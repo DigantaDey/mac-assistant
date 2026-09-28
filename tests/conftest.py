@@ -4,23 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from aura.config import load_config  # noqa: E402
-from aura.events import EventBus  # noqa: E402
-from aura.laya import ExampleBuffer, HeuristicBackend  # noqa: E402
-from aura.memory import Memory  # noqa: E402
-from aura.orchestrator import Orchestrator  # noqa: E402
-from aura.planner import MockPlanner  # noqa: E402
-from aura.safety import SafetyGate  # noqa: E402
-from aura.skills import DryRunBridge, build_default_registry  # noqa: E402
-from aura.stt import NullSTT  # noqa: E402
-from aura.tts import NullTTS  # noqa: E402
+from aura.config import load_config
+from aura.events import EventBus
+from aura.laya import ExampleBuffer, HeuristicBackend
+from aura.memory import Memory
+from aura.orchestrator import Orchestrator
+from aura.planner import MockPlanner
+from aura.safety import SafetyGate
+from aura.skills import DryRunBridge, build_default_registry
+from aura.stt import NullSTT
+from aura.tts import NullTTS
 
 
 class DemoStack:
@@ -57,10 +56,10 @@ def stack(tmp_path: Path) -> DemoStack:
 # Real-HTTP helpers + a live server fixture (used by server & permissions tests)
 # --------------------------------------------------------------------------- #
 
-import json as _json  # noqa: E402
-import socket as _socket  # noqa: E402
-import threading as _threading  # noqa: E402
-import urllib.request as _urllib  # noqa: E402
+import json as _json
+import socket as _socket
+import threading as _threading
+import urllib.request as _urllib
 
 
 def free_port() -> int:
@@ -123,7 +122,7 @@ async def collect(bus: EventBus, sid: int, coro, timeout: float = 5.0) -> list[s
         try:
             ev = await asyncio.wait_for(bus.get(sid), timeout=timeout)
             types.append(ev.type)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             break
     for ev in bus.drain(sid):
         types.append(ev.type)

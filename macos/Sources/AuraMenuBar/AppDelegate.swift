@@ -11,6 +11,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menu: NSMenu!
     private var loginItem: NSMenuItem!
 
+    // First-launch / Setup window — a real NSWindow, the Apple-standard
+    // place to have the consent conversation.
+    private var setupWindow: NSWindow?
+
     private var python = PythonProcess()
     private lazy var monitor = ServerMonitor { [weak self] state in
         self?.apply(state)
@@ -34,6 +38,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         monitor.start()
         python.onStateChange = { [weak self] in self?.monitor.kick() }
         python.start()
+
+        if !UserDefaults.standard.bool(forKey: "hasOnboarded") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.showSetupWindow()
+                self?.proactivePermissionAsks()
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -67,6 +78,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                               action: #selector(wake), keyEquivalent: "")
         wake.target = self
         m.addItem(wake)
+
+        let setup = NSMenuItem(title: "Setup & Permissions…",
+                               action: #selector(openSetup), keyEquivalent: "s")
+        setup.target = self
+        m.addItem(setup)
+
+        m.addItem(.separator())
+
+        let browser = NSMenuItem(title: "Open in Browser",
+                                 action: #selector(openInBrowser), keyEquivalent: "b")
+        browser.target = self
+        m.addItem(browser)
+
+        let restart = NSMenuItem(title: "Restart Engine",
+                                 action: #selector(restartEngine), keyEquivalent: "r")
+        restart.target = self
+        m.addItem(restart)
 
         m.addItem(.separator())
 
@@ -111,16 +139,111 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.appearance = NSAppearance(named: .darkAqua)
         panel.contentSize = NSSize(width: 480, height: 680)
         popover = panel
+        loadPanel(onboarding: false)
+    }
 
-        let firstRun = !UserDefaults.standard.bool(forKey: "hasOnboarded")
-        loadPanel(onboarding: firstRun)
-        UserDefaults.standard.set(true, forKey: "hasOnboarded")
+    // MARK: server readiness gate — never show a blank webview
+
+    private func placeholderHTML(_ title: String, _ body: String) -> String {
+        """
+        <html><head><meta charset="utf-8"></head>
+        <body style="margin:0;height:100vh;display:flex;flex-direction:column;
+          align-items:center;justify-content:center;gap:14px;
+          background:rgba(12,13,16,0.92);
+          font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;
+          -webkit-font-smoothing:antialiased;">
+          <div style="width:12px;height:12px;border-radius:50%;background:#0a84ff;
+            animation:p 1.2s ease-in-out infinite;"></div>
+          <div style="color:#f5f5f7;font-size:14px;font-weight:600;">\(title)</div>
+          <div style="color:rgba(235,235,245,0.55);font-size:12px;max-width:320px;
+            text-align:center;line-height:1.5;">\(body)</div>
+          <style>@keyframes p{0%,100%{opacity:.35;transform:scale(.8)}50%{opacity:1;transform:scale(1.15)}}</style>
+        </body></html>
+        """
+    }
+
+    private func waitThenLoad(_ web: WKWebView, url: URL, onboarding: Bool) {
+        web.loadHTMLString(placeholderHTML("Waking Aura…",
+            "The engine starts in a second. If this lasts a while, choose Restart Engine from the menu."),
+            baseURL: nil)
+        var tries = 0
+        func poll() {
+            tries += 1
+            var request = URLRequest(url: url.appendingPathComponent("api/health"))
+            request.timeoutInterval = 1.2
+            URLSession.shared.dataTask(with: request) { data, response, _ in
+                let up = (response as? HTTPURLResponse)?.statusCode == 200
+                DispatchQueue.main.async {
+                    if up {
+                        var target = self.baseURL
+                        if onboarding { target.append(fragment: "onboarding") }
+                        web.load(URLRequest(url: target))
+                    } else if tries < 40 {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { poll() }
+                    } else {
+                        web.loadHTMLString(placeholderHTML("Aura's engine is offline",
+                            "Pick Restart Engine from the menu bar, or check that the engine folder is still in place."),
+                            baseURL: nil)
+                    }
+                }
+            }.resume()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { poll() }
     }
 
     private func loadPanel(onboarding: Bool) {
-        var url = baseURL
-        if onboarding { url.append(fragment: "onboarding") }
-        webView.load(URLRequest(url: url))
+        waitThenLoad(webView, url: baseURL, onboarding: onboarding)
+    }
+
+    // MARK: first-launch window + proactive permission conversation
+
+    @objc private func openSetup() {
+        showSetupWindow()
+    }
+
+    private func showSetupWindow() {
+        if setupWindow != nil {
+            setupWindow?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let web = WKWebView(frame: NSRect(x: 0, y: 0, width: 720, height: 700),
+                            configuration: WKWebViewConfiguration())
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 700),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered, defer: false)
+        window.title = "Welcome to Aura"
+        window.titlebarAppearsTransparent = true
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.backgroundColor = NSColor(calibratedRed: 0.047, green: 0.051, blue: 0.063, alpha: 1)
+        window.isReleasedWhenClosed = false
+        window.contentView = web
+        window.center()
+        window.delegate = SetupWindowDelegate(delegate: self)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        setupWindow = window
+        waitThenLoad(web, url: baseURL, onboarding: true)
+    }
+
+    func setupWindowDidClose() {
+        setupWindow?.close()
+        setupWindow = nil
+        UserDefaults.standard.set(true, forKey: "hasOnboarded")
+    }
+
+    /// The consent conversation, on the app's own terms: microphone first
+    /// (its dialog carries our usage string), then Accessibility (system
+    /// sheet with an Open System Settings button). Neither is nagging —
+    /// each happens once, and the Setup window shows the honest state after.
+    private func proactivePermissionAsks() {
+        Task { @MainActor in
+            await Permissions.requestMicrophone()
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            Permissions.requestAccessibility()
+        }
     }
 
     // MARK: actions
@@ -155,6 +278,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var request = URLRequest(url: baseURL.appendingPathComponent("api/trigger"))
         request.httpMethod = "POST"
         URLSession.shared.dataTask(with: request).resume()
+    }
+
+    @objc private func openInBrowser() {
+        NSWorkspace.shared.open(baseURL)
+    }
+
+    @objc private func restartEngine() {
+        python.restart()
     }
 
     @objc private func chooseFolder() {
@@ -239,5 +370,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             value = (value << 8) | OSType(byte)
         }
         return value
+    }
+}
+
+// MARK: - small delegates
+
+final class SetupWindowDelegate: NSObject, NSWindowDelegate {
+    private let delegate: AppDelegate
+    init(delegate: AppDelegate) { self.delegate = delegate }
+    func windowWillClose(_ notification: Notification) {
+        delegate.setupWindowDidClose()
     }
 }

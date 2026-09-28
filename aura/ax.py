@@ -30,9 +30,9 @@ class AXNode:
     position: tuple[int, int] | None = None
     size: tuple[int, int] | None = None
     actions: tuple[str, ...] = ()      # e.g. ("AXPress",)
-    children: list["AXNode"] = field(default_factory=list)
+    children: list[AXNode] = field(default_factory=list)
 
-    def flat(self) -> list["AXNode"]:
+    def flat(self) -> list[AXNode]:
         out: list[AXNode] = []
         stack = [self]
         while stack:
@@ -85,7 +85,7 @@ class MacAXTree:
 
     # -- attribute helpers ------------------------------------------------ #
 
-    def _attr(self, ref, name: str):  # noqa: ANN001
+    def _attr(self, ref, name: str):
         AS = self._AS
         try:
             result = AS.AXUIElementCopyAttributeValue(ref, name, None)
@@ -96,7 +96,7 @@ class MacAXTree:
             return result[-1] if result else None
         return result
 
-    def _actions(self, ref) -> tuple[str, ...]:  # noqa: ANN001
+    def _actions(self, ref) -> tuple[str, ...]:
         AS = self._AS
         try:
             names = AS.AXUIElementCopyActionNames(ref, None)
@@ -111,7 +111,7 @@ class MacAXTree:
     def root(self) -> AXNode:
         count = 0
 
-        def convert(ref, depth: int) -> AXNode | None:  # noqa: ANN001
+        def convert(ref, depth: int) -> AXNode | None:
             nonlocal count
             if depth > self.MAX_DEPTH or count >= self.MAX_NODES:
                 return None
@@ -152,7 +152,7 @@ class MacAXTree:
 
     # -- actions ------------------------------------------------------------ #
 
-    def press(self, node: AXNode) -> bool:  # noqa: ANN001 - node carries no ref; locate by position
+    def press(self, node: AXNode) -> bool:
         """Press a button-like element: AXPress when available, else a synthetic
         click at its center (CGEvent). Returns success."""
         AS = self._AS
@@ -170,7 +170,7 @@ class MacAXTree:
             return False
         return self._click_at(center)
 
-    def _find_ref(self, node: AXNode):  # noqa: ANN001
+    def _find_ref(self, node: AXNode):
         """Re-locate a node's live ref by role+label path (position-stable)."""
         target_path = _path_of(self.root(), node)
         if not target_path:
@@ -195,7 +195,7 @@ class MacAXTree:
         except Exception as exc:  # pragma: no cover - Mac only
             raise AXUnavailable(f"CGEvent click failed: {exc}") from exc
 
-    def focus(self, node: AXNode) -> bool:  # noqa: ANN001
+    def focus(self, node: AXNode) -> bool:
         AS = self._AS
         ref = self._find_ref(node)
         if ref is None:
@@ -206,7 +206,7 @@ class MacAXTree:
         except Exception:
             return False
 
-    def insert(self, node: AXNode, text: str) -> bool:  # noqa: ANN001
+    def insert(self, node: AXNode, text: str) -> bool:
         """Focus the field and type. Keystrokes respect the focused element."""
         if not self.focus(node):
             return False

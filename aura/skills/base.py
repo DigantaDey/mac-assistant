@@ -45,13 +45,13 @@ class SkillResult:
 class Skill:
     spec: SkillSpec
 
-    async def execute(self, args: dict[str, Any], ctx: "SkillContext") -> SkillResult:
+    async def execute(self, args: dict[str, Any], ctx: SkillContext) -> SkillResult:
         raise NotImplementedError
 
 
 @dataclass
 class SkillContext:
-    bridge: "MacBridge"          # macOS execution surface (real or dry-run)
+    bridge: MacBridge          # macOS execution surface (real or dry-run)
     memory: Any                  # aura.memory.Memory
     config: Any                  # aura.config.Config
 

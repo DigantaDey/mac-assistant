@@ -1,5 +1,13 @@
-from .base import DryRunBridge, MacBridge, Skill, SkillContext, SkillRegistry, SkillResult, SkillSpec
 from . import accessibility, browser, clipboard, system
+from .base import (
+    DryRunBridge,
+    MacBridge,
+    Skill,
+    SkillContext,
+    SkillRegistry,
+    SkillResult,
+    SkillSpec,
+)
 
 __all__ = [
     "DryRunBridge", "MacBridge", "Skill", "SkillContext", "SkillRegistry",

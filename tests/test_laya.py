@@ -31,7 +31,7 @@ class TestHeuristicBackend:
 class TestBackendSelection:
     def test_falls_back_to_heuristic_without_laya(self, monkeypatch):
         class Cfg:
-            class laya:  # noqa: N801
+            class laya:
                 backend = "auto"
                 adapter_dir = ""
         # force the real import to fail

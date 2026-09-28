@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aura-mac"
-version = "0.4.0"
+version = "0.5.0"
 description = "Aura — a private, offline, voice-controlled assistant for macOS. Laya-gated, self-improving, blazing fast."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,7 +33,7 @@ mac = [
   "laya>=0.1",               # the System-1 decision model (Apache-2.0)
   "piper-tts>=1.2",          # optional local TTS
 ]
-dev = ["pytest>=8.0", "ruff>=0.4"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4"]
 
 [project.scripts]
 aura = "aura.__main__:main"
@@ -52,3 +52,19 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+# Ruff 0.16's default rule set is broader than this codebase was written
+# against. Everything else stays enforced; these are documented, deliberate
+# skips for patterns this codebase uses *on purpose*.
+extend-ignore = [
+    "BLE001",   # broad except at subsystem boundaries is the defensive
+                # contract: audio, config, model loading must degrade,
+                # never crash the session
+    "S110",     # try/except/pass is an intentional soft-fail probe
+    "PLW1510",  # probe subprocesses must not fail the loop when an
+                # optional binary is missing
+    "RUF059",   # unused unpacked variables: `_` placeholders are idiomatic
+    "RUF015",   # style preference
+    "ISC004",   # implicit string concat in collections is the house style
+]

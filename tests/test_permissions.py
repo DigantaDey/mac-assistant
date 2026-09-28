@@ -6,7 +6,6 @@ import json
 import platform
 
 import pytest
-
 from conftest import get, post
 
 
@@ -72,4 +71,3 @@ class TestPermissionsEndpoints:
         assert data["status"] in ("ok", "denied", "unavailable")
 
 
-import json  # noqa: E402  (kept at bottom so the fixture imports read first)

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
 from conftest import DemoStack
 
 
@@ -14,7 +13,7 @@ def orch(stack: DemoStack):
     return stack.build_orchestrator()
 
 
-async def session_transcript(orch: "object", text: str) -> str:  # noqa: ANN001
+async def session_transcript(orch: object, text: str) -> str:
     """Run a session and return the final reply text."""
     sid = orch.bus.subscribe_async()
     task = asyncio.create_task(orch.submit_text(text))

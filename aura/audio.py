@@ -15,7 +15,6 @@ import asyncio
 from dataclasses import dataclass
 
 try:  # optional dependency — only needed on a real Mac
-    import numpy as np
     import sounddevice as sd
 
     HAS_AUDIO = True
@@ -29,7 +28,7 @@ FRAME_SAMPLES = 512  # ~32 ms — small enough for snappy VAD, cheap enough to i
 
 @dataclass
 class AudioFrame:
-    pcm: "object"  # int16 numpy array when numpy is present, else bytes
+    pcm: object  # int16 numpy array when numpy is present, else bytes
     ts: float
 
 
@@ -44,7 +43,7 @@ class MicStream:
             raise MicStream.MicUnavailable("sounddevice/numpy not installed")
         self._loop = loop
         self._on_frame = on_frame  # sync callable invoked with AudioFrame
-        self._stream: "sd.InputStream | None" = None
+        self._stream: sd.InputStream | None = None
 
     def start(self) -> None:
         def callback(indata, frames, time_info, status):  # PortAudio thread

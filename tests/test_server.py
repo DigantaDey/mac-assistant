@@ -7,7 +7,6 @@ import json
 import urllib.error
 
 import pytest
-
 from conftest import get, post
 
 
@@ -26,13 +25,11 @@ class TestServer:
         _, state = get(f"{base}/api/state")
         st = json.loads(state)
         assert st["state"] == "armed"
-        assert "skills" not in st or True
         status, skills = get(f"{base}/api/skills")
         assert status == 200 and json.loads(skills)["skills"]
 
     def test_path_traversal_refused(self, server):
         _, srv, cfg = server
-        import urllib.error
         with pytest.raises(urllib.error.HTTPError):
             get(f"http://127.0.0.1:{cfg.server.port}/../aura/config.py")
 

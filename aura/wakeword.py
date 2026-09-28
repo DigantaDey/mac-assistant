@@ -15,6 +15,7 @@ start with the configured phrase, which kills nearly all false accepts.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 try:
     import numpy as np
@@ -27,7 +28,7 @@ except Exception:  # pragma: no cover
 class WakeEngine:
     """Interface. `feed(frame)` → True exactly once per accepted wake."""
 
-    def feed(self, frame) -> bool:  # noqa: ANN001
+    def feed(self, frame) -> bool:
         return False
 
     def reset(self) -> None: ...
@@ -61,7 +62,7 @@ class OpenWakeWordEngine(WakeEngine):
         self._buf = bytearray()
         self._last_fire = 0.0
 
-    def feed(self, frame) -> bool:  # noqa: ANN001
+    def feed(self, frame) -> bool:
         if not HAS_NUMPY:
             return False
         self._buf.extend(frame.pcm.tobytes())
@@ -95,7 +96,7 @@ class ManualTrigger(WakeEngine):
     def fire(self) -> None:
         self._flag = True
 
-    def feed(self, frame) -> bool:  # noqa: ANN001
+    def feed(self, frame) -> bool:
         if self._flag:
             self._flag = False
             return True
@@ -131,7 +132,7 @@ class TemplateWakeEngine(WakeEngine):
         self._since_score = 0
         self._last_fire = 0.0
 
-    def feed(self, frame) -> bool:  # noqa: ANN001
+    def feed(self, frame) -> bool:
         pcm = frame.pcm
         self._buf.extend(pcm.tobytes() if hasattr(pcm, "tobytes") else bytes(pcm))
         self._since_score += 1
@@ -173,8 +174,40 @@ def load_template_meta(model_path: str) -> dict:
         return {}
 
 
-def build_wake_engine(cfg) -> WakeEngine:  # noqa: ANN001 - Config is dataclass
-    """Factory used by the orchestrator; never raises — falls back to manual."""
+def wake_models_ready(cfg) -> tuple[bool, str]:
+    """Cheap, honest check: do the configured wake model files exist on disk?
+
+    Used by the Setup panel so "always listening" can offer a one-tap
+    download instead of silently falling back to manual wake.
+    """
+    models = list(getattr(cfg.wake, "models", None) or [])
+    if not models:
+        return True, "No wake model needed — manual wake is active."
+    for m in models:
+        path = str(m)
+        if path.endswith((".npz", ".onnx")):
+            if not Path(path).expanduser().is_file():
+                return False, f"Model file missing: {path}"
+            continue
+        # Pretrained openWakeWord name → look for the cached .onnx resource.
+        try:
+            import openwakeword  # type: ignore
+        except Exception:
+            return False, "openWakeWord package not installed — install from Setup."
+        res = Path(openwakeword.__file__).resolve().parent / "resources" / "models"
+        matches = list(res.glob(f"{path}*.onnx")) if res.is_dir() else []
+        if not matches:
+            return False, f"Pretrained model “{path}” not downloaded yet."
+    return True, "Wake models are on this Mac."
+
+
+def build_wake_engine(cfg, on_fallback=None) -> WakeEngine:
+    """Factory used by the orchestrator; never raises — falls back to manual.
+
+    Any failure (missing package, missing model file, corrupt model) degrades
+    to manual wake. `on_fallback(reason)` is invoked so the reason reaches the
+    log and the Setup panel instead of a crash.
+    """
     mode = getattr(cfg.wake, "mode", "manual")
     if mode == "openwakeword":
         # A trained template (.npz from the Wake Phrase panel) always wins —
@@ -183,15 +216,22 @@ def build_wake_engine(cfg) -> WakeEngine:  # noqa: ANN001 - Config is dataclass
             if str(m).endswith(".npz"):
                 try:
                     return TemplateWakeEngine(str(m))
-                except RuntimeError:
+                except Exception as exc:
+                    if on_fallback:
+                        on_fallback(f"trained phrase model unreadable: {exc}")
                     break
         try:
+            ready, detail = wake_models_ready(cfg)
+            if not ready:
+                raise RuntimeError(detail)
             return OpenWakeWordEngine(
                 models=cfg.wake.models,
                 threshold=cfg.wake.threshold,
                 refractory_seconds=cfg.wake.refractory_seconds,
             )
-        except RuntimeError:
+        except Exception as exc:
+            if on_fallback:
+                on_fallback(f"always-listening unavailable, using manual wake: {exc}")
             return ManualTrigger()
     return ManualTrigger()
 

@@ -54,14 +54,26 @@ final class PythonProcess {
         let defaults = UserDefaults.standard
         let fm = FileManager.default
 
+        // Engine discovery — no file picker on a normal install:
+        //   1. the folder a user explicitly chose (menu → "Choose Aura Folder…")
+        //   2. the standard installed copy the installer places in
+        //      ~/Library/Application Support/Aura/engine
+        //   3. last resort: ask the user to pick the mac-assistant folder
         var repoPath = defaults.string(forKey: "repoPath") ?? ""
         if repoPath.isEmpty || !fm.fileExists(atPath: repoPath + "/aura") {
-            guard let picked = Self.pickRepo() else {
-                onStateChange?()          // stayed down; user can retry from the menu
-                return
+            let installed = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Aura/engine", isDirectory: true)
+            if fm.fileExists(atPath: installed.appendingPathComponent("aura").path) {
+                repoPath = installed.path
+                defaults.set(repoPath, forKey: "repoPath")
+            } else {
+                guard let picked = Self.pickRepo() else {
+                    onStateChange?()          // stayed down; user can retry from the menu
+                    return
+                }
+                repoPath = picked
+                defaults.set(picked, forKey: "repoPath")
             }
-            repoPath = picked
-            defaults.set(picked, forKey: "repoPath")
         }
 
         let repo = URL(fileURLWithPath: repoPath, isDirectory: true)
@@ -82,6 +94,7 @@ final class PythonProcess {
             .appendingPathComponent("Aura", isDirectory: true)
         try? fm.createDirectory(at: support, withIntermediateDirectories: true)
         environment["AURA_DATA_DIR"] = support.path
+        environment["AURA_ENGINE_PATH"] = repo.path   // the engine knows its own home
         environment["PYTHONUNBUFFERED"] = "1"
         child.environment = environment
 

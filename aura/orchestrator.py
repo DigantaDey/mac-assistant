@@ -102,6 +102,8 @@ class Orchestrator:
         self._queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=200)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_activity = time.monotonic()
+        self.planner_online: bool | None = None   # last probe of the LLM endpoint
+        self.planner_status: dict = {}
         self._file_mtimes: dict[str, float] = {}
         self._trainer: TrainingState | None = None
         self._train_capture_armed = False
@@ -122,6 +124,7 @@ class Orchestrator:
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
+        self.bus.attach_loop(self._loop)
         self._wake = self._build_wake()
         try:
             self._mic = MicStream(self._loop, self._on_audio_frame)
@@ -135,6 +138,7 @@ class Orchestrator:
         self._maintenance_task = asyncio.create_task(self._maintenance_loop(),
                                                      name="aura-maintenance")
         self._remember_mtimes()
+        await self._probe_planner()
         self.state = "armed"
         self.bus.publish("state", state=self.state, mic=mic_kind,
                          wake=getattr(self.cfg.wake, "mode", "manual"))
@@ -170,11 +174,26 @@ class Orchestrator:
                 continue
 
     async def _maintenance_loop(self) -> None:
-        """Every 10 s: apply live config changes, unload idle models."""
+        """Every 10 s: apply live config changes, unload idle models, probe
+        the planner so the UI can tell the user when the brain is offline."""
         while True:
             await asyncio.sleep(10.0)
             self._poll_config_changes()
             self._unload_if_idle()
+            await self._probe_planner()
+
+    async def _probe_planner(self) -> None:
+        probe = getattr(self.planner, "probe", None)
+        status = getattr(self.planner, "status", None)
+        if probe is None or status is None:
+            self.planner_online = None            # deterministic planner — nothing to check
+            return
+        try:
+            self.planner_online = bool(await asyncio.get_running_loop()
+                                       .run_in_executor(None, probe))
+            self.planner_status = status() if callable(status) else dict(status)
+        except Exception:
+            self.planner_online = False
 
     def _poll_config_changes(self) -> None:
         current: dict[str, float] = {}
@@ -187,13 +206,13 @@ class Orchestrator:
             return
         self._file_mtimes = current
         try:
-            fresh = config_mod.load_config()
+            fresh = config_mod.load_config(data_dir=self.cfg.data_dir)
         except Exception as exc:  # a broken edit must not crash the loop
             self.bus.publish("log", line=f"config reload failed: {exc}")
             return
         self.apply_live_config(fresh)
 
-    def apply_live_config(self, fresh) -> None:  # noqa: ANN001 - Config
+    def apply_live_config(self, fresh) -> None:
         """Hot-apply only the fields in config.LIVE_FIELDS; report the rest."""
         changed: list[str] = []
         for section_name, allowed in config_mod.LIVE_FIELDS.items():
@@ -235,13 +254,17 @@ class Orchestrator:
     def _build_wake(self) -> WakeEngine:
         from .wakeword import build_wake_engine
 
-        return build_wake_engine(self.cfg)
+        def on_fallback(reason: str) -> None:
+            self.bus.publish("log", line=f"wake: {reason}")
+            self.bus.publish("wake_fallback", reason=reason)
+
+        return build_wake_engine(self.cfg, on_fallback=on_fallback)
 
     async def set_wake_mode(self, mode: str, phrase: str | None = None) -> dict:
         """Switch manual ↔ always-listening at runtime; persist the choice."""
         if mode not in ("manual", "openwakeword"):
             return {"ok": False, "message": f"unknown wake mode {mode!r}"}
-        if self.cfg.profile == "demo":
+        if config_mod.resolved_profile(self.cfg) == "demo":
             return {"ok": False,
                     "message": "Demo profile pins manual wake — set profile = \"mac\" "
                                "in config.toml to enable always-listening."}
@@ -360,6 +383,24 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
 
     async def _session_text(self, transcript: str, spoken: bool = False) -> None:
+        """A session must *always* end — with a result or a polite apology.
+        An unexpected error is a product bug, not a frozen orb."""
+        try:
+            await self._run_session(transcript, spoken)
+        except Exception as exc:
+            self.bus.publish("log", line=f"session error: {exc!r}")
+            import traceback as _tb
+
+            self.bus.publish("log", line=_tb.format_exc(limit=3))
+            try:
+                await self._end_session(
+                    "Something went wrong while thinking — please try again.")
+            except Exception:  # even the apology must not hang the state
+                self.session = None
+                self.state = "armed"
+                self.bus.publish("state", state=self.state)
+
+    async def _run_session(self, transcript: str, spoken: bool = False) -> None:
         session = Session(id=uuid.uuid4().hex[:12], transcript=transcript)
         self.session = session
         self._last_activity = time.monotonic()
@@ -411,7 +452,7 @@ class Orchestrator:
             try:
                 answer = await asyncio.wait_for(
                     fut, timeout=self.cfg.session.confirmation_timeout_seconds)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 answer = "timeout"
             if answer != "confirm":
                 for p in session.pending:
@@ -470,7 +511,8 @@ class Orchestrator:
         self.state = "responding"
         self.bus.publish("state", state=self.state, session=session.id)
         self.bus.publish("reply", text=reply, session=session.id,
-                         total_ms=total_ms, outcome=outcome)
+                         total_ms=total_ms, outcome=outcome,
+                         degraded=bool(getattr(session.plan, "degraded", False)))
         self.memory.record_event(session.transcript,
                                  (session.plan.as_dict() if session.plan else {}),
                                  reply, outcome, total_ms)
@@ -583,8 +625,7 @@ class Orchestrator:
                     "message": "Record a few more samples first — three at minimum."}
         from pathlib import Path as _Path
 
-        from .wakeword_trainer import (save_template, slugify, spectral_embedding,
-                                       train_wake)
+        from .wakeword_trainer import save_template, slugify, train_wake
 
         trainer = self._trainer
         phrase = trainer.phrase
@@ -631,7 +672,7 @@ class Orchestrator:
     async def run_setup(self) -> dict:
         if self._setup_running:
             return {"ok": False, "message": "An install is already running."}
-        if self.cfg.profile == "demo":
+        if config_mod.resolved_profile(self.cfg) == "demo":
             return {"ok": False,
                     "message": "Development build — component install runs on a real install."}
         self._setup_running = True
@@ -641,23 +682,137 @@ class Orchestrator:
             self._setup_running = False
         return {"ok": True}
 
-    def _run_setup_sync(self) -> None:
+    async def run_setup_step(self, key: str) -> Any:
+        """One Setup step at a time — the per-card Install buttons."""
+        from .setup_installer import StepResult
+
+        if config_mod.resolved_profile(self.cfg) == "demo":
+            return StepResult(key, "Development build", "skip",
+                              "Component install runs on a real Mac install.")
+        if self._setup_running:
+            return StepResult(key, "Install already running", "fail",
+                              "One install at a time — this one is in progress.")
+        self._setup_running = True
+        try:
+            return await self.loop.run_in_executor(None, self._run_setup_step_sync, key)
+        finally:
+            self._setup_running = False
+
+    def _engine_repo(self):
+        """Where the `python` step pip-installs from: the engine folder the
+        app knows about (AURA_ENGINE_PATH), else this package's repo."""
+        import os
         from pathlib import Path as _Path
 
+        env = os.environ.get("AURA_ENGINE_PATH", "")
+        if env and (_Path(env) / "pyproject.toml").is_file():
+            return _Path(env)
+        return _Path(__file__).resolve().parent.parent
+
+    def _run_setup_step_sync(self, key: str) -> Any:
+        from .setup_installer import run_step
+
+        return run_step(self, self._engine_repo(), key)
+
+    def _run_setup_sync(self) -> None:
         from .setup_installer import run_installer
 
-        run_installer(self, _Path(__file__).resolve().parent.parent)
+        run_installer(self, self._engine_repo())
 
     # ------------------------------------------------------------------ #
     # Confirmation / feedback API (called from server threads)             #
     # ------------------------------------------------------------------ #
 
+    async def set_config(self, updates: dict) -> dict:
+        """Live settings from the UI: validate, persist, hot-apply. Runs on
+        the loop because some fields (wake engine, STT) need rebuilding."""
+        from .config import LIVE_FIELDS, load_config, write_overrides
+
+        if not isinstance(updates, dict) or not updates:
+            return {"ok": False, "applied": [], "message": "nothing to change"}
+        for section, values in updates.items():
+            if section not in LIVE_FIELDS:
+                return {"ok": False, "applied": [],
+                        "message": f"“{section}” isn't a setting Aura can change live"}
+            if not isinstance(values, dict):
+                return {"ok": False, "applied": [], "message": f"“{section}” needs a field map"}
+            for key, value in values.items():
+                if key not in LIVE_FIELDS[section]:
+                    return {"ok": False, "applied": [],
+                            "message": f"{section}.{key} isn't changeable live"}
+                current = getattr(getattr(self.cfg, section), key)
+                if isinstance(current, bool):
+                    if not isinstance(value, bool):
+                        return _config_type_error(section, key, "on/off")
+                elif isinstance(current, (int, float)):
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        return _config_type_error(section, key, "a number")
+                elif isinstance(current, str):
+                    if not isinstance(value, str):
+                        return _config_type_error(section, key, "text")
+                elif isinstance(current, list):
+                    if not isinstance(value, list):
+                        return _config_type_error(section, key, "a list")
+                else:
+                    return {"ok": False, "applied": [],
+                            "message": f"{section}.{key} isn't supported"}
+
+        try:
+            write_overrides(self.cfg.data_dir, updates)
+        except OSError as exc:
+            return {"ok": False, "applied": [],
+                    "message": f"changed for now, but couldn't save it: {exc}"}
+
+        try:
+            fresh = load_config(data_dir=self.cfg.data_dir)
+        except Exception as exc:
+            fresh = None
+            self.bus.publish("log", line=f"config reload after save failed: {exc}")
+        if fresh is not None:
+            self.apply_live_config(fresh)
+        else:
+            for section, values in updates.items():
+                for key, value in values.items():
+                    setattr(getattr(self.cfg, section), key, value)
+        self._remember_mtimes()  # the file we just wrote is expected
+        applied = [f"{s}.{k}" for s, vs in updates.items() for k in vs]
+        self.bus.publish("config", changed=applied)
+        self.bus.publish("log", line="settings updated: " + ", ".join(applied))
+        return {"ok": True, "applied": applied, "message": "Saved."}
+
+    def run_blocking(self, fn, *args, timeout: float = 90.0) -> Any:
+        """Run a blocking function (TCC prompt, probe, installer step) on the
+        orchestrator's loop without stalling it, called from a server thread."""
+        async def _run():
+            return await self.loop.run_in_executor(None, fn, *args)
+
+        try:
+            return asyncio.run_coroutine_threadsafe(_run(), self.loop).result(
+                timeout=timeout)
+        except Exception as exc:
+            return ("error", f"that didn't finish in time ({exc.__class__.__name__})")
+
     def resolve_confirmation(self, token: str, answer: Literal["confirm", "cancel"]) -> bool:
+        """Resolve a pending proposal. May be called from the server thread —
+        the wake-up must be scheduled onto the loop that awaits the future,
+        or the session would hang in `proposing` forever."""
         fut = self._confirmations.get(token)
-        if fut and not fut.done():
-            fut.set_result(answer)
-            return True
-        return False
+        if fut is None or fut.done():
+            return False
+
+        def _set() -> None:
+            if not fut.done():
+                fut.set_result(answer)
+
+        try:
+            here = asyncio.get_running_loop()
+        except RuntimeError:
+            here = None
+        if self._loop is not None and here is not self._loop:
+            self._loop.call_soon_threadsafe(_set)
+        else:
+            _set()
+        return True
 
     def record_feedback(self, transcript: str, skill: str, verdict: str, note: str = "") -> None:
         """Explicit 👍/👎 from the Activity timeline — the richest signal we get."""
@@ -686,7 +841,7 @@ class Orchestrator:
 
     # ------------------------------------------------------------------ #
 
-    def _record_example(self, transcript: str, action: Action | "_ShadowAction", outcome: str) -> None:
+    def _record_example(self, transcript: str, action: Action | _ShadowAction, outcome: str) -> None:
         if isinstance(action, Action):
             skill, args = action.skill, action.args
         else:
@@ -715,16 +870,16 @@ class _RawFrame:
 
 
 class _SkillCtx:
-    __slots__ = ("bridge", "memory", "config")
+    __slots__ = ("bridge", "config", "memory")
 
-    def __init__(self, orch: "Orchestrator") -> None:
+    def __init__(self, orch: Orchestrator) -> None:
         self.bridge = orch.bridge
         self.memory = orch.memory
         self.config = orch.cfg
 
 
 class _SkillOutcome:
-    __slots__ = ("ok", "message", "data")
+    __slots__ = ("data", "message", "ok")
 
     def __init__(self, ok: bool, message: str, data: dict | None = None) -> None:
         self.ok, self.message, self.data = ok, message, data or {}
@@ -742,6 +897,11 @@ class _ShadowAction:
         self.skill = skill
         self.args = {}
         self.why = ""
+
+
+def _config_type_error(section: str, key: str, want: str) -> dict:
+    return {"ok": False, "applied": [],
+            "message": f"{section}.{key} needs {want}, Aura got something else"}
 
 
 def _ms(t0: float) -> int:

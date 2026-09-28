@@ -1,131 +1,181 @@
-# Aura — your Mac, at your command.
+# Aura
 
-<p align="center">
-  <img src="ui/icon.svg" width="72" alt="Aura">
-</p>
+**Your machine, understood.** A private, offline, voice-first assistant for
+macOS — built around Apple's **on-device Foundation Models** (the same API
+family as Apple Intelligence), with a **local Llama 3.2 1B** safety brain
+(**Laya**) that double-checks every action, and a hard rule: *confirm
+anything destructive.*
 
-**Aura is a private, offline, voice-controlled assistant for macOS.**
-You choose the activation phrase. Aura listens for it, understands you on-device,
-shows you a plan before it touches anything — and gets sharper every week,
-because every confirmation and correction you give becomes training data for
-its [Laya](https://huggingface.co/convaiinnovations) decision core.
+Aura runs entirely on your Mac. No cloud, no telemetry, no account — and it
+wears the face of a real Mac app: a menu-bar orb that listens, asks, and
+acts.
 
-No cloud. No API keys. No telemetry. Idle footprint under ~200 MB.
-
-```text
- you:  "hey aura … open Spotify and set the volume to 30"
-
-       ◉ wake word (your phrase, on-device)
-       │
-       ▼
-       whisper.cpp          speech → text, on the Neural Engine
-       │
-       ▼
-       Qwen3-4B (MLX)       a small local model plans with real skills
-       │
-       ▼
-       Laya gate            every action scored: match? destructive?  ← ~33 ms
-       │                        low confidence ⇒ it asks, never guesses
-       ▼
-       skills               apps · windows · volume · browser · clipboard …
-       │
-       ▼
-       `say` + timeline     spoken reply, and a log you can correct
-```
+> **TL;DR** — Say “*Hey Aura, open YouTube*.” Type it. Click the icon and
+> ask. Aura listens, understands, plans, and — when something is risky —
+> asks you first. All of it, on your machine.
 
 ---
 
-## Try it in 60 seconds (works on any machine)
+## Quick start (macOS 15+, Apple Silicon)
 
 ```bash
-git clone https://github.com/DigantaDey/mac-assistant && cd mac-assistant
-python3 -m aura serve          # demo profile: deterministic, safe, no deps
-# → http://127.0.0.1:7331
+git clone <this repo> mac-assistant && cd mac-assistant
+./scripts/install.sh
 ```
 
-You'll get the full product — orb, transcripts, plan proposals, confirm/cancel,
-activity timeline with a 👍/👎 learning loop — with actions **simulated**
-(nothing touches your system). Try:
+That's the whole install. One command:
 
-- `open spotify and set volume to 30`
-- `search for flights to goa` · `open github.com`
-- `empty the trash` → watch Aura **stop and ask first**
-- `remember that my editor is Zed` → it keeps that forever
+1. brews the native bits (PortAudio, whisper.cpp), starts **Ollama** and
+   pulls the **qwen3:4b** reasoning brain (one-time, cached after);
+2. downloads the speech model (≈150 MB) and Aura's engine (Python + venv,
+   zero cloud);
+3. builds **Aura.app**, installs it into **/Applications**, and opens it;
+4. Aura walks you through permissions — Microphone, Accessibility,
+   Automation — with one click each.
 
-## Run it for real on a Mac
+Then:
+
+- click the **◉** in the menu bar, or press **⌥Space** anywhere, and say
+  “*open YouTube*” — or just type it;
+- say “*empty the trash*” — Aura **stops and asks** before anything risky;
+- open **Settings** any time to change the mic, the brain, wake phrase, or
+  see exactly what Aura can and can't do.
+
+### Already like it in a browser? (any OS)
 
 ```bash
-# 1. system deps
-brew install portaudio whisper-cpp ollama
-ollama pull qwen3:4b                      # the planner brain (~2.5 GB)
-
-# 2. python env
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[mac]"                   # sounddevice, openwakeword, laya, httpx…
-
-# 3. go
-python -m aura doctor                     # capability check
-python -m aura serve                      # real mic, real executors
+python3 -m venv .venv && .venv/bin/pip install -U pip && .venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m aura serve
+# → open http://127.0.0.1:7331  (auto profile: everything works, nothing is faked)
 ```
 
-Then grant permissions when macOS asks (**System Settings → Privacy & Security**):
-**Accessibility** (drive apps), **Microphone** (hear you), and per-app
-**Automation** (AppleScript). The built-in **Setup wizard** (sidebar → Setup)
-detects each one live and deep-links you to the exact pane.
-
-### Make it feel like a native app
-
-```bash
-./scripts/make_app.sh --install   # → /Applications/Aura.app (menu-bar shell)
-```
-
-A thin Swift/AppKit shell (no Xcode project needed — just `swift build`):
-◉ in your menu bar, the full UI in a popover, **⌥Space wakes Aura globally**,
-launches/restarts the Python engine for you, and offers Start-at-Login.
-See [macos/README.md](macos/README.md).
-
-### Make the wake phrase yours
-
-Open Aura, choose **Wake Phrase**, type the phrase you want, and say it a few
-times when prompted. Training takes seconds, runs entirely on this Mac, and the
-phrase is live the moment you confirm — no terminal, no configuration files.
+The same web panel, same engine, same code — the menu-bar app is a thin
+native shell around it.
 
 ---
 
-## What's in the box
+## What makes Aura different
 
-| | |
-|---|---|
-| **Wake** | openWakeWord models, or **your own phrase trained in-app** (Wake Phrase panel, seconds, on-device) |
-| **STT** | whisper.cpp (Metal/CoreML) → faster-whisper → typed input, auto-selected |
-| **Plan** | any local OpenAI-compatible server: Ollama, `mlx_lm.server`, llama.cpp, LM Studio |
-| **Gate** | [Laya](docs/RESEARCH.md) (Apache-2.0) — calibrated match/destructive scores in milliseconds; deterministic heuristic fallback |
-| **Act** | 20 declared skills — system, browser, clipboard, memory + **accessibility element control** (`ax.click`/`ax.type_into` on any app, picked coarse-to-fine and Laya-scored) |
-| **Speak** | macOS `say` (zero RAM) or Piper/Kokoro |
-| **Learn** | SQLite event store → preference memory → Laya fine-tune buffer → `scripts/nightly_laya.py` |
-| **UI** | hand-rolled, zero-dependency, Apple-grade dark interface on `127.0.0.1:7331` — SSE-live |
+| | Cloud assistants | Aura |
+|---|---|---|
+| **Where it runs** | their data centers | your Mac — always offline |
+| **Voice** | mic off → nothing | always-on wake word + push-to-talk + typing |
+| **Memory** | their profiles | local preference notes + a growing lesson log it fine-tunes on |
+| **Safety** | “trust us” | a local Llama 3.2 1B (Laya) scores *match* and *destructiveness* of every action; anything risky **asks you** |
+| **The “brain”** | one monolith | **on-device Apple Foundation Models** for understanding + **local qwen3 (Ollama)** for planning + **GPT-4o mini** as an *optional, explicit* fallback you can turn on |
+| **When the model is down** | nothing | falls back to built-in skills + a visible “running on basics” badge — never silent failure |
+| **Privacy** | your data is their product | audio, transcripts, and memory never leave the machine (unless *you* opt in to the cloud brain) |
 
-## Design principles
+### The action pipeline
 
-1. **Private by architecture, not by policy.** Loopback-only server, no
-   telemetry, models on disk, data in plain SQLite you can open and delete.
-2. **Ask, don't guess.** Calibrated confidence below threshold ⇒ a visible
-   proposal with confirm/cancel. Destructive is never "safe".
-3. **Lightweight is a feature.** Only the wake model stays resident; STT/LLM
-   load on demand and unload when idle.
-4. **Every action is inspectable.** A timeline, a log, an audit trail — no
-   magic, and corrections feed the next fine-tune.
+```
+you ── voice / type ──►  STT (whisper.cpp, on-device)
+                              │ transcript
+                              ▼
+                        Planner — on-device Apple Foundation Models
+                          (local qwen3 via Ollama; GPT-4o mini only if
+                          you switch the engine in Settings → Brain)
+                              │ plan: which skills, with what args
+                              ▼
+                        Laya — local Llama 3.2 1B (llama.cpp)
+                          scores: match (did I understand?) &
+                          destructive (is this risky?)
+                              │
+              ┌───────────────┴───────────────┐
+        safe ▼                               risky ▼
+     just do it                         ASK the user (Run / Change / Stop)
+```
 
-Read [ARCHITECTURE.md](ARCHITECTURE.md) for the layer-by-layer design,
-[ROADMAP.md](ROADMAP.md) for where this is going, and
-[docs/RESEARCH.md](docs/RESEARCH.md) for the market/feasibility research
-that kicked this off.
+Every outcome (done / you confirmed / you corrected it / you stopped it)
+is recorded to Aura's **lesson log** — the training set for fine-tuning
+Laya on your machine later (ROADMAP).
 
-## Status
+---
 
-**v0.3 — see ROADMAP.** Always-on wake with a phrase gate, live config
-hot-reload + idle model unload, native menu-bar shell, permissions wizard,
-and AX element picking (Aura clicks any labeled control in any app). 95
-tests green; everything installs or downloads once, up front.
+## What Aura can do today
 
-MIT licensed. Built with care.
+- **System** — open apps, find files, copy / set the clipboard, mute,
+  DND, sleep, screenshots, volume, trash (asks first), quit apps (asks)
+- **Automation** — System Events (launch/quit/set frontmost), Accessibility
+  UI control, browser tabs — a growing, tested skill catalog
+- **Understanding** — on-device: “*quiet the house*” → DND + volume;
+  “*find my Q3 deck*” → search; compound requests plan into several steps
+- **Ongoing** — preferences Aura learns from your corrections
+  (“I prefer Spotify for music”) and remembers in Settings
+
+The skill catalog is data, not code — add a skill by adding JSON
+(`aura/skills/*.json`); tests keep them honest.
+
+## The product, end to end
+
+```
+install  ──►  permissions  ──►  first command  ──►  daily
+1 cmd      mic / access /     “open youtube”     ◉ menu bar · ⌥Space
+script     automation (one    answers + acts     Settings: permissions,
+           click each)                         brain, wake, data, log
+```
+
+Everything you can change, you can change **later**, from
+**Settings** — permissions (re-ask any time), brain engine, wake mode,
+voice on/off, confirmation mode, and Aura's data folder.
+
+## Doctor
+
+Aura checks itself and tells you, in plain English, what's ready and what
+needs you:
+
+```bash
+.venv/bin/python -m aura doctor     # models, permissions, ports, config
+.venv/bin/python -m aura --version
+```
+
+## Layout
+
+```
+aura/            the engine — server (HTTP + SSE), orchestrator, planner,
+                 Laya, STT (whisper.cpp / Apple), TTS, wake word, VAD,
+                 skills, memory, permissions
+  server.py      the local API (127.0.0.1:7331): chat, state, setup steps,
+                 permission requests, live config, wake/training control
+ui/              the web panel — single page, no build step
+macos/           the native shell — AppKit menu-bar app + WKWebView
+                 (swift build, no Xcode project)
+scripts/         install.sh (one command) · make_app.sh · make_icon.py
+                 nightly_laya.py
+tests/           144+ tests — engine, planner fallbacks, permission honesty,
+                 skill catalog, ship-quality regressions
+ARCHITECTURE.md  how the pieces talk (engine, Laya, hybrid planner, shell)
+ROADMAP.md       where the product is going, what shipped when
+docs/RESEARCH.md the model choices, with the papers behind them
+```
+
+## Honest limitations (read before judging)
+
+- **macOS 15 / Apple Silicon** for the on-device foundation model brain;
+  on other machines Aura runs the same code with the local-qwen or
+  built-in-skill brains and says so.
+- The Foundation Models call is **on-device but private** — prompts go to
+  the system framework, not to OpenAI. The GPT-4o mini fallback is the only
+  network path in the project, and it's off by default.
+- Voice quality depends on your mic; wake-word recall is a tuning knob
+  (`config: [wake] sensitivity`), not a science.
+- Destructive actions ask. *Everything else just happens* — that's the
+  point, and the reason Laya scores match, not just risk.
+
+## Development
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m pytest tests/ -q
+.venv/bin/ruff check
+.venv/bin/python -m aura serve      # browser preview at http://127.0.0.1:7331
+```
+
+See `ARCHITECTURE.md` for how the pieces talk, `ROADMAP.md` for what ships
+next, and `docs/RESEARCH.md` for the model choices (with the papers behind
+them).
+
+---
+
+Aura is a research-grade product: the bar is “Apple could ship this.”
+The roadmap holds it there.

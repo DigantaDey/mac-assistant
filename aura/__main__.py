@@ -11,15 +11,13 @@ import asyncio
 import sys
 
 
-def _profile_for(cfg) -> str:  # noqa: ANN001
-    if cfg.profile != "auto":
-        return cfg.profile
-    return "mac" if sys.platform == "darwin" else "demo"
+def _profile_for(cfg) -> str:
+    from .config import resolved_profile
+
+    return resolved_profile(cfg)
 
 
-def cmd_doctor(cfg) -> int:  # noqa: ANN001
-    from .config import load_config  # noqa: F401
-
+def cmd_doctor(cfg) -> int:
     checks: list[tuple[str, bool, str]] = []
 
     def check(name: str, ok: bool, note: str = "") -> None:
@@ -36,6 +34,7 @@ def cmd_doctor(cfg) -> int:  # noqa: ANN001
             check(f"python: {mod}", False, str(exc)[:60])
 
     import shutil
+    import urllib.request
 
     for binary in ("say", "osascript", "pbcopy", "whisper-cli", "ollama"):
         check(f"binary: {binary}", shutil.which(binary) is not None,
@@ -44,17 +43,49 @@ def cmd_doctor(cfg) -> int:  # noqa: ANN001
     check("platform is macOS", sys.platform == "darwin",
           "demo profile elsewhere" if sys.platform != "darwin" else "")
 
+    if _profile_for(cfg) == "mac":
+        # Live capability checks — the same honesty the Setup panel shows.
+        from . import permissions as perms
+
+        check("microphone", perms.request_microphone(timeout=5.0)[0] == "ok",
+              "open it in Aura's Setup panel" if perms.is_mac() else "")
+        check("accessibility", perms.check_accessibility() is True,
+              "grant in System Settings (Aura's Setup panel opens it)")
+        check("wake models", perms.check_wake_models(cfg)[0],
+              perms.check_wake_models(cfg)[1])
+        check("whisper model", perms.check_whisper_cpp(cfg),
+              cfg.stt.whisper_model or "no model path configured")
+        if cfg.planner.engine != "mock":
+            try:
+                url = cfg.planner.base_url.rstrip("/") + "/models"
+                with urllib.request.urlopen(url, timeout=2) as resp:
+                    live = resp.status == 200
+            except Exception:
+                live = False
+            check("planner server", live,
+                  f"{cfg.planner.base_url} ({cfg.planner.model})" +
+                  (" — is Ollama running?" if not live else ""))
+        else:
+            check("planner server", True, "mock (basic mode)")
+        check("Aura.app installed",
+              shutil.which("open") is not None and
+              (__import__("pathlib").Path("/Applications/Aura.app").is_dir()),
+              "/Applications/Aura.app" if __import__("pathlib").Path("/Applications/Aura.app").is_dir()
+              else "run ./scripts/install.sh")
+
     print("Aura doctor — capability matrix")
-    print("=" * 46)
+    print("=" * 52)
     for name, ok, note in checks:
         mark = "✔" if ok else "✘"
-        print(f"  {mark}  {name:24s} {note}")
-    print("=" * 46)
-    print("Run `python -m aura serve` to start. Demo profile works anywhere.")
+        print(f"  {mark}  {name:20s} {note}")
+    print("=" * 52)
+    print("Run `python -m aura serve` to start (or open Aura from /Applications).")
     return 0
 
 
-def cmd_serve(cfg) -> int:  # noqa: ANN001
+def cmd_serve(cfg) -> int:
+    from pathlib import Path
+
     from .events import EventBus
     from .laya import ExampleBuffer, build_backend
     from .memory import Memory
@@ -65,7 +96,6 @@ def cmd_serve(cfg) -> int:  # noqa: ANN001
     from .skills import build_default_registry
     from .stt import build_stt
     from .tts import build_tts
-    from pathlib import Path
 
     data_dir = Path(cfg.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -108,7 +138,7 @@ def cmd_serve(cfg) -> int:  # noqa: ANN001
     return 0
 
 
-def _build_bridge(cfg):  # noqa: ANN001
+def _build_bridge(cfg):
     from .skills import DryRunBridge, MacBridge
 
     if cfg.profile == "demo":
@@ -119,12 +149,14 @@ def _build_bridge(cfg):  # noqa: ANN001
 
 
 def main(argv: list[str] | None = None) -> int:
+    from . import __version__
     from .config import load_config
 
     parser = argparse.ArgumentParser(prog="aura", description="Aura — your Mac, at your command.")
     parser.add_argument("command", nargs="?", default="serve",
                         choices=["serve", "doctor"])
     parser.add_argument("--config", help="path to a config.toml")
+    parser.add_argument("--version", action="version", version=f"aura {__version__}")
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)

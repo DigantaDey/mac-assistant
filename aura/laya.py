@@ -127,7 +127,7 @@ class HeuristicBackend(LayaBackend):
         return Decision(match=min(match, 0.99), destructive=destructive, backend="heuristic")
 
 
-def build_backend(cfg) -> LayaBackend:  # noqa: ANN001
+def build_backend(cfg) -> LayaBackend:
     if cfg.laya.backend in ("auto", "laya"):
         try:
             return RealLayaBackend(adapter_dir=cfg.laya.adapter_dir)

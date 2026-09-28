@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
-from aura.config import (LIVE_FIELDS, load_config, runtime_overrides_path,
-                         watch_paths, write_overrides)
 from conftest import DemoStack
+
+from aura.config import (
+    LIVE_FIELDS,
+    load_config,
+    runtime_overrides_path,
+    watch_paths,
+    write_overrides,
+)
 
 
 class TestWriteOverrides:
@@ -31,7 +37,6 @@ class TestWriteOverrides:
     def test_atomic_and_valid_toml(self, tmp_path):
         for i in range(3):
             write_overrides(tmp_path, {"wake": {"threshold": 0.5 + i / 10}})
-        cfg = load_config.__wrapped__ if hasattr(load_config, "__wrapped__") else None
         import tomllib
         raw = tomllib.loads(runtime_overrides_path(tmp_path).read_text())
         assert raw["wake"]["threshold"] == 0.7

@@ -19,6 +19,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+try:  # optional — the deterministic basic mode works without it
+    import httpx
+except Exception:  # pragma: no cover - depends on host
+    httpx = None  # type: ignore[assignment]
+
 RISKS = ("safe", "confirm")
 
 
@@ -38,10 +43,13 @@ class Plan:
     reply: str
     actions: list[Action] = field(default_factory=list)
     latency_ms: int = 0
+    # True when the plan came from the deterministic basic layer because the
+    # local LLM was unreachable — the UI shows a subtle "basic mode" note.
+    degraded: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {"reply": self.reply, "actions": [a.as_dict() for a in self.actions],
-                "latency_ms": self.latency_ms}
+                "latency_ms": self.latency_ms, "degraded": self.degraded}
 
 
 class Planner:
@@ -164,7 +172,9 @@ def parse_plan(raw: dict[str, Any] | None, latency_ms: int = 0) -> Plan:
 
 
 class OpenAICompatPlanner(Planner):
-    def __init__(self, cfg, catalog_prompt: str) -> None:  # noqa: ANN001
+    def __init__(self, cfg, catalog_prompt: str) -> None:
+        if httpx is None:
+            raise RuntimeError("httpx is not installed — pip install -e '.[mac]'")
         self.base_url = cfg.planner.base_url.rstrip("/")
         self.model = cfg.planner.model
         self.api_key = cfg.planner.api_key
@@ -206,7 +216,74 @@ class OpenAICompatPlanner(Planner):
 
 
 # --------------------------------------------------------------------------- #
-# Deterministic mock planner — demo profile & tests                            #
+# Hybrid planner — the real brain, with an honest basic mode                   #
+# --------------------------------------------------------------------------- #
+
+
+class HybridPlanner(Planner):
+    """LLM-first planning with a deterministic fallback for core intents.
+
+    The local LLM (Ollama, mlx_lm, …) is the brain; when it is unreachable —
+    not installed, model not pulled, or the machine just booted — Aura does
+    not go silent. It degrades to the built-in basic intents ("open X",
+    "set volume to N", "search for Y", …) and flags the plan `degraded` so
+    the UI can say so. A fast /models probe with a short-TTL cache decides
+    which path to take, and failed requests re-probe on the next attempt.
+    """
+
+    def __init__(self, cfg, catalog_prompt: str) -> None:
+        self.cfg = cfg
+        self.llm = OpenAICompatPlanner(cfg, catalog_prompt)
+        self.basic = MockPlanner(catalog_prompt, cfg.planner.max_actions)
+        self._online: bool = False
+        self._last_probe = 0.0
+        self._last_error = ""
+
+    # -- availability ------------------------------------------------------ #
+
+    def probe(self) -> bool:
+        """Is the local LLM endpoint answering? Cached: ≤1 check / 15 s."""
+        now = time.monotonic()
+        if self._online and now - self._last_probe < 15.0:
+            return True
+        if now - self._last_probe < 3.0:
+            return self._online
+        self._last_probe = now
+        try:
+            with httpx.Client(timeout=1.5) as client:
+                resp = client.get(f"{self.llm.base_url}/models")
+                self._online = resp.status_code == 200
+            if self._online:
+                self._last_error = ""
+        except Exception as exc:
+            self._online = False
+            self._last_error = str(exc).splitlines()[0][:160]
+        return self._online
+
+    @property
+    def status(self) -> dict[str, Any]:
+        """For /api/state: engine, live status, and the last error, if any."""
+        return {"engine": "openai_compat", "online": self._online,
+                "model": self.llm.model, "base_url": self.llm.base_url,
+                "last_error": self._last_error}
+
+    async def plan(self, transcript: str, context: dict[str, Any]) -> Plan:
+        if self.probe():
+            try:
+                plan = await self.llm.plan(transcript, context)
+                plan.degraded = False
+                return plan
+            except Exception as exc:
+                self._online = False
+                self._last_error = str(exc).splitlines()[0][:160]
+                # fall through — the user still gets an answer
+        plan = await self.basic.plan(transcript, context)
+        plan.degraded = True
+        return plan
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic mock planner — demo profile, basic mode & tests                #
 # --------------------------------------------------------------------------- #
 
 
@@ -315,7 +392,7 @@ class MockPlanner(Planner):
             reply = "Reading your clipboard."
         elif "copy" in t and "clipboard" in t:
             m2 = re.search(r'copy "([^"]+)"', t) or re.search(r"copy (.+)", t)
-            text = m2.group(1).strip("to the.!") if m2 else ""
+            text = m2.group(1).strip() if m2 else ""
             actions.append(Action("clipboard.set_text", {"text": text}, "safe", "asked to copy"))
             reply = "Copied to the clipboard."
         elif "recording" in t and ("start" in t or "begin" in t):
@@ -328,12 +405,18 @@ class MockPlanner(Planner):
         return Plan(reply=reply, actions=actions)
 
 
-def build_planner(cfg, catalog_prompt: str):  # noqa: ANN001
+def build_planner(cfg, catalog_prompt: str):
+    """Choose the planner for this machine.
+
+    * mock          — demo profile & tests
+    * auto / openai_compat — HybridPlanner (LLM + basic-mode fallback) when
+      httpx is available; otherwise the basic layer alone, honestly labeled.
+    """
     if cfg.planner.engine == "mock":
         return MockPlanner(catalog_prompt, cfg.planner.max_actions)
-    if cfg.planner.engine in ("auto", "openai_compat"):
+    if cfg.planner.engine in ("auto", "openai_compat") and httpx is not None:
         try:
-            return OpenAICompatPlanner(cfg, catalog_prompt)
+            return HybridPlanner(cfg, catalog_prompt)
         except Exception:
-            return MockPlanner(catalog_prompt, cfg.planner.max_actions)
+            pass
     return MockPlanner(catalog_prompt, cfg.planner.max_actions)
