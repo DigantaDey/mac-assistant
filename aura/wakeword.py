@@ -4,7 +4,7 @@ Two sources of wake models, both on-device:
 
 1. Pretrained openWakeWord models (e.g. "hey_jarvis") — instant, works today.
 2. A custom model the user trains for *their* phrase via
-   scripts/train_wakeword.py (openWakeWord trainer, Apache-2.0). The trained
+   in-app Wake Phrase training (aura.wakeword_trainer). The trained
    ONNX file is dropped in the data dir and referenced from config; nothing
    about this module changes.
 
@@ -102,10 +102,89 @@ class ManualTrigger(WakeEngine):
         return False
 
 
+class TemplateWakeEngine(WakeEngine):
+    """Detects the user's own trained phrase — the .npz from the in-app
+    Wake Phrase Studio. Scores the rolling one-second window with the same
+    embedding and length normalization the trainer calibrated on; fires once
+    per accepted wake, with a refractory period."""
+
+    SCORE_EVERY = 8          # frames (~0.26 s) between scoring passes
+
+    def __init__(self, model_path: str, threshold_margin: float = 0.0) -> None:
+        try:
+            import numpy as np_
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(f"numpy unavailable: {exc}") from exc
+        self._np = np_
+        from .wakeword_trainer import SR, WINDOW_S, spectral_embedding
+
+        self._embed = spectral_embedding
+        self._window_samples = int(WINDOW_S * SR) * 2  # int16 → bytes
+        try:
+            data = np_.load(model_path, allow_pickle=False)
+        except Exception as exc:
+            raise RuntimeError(f"could not load wake template {model_path}: {exc}") from exc
+        self.template = data["template"]
+        self.threshold = float(data["threshold"]) + threshold_margin
+        self.phrase = str(data.get("phrase", ""))
+        self._buf = bytearray()
+        self._since_score = 0
+        self._last_fire = 0.0
+
+    def feed(self, frame) -> bool:  # noqa: ANN001
+        pcm = frame.pcm
+        self._buf.extend(pcm.tobytes() if hasattr(pcm, "tobytes") else bytes(pcm))
+        self._since_score += 1
+        if self._since_score < self.SCORE_EVERY:
+            return False
+        self._since_score = 0
+        if len(self._buf) < self._window_samples:
+            return False
+
+        window = self._np.frombuffer(
+            bytes(self._buf[-self._window_samples:]), dtype=self._np.int16)
+        emb = self._embed(window)
+        denom = float(self._np.linalg.norm(emb) * self._np.linalg.norm(self.template))
+        if denom == 0:
+            return False
+        score = float(self._np.dot(emb, self.template) / denom)
+        if score < self.threshold:
+            return False
+        now = time.monotonic()
+        if now - self._last_fire < 2.5:
+            return False
+        self._last_fire = now
+        self._buf.clear()
+        return True
+
+    def reset(self) -> None:
+        self._buf.clear()
+
+
+def load_template_meta(model_path: str) -> dict:
+    """Phrase + threshold of a trained template, for display in the UI."""
+    try:
+        import numpy as np_
+
+        data = np_.load(model_path, allow_pickle=False)
+        return {"phrase": str(data.get("phrase", "")),
+                "threshold": float(data["threshold"])}
+    except Exception:
+        return {}
+
+
 def build_wake_engine(cfg) -> WakeEngine:  # noqa: ANN001 - Config is dataclass
     """Factory used by the orchestrator; never raises — falls back to manual."""
     mode = getattr(cfg.wake, "mode", "manual")
     if mode == "openwakeword":
+        # A trained template (.npz from the Wake Phrase panel) always wins —
+        # it is the user's own voice, calibrated on this machine.
+        for m in cfg.wake.models or []:
+            if str(m).endswith(".npz"):
+                try:
+                    return TemplateWakeEngine(str(m))
+                except RuntimeError:
+                    break
         try:
             return OpenWakeWordEngine(
                 models=cfg.wake.models,

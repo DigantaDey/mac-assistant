@@ -55,7 +55,23 @@ mainstream gap.
 - [ ] Laya element-picking with the real Laya fine-tune (v10s-style
       checkpoint over AX labels; coarse-to-fine already wired)
 
-## v0.4 — Depth
+## v0.4 — Ownable product ✅ (shipped)
+- [x] **Wake Phrase Studio**: train your own phrase inside the app — type it,
+      say it a few times when prompted, done in seconds. Spectral-template
+      trainer (80-dim log-band embedding, length-normalized to a shared
+      1 s window; calibrated cosine threshold; synthesized + `say`-rendered
+      negatives; sample quality judge with friendly guidance)
+- [x] `TemplateWakeEngine` — detection on the user's own voice, refractory,
+      live rebuild the moment training finishes (no restart)
+- [x] **In-app installer** (Setup panel): whisper.cpp model download with
+      visible progress, environment probe, hot-swapped STT — no commands
+- [x] **Installed-app story**: `install_mac.sh` ends with Aura.app in
+      /Applications, opened; after install the terminal never appears again
+- [x] **Zero-demo on user machines**: the developer-build banner and every
+      simulated surface appear only off-Mac; permissions drive the gating
+- [x] Full Apple-grade copy pass over every UI string; version 0.4.0
+
+## v0.5 — Depth
 - [ ] Browser extension (MV3) + CDP: read/act on DOM, forms, multi-tab flows
 - [ ] Window management skills (positions, spaces) via AX
 - [ ] Procedures: "watch me do this once" → recorded, editable, replayable

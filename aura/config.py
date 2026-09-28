@@ -30,6 +30,7 @@ RUNTIME_FILE = "runtime.toml"
 # requires a restart — an honest, explicit list.
 LIVE_FIELDS: dict[str, set[str]] = {
     "wake": {"enabled", "mode", "models", "threshold", "refractory_seconds", "phrase"},
+    "stt": {"whisper_model"},   # the orchestrator rebuilds the STT engine live
     "tts": {"enabled", "voice", "rate"},
     "laya": {"confidence_threshold", "destructive_threshold"},
     "safety": {"show_plan_before_run", "confirm_destructive", "blocked_patterns"},
@@ -48,7 +49,7 @@ class WakeConfig:
     enabled: bool = True
     # "manual"       — trigger from UI / hotkey (works everywhere, great for testing)
     # "openwakeword" — always-on on-device wake model(s); a custom phrase model
-    #                  trained via scripts/train_wakeword.py can be dropped in.
+    #                  trained in-app via the Wake Phrase panel can be dropped in.
     mode: str = "manual"
     # Pretrained model names, or absolute paths to custom ONNX models the user
     # trained for their own activation phrase.

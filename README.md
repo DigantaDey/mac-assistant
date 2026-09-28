@@ -84,15 +84,11 @@ A thin Swift/AppKit shell (no Xcode project needed — just `swift build`):
 launches/restarts the Python engine for you, and offers Start-at-Login.
 See [macos/README.md](macos/README.md).
 
-### Make the wake word yours
+### Make the wake phrase yours
 
-```bash
-python scripts/train_wakeword.py "hey aura"   # trains locally, ~20 min
-```
-
-Drop the resulting ONNX where it says, set `wake.mode = "openwakeword"` in
-`config.toml`, and Aura will answer to *your* phrase — trained on your machine,
-never leaving it.
+Open Aura, choose **Wake Phrase**, type the phrase you want, and say it a few
+times when prompted. Training takes seconds, runs entirely on this Mac, and the
+phrase is live the moment you confirm — no terminal, no configuration files.
 
 ---
 
@@ -100,7 +96,7 @@ never leaving it.
 
 | | |
 |---|---|
-| **Wake** | openWakeWord models + a spoken-phrase second factor; custom self-trained models |
+| **Wake** | openWakeWord models, or **your own phrase trained in-app** (Wake Phrase panel, seconds, on-device) |
 | **STT** | whisper.cpp (Metal/CoreML) → faster-whisper → typed input, auto-selected |
 | **Plan** | any local OpenAI-compatible server: Ollama, `mlx_lm.server`, llama.cpp, LM Studio |
 | **Gate** | [Laya](docs/RESEARCH.md) (Apache-2.0) — calibrated match/destructive scores in milliseconds; deterministic heuristic fallback |

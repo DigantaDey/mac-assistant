@@ -54,3 +54,46 @@ class TestServer:
         assert events[0]["transcript"] == "open spotify"
         assert events[0]["outcome"] == "ok"
         assert any("Spotify" in c[1] for c in orch.bridge.calls)
+
+    # ------------------------------------------------------------------ #
+    # Wake Phrase Studio + in-app installer over HTTP                      #
+    # ------------------------------------------------------------------ #
+
+    def test_training_endpoints_honest_without_mic(self, server):
+        orch, srv, cfg = server
+        base = f"http://127.0.0.1:{cfg.server.port}"
+        _, status = get(f"{base}/api/wake/train")
+        assert json.loads(status) == {"active": False}
+
+        _, res = post(f"{base}/api/wake/train", {"phrase": "hey aura"})
+        assert res["ok"] is False
+        assert "microphone" in res["message"].lower()
+
+    def test_training_endpoints_with_mic(self, server):
+        orch, srv, cfg = server
+        base = f"http://127.0.0.1:{cfg.server.port}"
+
+        _, bad = post(f"{base}/api/wake/train", {"phrase": "way too many words here ok"})
+        assert bad["ok"] is False
+
+        orch._has_audio = True  # simulate granted microphone
+        _, res = post(f"{base}/api/wake/train", {"phrase": "Hey Aura"})
+        assert res["ok"] is True and res["need"] == 6
+
+        _, status = get(f"{base}/api/wake/train")
+        st = json.loads(status)
+        assert st["active"] and st["phrase"] == "hey aura" and st["count"] == 0
+
+        _, cap = post(f"{base}/api/wake/train/capture", {})
+        assert cap["ok"] is True
+
+        _, cancel = post(f"{base}/api/wake/train/cancel", {})
+        assert cancel["ok"] is True
+        _, status = get(f"{base}/api/wake/train")
+        assert json.loads(status) == {"active": False}
+
+    def test_setup_install_refused_in_demo(self, server):
+        _, srv, cfg = server
+        base = f"http://127.0.0.1:{cfg.server.port}"
+        _, res = post(f"{base}/api/setup/install", {})
+        assert res["ok"] is False

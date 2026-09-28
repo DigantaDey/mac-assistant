@@ -14,6 +14,12 @@ Endpoints:
   GET  /api/skills        the skill catalog
   GET  /api/permissions   honest permission + readiness snapshot
   POST /api/wake          live wake-mode switch {mode: manual|openwakeword, phrase?}
+  POST /api/wake/train          start a training session {phrase}
+  POST /api/wake/train/capture  record the next utterance as a sample
+  POST /api/wake/train/finish   train + go live (watches for the phrase)
+  POST /api/wake/train/cancel   discard the session
+  GET  /api/wake/train          session status
+  POST /api/setup/install       in-app component install (progress → SSE)
   GET  /api/metrics       lightweight self-observation (RSS, engines, examples)
   POST /api/permissions/open            {target: microphone|accessibility|automation}
   POST /api/permissions/test_automation  sends one harmless AppleEvent probe
@@ -112,6 +118,8 @@ class AuraServer:
                     self._json(_permissions_snapshot(orch, cfg))
                 elif path == "/api/metrics":
                     self._json(orch.metrics())
+                elif path == "/api/wake/train":
+                    self._json(orch.training_status())
                 elif path == "/api/history":
                     self._json({"events": orch.memory.recent_events(100)})
                 elif path == "/api/events":
@@ -194,6 +202,25 @@ class AuraServer:
                         self._json(future.result(timeout=5))
                     except Exception:
                         self._json({"ok": False, "message": "wake switch timed out"}, 503)
+                elif path == "/api/wake/train":
+                    self._json(orch.training_start(str(body.get("phrase", ""))))
+                elif path == "/api/wake/train/capture":
+                    self._json(orch.training_capture())
+                elif path == "/api/wake/train/cancel":
+                    self._json(orch.training_cancel())
+                elif path == "/api/wake/train/finish":
+                    future = asyncio.run_coroutine_threadsafe(
+                        orch.training_finish(), loop)
+                    try:
+                        self._json(future.result(timeout=120))
+                    except Exception:
+                        self._json({"ok": False, "message": "training timed out"}, 503)
+                elif path == "/api/setup/install":
+                    future = asyncio.run_coroutine_threadsafe(orch.run_setup(), loop)
+                    try:
+                        self._json(future.result(timeout=30))
+                    except Exception:
+                        self._json({"ok": False, "message": "install timed out"}, 503)
                 else:
                     self._json({"error": "not found"}, 404)
 

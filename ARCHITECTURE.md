@@ -37,7 +37,7 @@ paranoid gate, and dumb-but-perfect executors.
   wake and unload after `session.idle_unload_seconds` — that's the ~200 MB idle
   promise.
 - Wake supports pretrained openWakeWord models and user-trained custom-phrase
-  ONNX models (`scripts/train_wakeword.py`). A configurable **spoken phrase
+  in-app training (the Wake Phrase panel). A configurable **spoken phrase
   gate** adds a second factor: in always-on mode the transcript must begin
   with the user's phrase, killing false accepts.
 - STT is a one-method interface with three backends; whisper.cpp is preferred

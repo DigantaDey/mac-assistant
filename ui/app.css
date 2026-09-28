@@ -455,6 +455,21 @@ kbd {
 .setup-result.bad { color: #ffb4ad; border-color: rgba(255, 69, 58, 0.25); }
 .risk-unknown { color: var(--ink-3); background: rgba(255, 255, 255, 0.06); }
 
+/* sample dots (Wake Phrase Studio) + install progress */
+.sample-dots { display: flex; gap: 8px; margin: 14px 0 2px; }
+.dot { width: 12px; height: 12px; border-radius: 50%;
+  background: rgba(255, 255, 255, 0.1); border: 1px solid var(--hairline);
+  transition: all var(--t-med) var(--ease-spring); }
+.dot.is-on { background: var(--grad-accent); border-color: transparent;
+  box-shadow: 0 0 10px rgba(10, 132, 255, 0.45); transform: scale(1.1); }
+.install-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.install-row { display: flex; align-items: baseline; gap: 10px; font-size: 12.5px; }
+.install-mark { width: 16px; text-align: center; font-weight: 700; color: var(--ink-3); }
+.install-mark.ok { color: var(--green); }
+.install-mark.fail { color: var(--red); }
+.install-mark.running { color: var(--accent); animation: breathe 1.6s ease-in-out infinite; }
+.install-detail { margin-left: auto; color: var(--ink-3); font-size: 11.5px; text-align: right; }
+
 /* ── Compact layout — the menu-bar popover is 480 pt wide ─────────────── */
 
 @media (max-width: 620px) {

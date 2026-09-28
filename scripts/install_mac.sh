@@ -67,12 +67,27 @@ say_step "Doctor — what will run on this Mac"
 python -m aura doctor || true
 
 say_step "Done"
-cat <<EOF
+if [ -x /usr/bin/swift ] || command -v swift >/dev/null 2>&1; then
+  say_step "Building the Aura app"
+  if ./scripts/make_app.sh --install; then
+    say_step "Opening Aura"
+    open /Applications/Aura.app
+    cat <<EOF
 
-  Start Aura:            source .venv/bin/activate && python -m aura serve
-  Native menu-bar app:   ./scripts/make_app.sh --install
-  Make it yours:         python scripts/train_wakeword.py "your phrase"
+  Aura is installed in /Applications and running in your menu bar.
+  Train your phrase:     Aura's Wake Phrase panel — a few seconds of your voice
   First run permissions: Aura's Setup panel walks you through each one.
 
   Everything above was downloaded to this machine. Aura never phones home.
+EOF
+    exit 0
+  fi
+fi
+cat <<EOF
+
+  Aura's engine is ready. To finish, install the menu-bar app:
+
+  ./scripts/make_app.sh --install
+
+  (That single step puts Aura in /Applications — after this, no terminal ever.)
 EOF

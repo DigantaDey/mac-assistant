@@ -55,6 +55,12 @@ class Session:
     started: float = field(default_factory=time.monotonic)
 
 
+@dataclass
+class TrainingState:
+    phrase: str
+    samples: list = field(default_factory=list)
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -97,6 +103,10 @@ class Orchestrator:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_activity = time.monotonic()
         self._file_mtimes: dict[str, float] = {}
+        self._trainer: TrainingState | None = None
+        self._train_capture_armed = False
+        self._train_vad = EnergyVAD(end_silence_seconds=0.6, max_seconds=4.0)
+        self._setup_running = False
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop:
@@ -198,6 +208,10 @@ class Orchestrator:
             return
         if "wake.mode" in changed or "wake.models" in changed or "wake.threshold" in changed:
             self._wake = self._build_wake()
+        if "stt.whisper_model" in changed:
+            from .stt import build_stt
+
+            self.stt = build_stt(self.cfg)
         self.bus.publish("config", changed=changed)
         self.bus.publish("log", line="hot-reloaded: " + ", ".join(changed))
 
@@ -264,7 +278,13 @@ class Orchestrator:
     async def _audio_loop(self) -> None:
         while True:
             frame = await self._queue.get()
-            if self.state == "armed" and self._wake:
+            if self.state == "armed" and self._trainer is not None and self._train_capture_armed:
+                verdict = self._train_vad.feed(frame)
+                if verdict in ("end", "timeout"):
+                    frames = self._train_vad.pcm_frames()
+                    self._train_capture_armed = False
+                    self._handle_train_sample(frames)
+            elif self.state == "armed" and self._wake:
                 if self._wake.feed(frame):
                     await self.begin_capture()
             elif self.state == "capturing":
@@ -472,6 +492,161 @@ class Orchestrator:
         self.state = "armed"
         self._last_activity = time.monotonic()
         self.bus.publish("state", state=self.state)
+
+    # ------------------------------------------------------------------ #
+    # Wake Phrase Studio — guided, in-app training (no terminal, ever)     #
+    # ------------------------------------------------------------------ #
+
+    TRAIN_SAMPLES_NEEDED = 6
+    TRAIN_SAMPLES_MINIMUM = 3
+
+    def training_start(self, phrase: str) -> dict:
+        phrase = " ".join(str(phrase or "").split())
+        words = phrase.split()
+        if not (1 <= len(words) <= 5) or not all(w.isalpha() for w in words):
+            return {"ok": False,
+                    "message": "Pick one to five simple words — they become the phrase you train."}
+        if not self._has_audio:
+            return {"ok": False,
+                    "message": "Aura can't hear you yet — allow the microphone in Setup first."}
+        try:
+            import numpy  # noqa: F401
+        except Exception:
+            return {"ok": False,
+                    "message": "The trainer needs a component — install it from Setup."}
+        if self.state != "armed" or self.session is not None:
+            return {"ok": False, "message": "Finish the current request first."}
+
+        self._trainer = TrainingState(phrase=phrase.lower())
+        self.bus.publish("train_update", phase="capture", phrase=phrase.lower(),
+                         count=0, need=self.TRAIN_SAMPLES_NEEDED)
+        return {"ok": True, "need": self.TRAIN_SAMPLES_NEEDED,
+                "minimum": self.TRAIN_SAMPLES_MINIMUM}
+
+    def training_capture(self) -> dict:
+        if self._trainer is None:
+            return {"ok": False, "message": "Start training first."}
+        if self.state != "armed" or self.session is not None:
+            return {"ok": False, "message": "One moment — finish the current request."}
+        self._train_capture_armed = True
+        self._train_vad.reset()
+        self.bus.publish("train_update", phase="listening",
+                         phrase=self._trainer.phrase,
+                         count=len(self._trainer.samples),
+                         need=self.TRAIN_SAMPLES_NEEDED)
+        return {"ok": True}
+
+    def _handle_train_sample(self, frames: list[AudioFrame]) -> None:
+        if self._trainer is None:
+            return
+        import numpy as np
+
+        from .wakeword_trainer import judge_sample
+
+        pcm = b"".join(f.pcm.tobytes() for f in frames if hasattr(f.pcm, "tobytes"))
+        quality = judge_sample(pcm)
+        count = len(self._trainer.samples)
+        if quality.ok:
+            self._trainer.samples.append(
+                np.frombuffer(pcm, dtype=np.int16).astype(np.float32))
+            count = len(self._trainer.samples)
+            message = (f"Sample {count} of {self.TRAIN_SAMPLES_NEEDED} captured."
+                       if count < self.TRAIN_SAMPLES_NEEDED
+                       else "All samples captured — ready to train.")
+        else:
+            message = quality.message
+        phase = "ready" if count >= self.TRAIN_SAMPLES_NEEDED else "capture"
+        self.bus.publish("train_sample", ok=quality.ok, message=message,
+                         count=count, need=self.TRAIN_SAMPLES_NEEDED,
+                         phase=phase, seconds=round(quality.seconds, 2))
+        self.bus.publish("train_update", phase=phase, phrase=self._trainer.phrase,
+                         count=count, need=self.TRAIN_SAMPLES_NEEDED)
+
+    def training_status(self) -> dict:
+        if self._trainer is None:
+            return {"active": False}
+        return {"active": True, "phrase": self._trainer.phrase,
+                "count": len(self._trainer.samples),
+                "need": self.TRAIN_SAMPLES_NEEDED,
+                "listening": self._train_capture_armed}
+
+    def training_cancel(self) -> dict:
+        self._trainer = None
+        self._train_capture_armed = False
+        self.bus.publish("train_update", phase="idle", count=0,
+                         need=self.TRAIN_SAMPLES_NEEDED)
+        return {"ok": True}
+
+    async def training_finish(self) -> dict:
+        if self._trainer is None or len(self._trainer.samples) < self.TRAIN_SAMPLES_MINIMUM:
+            return {"ok": False,
+                    "message": "Record a few more samples first — three at minimum."}
+        from pathlib import Path as _Path
+
+        from .wakeword_trainer import (save_template, slugify, spectral_embedding,
+                                       train_wake)
+
+        trainer = self._trainer
+        phrase = trainer.phrase
+
+        def work():
+            # Re-embed once here so train_wake receives feature-ready float32
+            # arrays straight from the user's recordings.
+            return train_wake(trainer.samples)
+
+        try:
+            trained = await self.loop.run_in_executor(None, work)
+        except Exception as exc:
+            self.bus.publish("log", line=f"training failed: {exc}")
+            return {"ok": False, "message": f"Training didn't take: {exc}"}
+
+        out_dir = _Path(self.cfg.data_dir) / "wakewords"
+        path = save_template(trained, phrase, out_dir / f"{slugify(phrase)}.npz")
+
+        # Go live immediately and remember the choice.
+        self.cfg.wake.models = [str(path)]
+        self.cfg.wake.mode = "openwakeword"
+        self.cfg.wake.phrase = phrase
+        try:
+            config_mod.write_overrides(self.cfg.data_dir, {"wake": {
+                "models": [str(path)], "mode": "openwakeword", "phrase": phrase}})
+        except OSError as exc:
+            self.bus.publish("log", line=f"could not persist wake model: {exc}")
+        self._remember_mtimes()
+        self._wake = self._build_wake()
+        self._trainer = None
+        self.bus.publish("train_update", phase="done", phrase=phrase,
+                         threshold=round(trained.threshold, 3),
+                         margin=round(trained.margin, 3))
+        self.bus.publish("log", line=f"Wake phrase “{phrase}” trained and active.")
+        return {"ok": True, "phrase": phrase, "path": str(path),
+                "threshold": round(trained.threshold, 3),
+                "margin": round(trained.margin, 3),
+                "engine": type(self._wake).__name__}
+
+    # ------------------------------------------------------------------ #
+    # In-app component install (Setup panel — nothing typed, ever)         #
+    # ------------------------------------------------------------------ #
+
+    async def run_setup(self) -> dict:
+        if self._setup_running:
+            return {"ok": False, "message": "An install is already running."}
+        if self.cfg.profile == "demo":
+            return {"ok": False,
+                    "message": "Development build — component install runs on a real install."}
+        self._setup_running = True
+        try:
+            await self.loop.run_in_executor(None, self._run_setup_sync)
+        finally:
+            self._setup_running = False
+        return {"ok": True}
+
+    def _run_setup_sync(self) -> None:
+        from pathlib import Path as _Path
+
+        from .setup_installer import run_installer
+
+        run_installer(self, _Path(__file__).resolve().parent.parent)
 
     # ------------------------------------------------------------------ #
     # Confirmation / feedback API (called from server threads)             #
