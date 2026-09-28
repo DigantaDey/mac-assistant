@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Aura</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body data-view="overview">
+
+<div class="app">
+
+  <!-- ══════════ Sidebar ══════════ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div class="brand-text">
+        <span class="brand-name">Aura</span>
+        <span class="brand-sub" id="conn-badge">connecting…</span>
+      </div>
+    </div>
+
+    <div class="status-card" id="status-card">
+      <div class="status-row">
+        <span class="status-dot" id="status-dot"></span>
+        <span class="status-label" id="status-label">Starting</span>
+      </div>
+      <div class="status-meta" id="status-meta">—</div>
+    </div>
+
+    <nav class="nav" aria-label="Main">
+      <a href="#overview" class="nav-item is-active" data-nav="overview">
+        <svg viewBox="0 0 20 20"><path d="M3 9.5 10 3l7 6.5V17a1 1 0 0 1-1 1h-4v-5H8v5H4a1 1 0 0 1-1-1V9.5Z"/></svg>
+        <span>Overview</span>
+      </a>
+      <a href="#activity" class="nav-item" data-nav="activity">
+        <svg viewBox="0 0 20 20"><path d="M10 3a7 7 0 1 1-6.5 4.4L10 10V3Zm1.5-1.1A8 8 0 1 0 18 10h-1.5A6.5 6.5 0 1 1 11.5 3.4V1.9Z"/></svg>
+        <span>Activity</span>
+        <span class="nav-badge" id="activity-count" hidden></span>
+      </a>
+      <a href="#skills" class="nav-item" data-nav="skills">
+        <svg viewBox="0 0 20 20"><path d="M3 3h6v6H3V3Zm8 0h6v6h-6V3ZM3 11h6v6H3v-6Zm8 0h6v6h-6v-6Z"/></svg>
+        <span>Skills</span>
+      </a>
+      <a href="#wake" class="nav-item" data-nav="wake">
+        <svg viewBox="0 0 20 20"><path d="M10 2a2.5 2.5 0 0 1 2.5 2.5v6a2.5 2.5 0 0 1-5 0v-6A2.5 2.5 0 0 1 10 2Zm-6 8.5a6 6 0 0 0 5 5.9V19h2v-2.6a6 6 0 0 0 5-5.9h-1.7a4.3 4.3 0 0 1-8.6 0H4Z"/></svg>
+        <span>Wake Word</span>
+      </a>
+      <a href="#settings" class="nav-item" data-nav="settings">
+        <svg viewBox="0 0 20 20"><path d="m16.7 8.3-.1-1.2 1.5-1.3-1.5-2.6-1.9.6a6.4 6.4 0 0 0-1-.6L13.4 1h-3l-.4 2a6.4 6.4 0 0 0-1 .5l-1.9-.6-1.5 2.6L6.9 6.7l-.1 1.2.1 1.2-1.5 1.3 1.5 2.6 1.9-.6c.3.2.6.4 1 .6l.4 2h3l.4-2c.3-.1.7-.3 1-.5l1.9.6 1.5-2.6-1.5-1.3.1-1.2ZM10 12.6a2.6 2.6 0 1 1 0-5.2 2.6 2.6 0 0 1 0 5.2Z" transform="translate(0 1.5)"/></svg>
+        <span>Settings</span>
+      </a>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="privacy-pill" title="Every model runs on this machine. No cloud, no telemetry.">
+        <svg viewBox="0 0 20 20"><path d="M10 2 4 4.5v5c0 4 2.6 7 6 8.5 3.4-1.5 6-4.5 6-8.5v-5L10 2Z"/></svg>
+        <span>100% on-device</span>
+      </div>
+      <div class="version" id="version">v0.1.0</div>
+    </div>
+  </aside>
+
+  <!-- ══════════ Main ══════════ -->
+  <main class="main">
+
+    <!-- ── Overview ── -->
+    <section class="view is-active" id="view-overview">
+      <div class="demo-banner" id="demo-banner" hidden>
+        <strong>Demo mode</strong> — actions are simulated on this machine. On your Mac,
+        Aura drives real apps, windows, sound and the browser.
+      </div>
+
+      <div class="hero">
+        <div class="caption" id="caption" hidden></div>
+        <div class="transcript-echo" id="transcript-echo" hidden></div>
+
+        <button class="orb" id="orb" aria-label="Wake Aura" title="Wake Aura (⌥Space)">
+          <canvas id="orb-canvas" width="360" height="360"></canvas>
+          <span class="orb-core" id="orb-core">
+            <svg viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3Zm-7 8a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11h-1.8a5.2 5.2 0 0 1-10.4 0H5Z"/></svg>
+          </span>
+        </button>
+
+        <h1 class="orb-title" id="orb-title">Say your wake word</h1>
+        <p class="orb-sub" id="orb-sub">or press the orb — then just talk</p>
+
+        <form class="composer" id="composer">
+          <input id="command-input" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="Type a command…  ⌘K" aria-label="Type a command">
+          <button type="submit" class="send" aria-label="Send">
+            <svg viewBox="0 0 20 20"><path d="M3 10h11M9.5 5.5 14 10l-4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </form>
+
+        <div class="chips" id="chips">
+          <button class="chip" data-cmd="Open Spotify">Open Spotify</button>
+          <button class="chip" data-cmd="Set volume to 30">Volume 30</button>
+          <button class="chip" data-cmd="Search for the weather in Kolkata">Search weather</button>
+          <button class="chip" data-cmd="Empty the trash">Empty trash</button>
+          <button class="chip" data-cmd="Remember that my editor is Zed">Teach a preference</button>
+        </div>
+      </div>
+
+      <!-- proposal: confirm before run -->
+      <div class="proposal card" id="proposal" hidden>
+        <div class="proposal-head">
+          <span class="proposal-shield" aria-hidden="true">
+            <svg viewBox="0 0 20 20"><path d="M10 2 4 4.5v5c0 4 2.6 7 6 8.5 3.4-1.5 6-4.5 6-8.5v-5L10 2Z"/></svg>
+          </span>
+          <div>
+            <h2>Aura wants to run <span id="proposal-count">1 action</span></h2>
+            <p class="muted" id="proposal-reason">Review before it runs.</p>
+          </div>
+        </div>
+        <ul class="proposal-actions" id="proposal-actions"></ul>
+        <div class="proposal-foot">
+          <button class="btn btn-ghost" id="btn-cancel">Cancel&nbsp;&nbsp;<kbd>esc</kbd></button>
+          <button class="btn btn-primary" id="btn-confirm">Run it&nbsp;&nbsp;<kbd>⌘↩</kbd></button>
+        </div>
+      </div>
+
+      <div class="live-actions" id="live-actions" hidden></div>
+    </section>
+
+    <!-- ── Activity ── -->
+    <section class="view" id="view-activity">
+      <header class="view-head">
+        <h1>Activity</h1>
+        <p class="muted">Everything Aura does is logged locally — inspectable, correctable, exportable.</p>
+      </header>
+      <div class="timeline" id="timeline"></div>
+    </section>
+
+    <!-- ── Skills ── -->
+    <section class="view" id="view-skills">
+      <header class="view-head">
+        <h1>Skills</h1>
+        <p class="muted" id="skills-sub">What Aura can do today.</p>
+      </header>
+      <div class="skill-grid" id="skill-grid"></div>
+    </section>
+
+    <!-- ── Wake word ── -->
+    <section class="view" id="view-wake">
+      <header class="view-head">
+        <h1>Wake Word</h1>
+        <p class="muted">Your activation phrase is yours — chosen, trained, and stored on this Mac.</p>
+      </header>
+      <div class="wake-grid">
+        <div class="card">
+          <h2>Activation</h2>
+          <div class="segmented" id="wake-mode" role="tablist">
+            <button class="seg is-active" data-mode="manual">Manual</button>
+            <button class="seg" data-mode="openwakeword">Always listening</button>
+          </div>
+          <p class="muted" id="wake-mode-help">
+            Manual: Aura listens only after you press the orb or hold the hotkey.
+          </p>
+        </div>
+        <div class="card">
+          <h2>Phrase gate</h2>
+          <label class="field">
+            <span>Spoken prefix that must start a command</span>
+            <input type="text" id="wake-phrase" placeholder="e.g. “hey aura”">
+          </label>
+          <p class="muted">In always-listening mode, the transcript must begin with this
+          phrase — a second factor that kills false wakes.</p>
+        </div>
+        <div class="card">
+          <h2>Train your own phrase</h2>
+          <ol class="steps">
+            <li>Pick a phrase that's yours — “hey aura”, “okay mac”, anything distinct.</li>
+            <li>Run <code>python scripts/train_wakeword.py "your phrase"</code>.</li>
+            <li>Drop the ONNX into your data folder and add its path to
+              <code>[wake] models</code> in <code>config.toml</code>.</li>
+          </ol>
+          <p class="muted">openWakeWord training runs locally, ~20 minutes on any Mac.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Settings ── -->
+    <section class="view" id="view-settings">
+      <header class="view-head">
+        <h1>Settings</h1>
+        <p class="muted">Live configuration — edit <code>config.toml</code> to change it. Hot-reload lands in v0.2.</p>
+      </header>
+      <div id="settings-body"></div>
+    </section>
+
+  </main>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<script src="/app.js"></script>
+</body>
+</html>
