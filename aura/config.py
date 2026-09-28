@@ -114,7 +114,10 @@ class TTSConfig:
 
 @dataclass
 class SafetyConfig:
-    show_plan_before_run: bool = True
+    # Strict mode: when on, even safe, confident actions pause for a yes.
+    # Destructive/risky actions ALWAYS confirm, with this on or off —
+    # the safety gate's "ask" can never be switched off.
+    show_plan_before_run: bool = False
     confirm_destructive: bool = True
     # Skills that always require explicit confirmation regardless of scoring.
     always_confirm: list[str] = field(default_factory=list)
@@ -158,6 +161,14 @@ class Config:
 # --------------------------------------------------------------------------- #
 
 
+def resolved_profile(cfg) -> str:
+    """What "auto" means on this machine — mac gets the real stack, the rest
+    get the safe demo profile. Everything user-facing must say the same thing."""
+    if cfg.profile != "auto":
+        return cfg.profile
+    return "mac" if sys.platform == "darwin" else "demo"
+
+
 def default_data_dir() -> Path:
     env = os.environ.get("AURA_DATA_DIR")
     if env:
@@ -194,21 +205,53 @@ def watch_paths(data_dir: str | Path | None = None) -> list[Path]:
 # --------------------------------------------------------------------------- #
 
 
+def _warn_bad_value(section: str, key: str, want: str, value: Any) -> None:
+    print(f"[config] ignoring {section}.{key} = {value!r} — expected {want}",
+          file=sys.stderr)
+
+
 def _apply(dc: Any, raw: dict[str, Any]) -> None:
-    """Merge a raw dict into a dataclass instance, ignoring unknown keys."""
+    """Merge a raw dict into a dataclass instance.
+
+    Unknown keys are ignored; a key whose *type* doesn't match is skipped
+    with a warning — a typo in the user's file must not corrupt the running
+    config (e.g. `models = "hey_jarvis"` where a list belongs).
+    """
     if not isinstance(raw, dict):
         return
+    section = type(dc).__name__
     known = {f.name for f in fields(dc)} if is_dataclass(dc) else set()
     for key, value in raw.items():
         if key not in known:
             continue
         current = getattr(dc, key)
-        if is_dataclass(current) and isinstance(value, dict):
-            _apply(current, value)
-        elif isinstance(current, list) and isinstance(value, list):
-            setattr(dc, key, value)
-        elif isinstance(current, bool) or isinstance(value, (str, int, float, bool, type(None))):
-            setattr(dc, key, value)
+        if is_dataclass(current):
+            if isinstance(value, dict):
+                _apply(current, value)
+            else:
+                _warn_bad_value(section, key, "a table", value)
+        elif isinstance(current, bool):
+            if isinstance(value, bool):
+                setattr(dc, key, value)
+            else:
+                _warn_bad_value(section, key, "true/false", value)
+        elif isinstance(current, list):
+            if isinstance(value, list):
+                setattr(dc, key, value)
+            else:
+                _warn_bad_value(section, key, "a list", value)
+        elif isinstance(current, (int, float)):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                setattr(dc, key, value)
+            else:
+                _warn_bad_value(section, key, "a number", value)
+        elif isinstance(current, str):
+            if isinstance(value, str):
+                setattr(dc, key, value)
+            else:
+                _warn_bad_value(section, key, "a string", value)
+        else:
+            _warn_bad_value(section, key, "a supported type", value)
 
 
 def _load_toml(path: Path) -> dict[str, Any] | None:
@@ -221,20 +264,41 @@ def _load_toml(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def load_config(explicit_path: str | None = None) -> Config:
+def load_config(explicit_path: str | None = None,
+                data_dir: str | None = None) -> Config:
     cfg = Config()
 
     # Data dir must exist before runtime overrides can be located.
     if os.environ.get("AURA_DATA_DIR"):
         cfg.data_dir = os.environ["AURA_DATA_DIR"]
     if not cfg.data_dir:
-        cfg.data_dir = str(default_data_dir())
+        cfg.data_dir = str(Path(data_dir).expanduser() if data_dir else default_data_dir())
 
+    # "auto" off-Mac resolves to the demo profile *as a base layer*:
+    # predictable providers unless the user's files say otherwise.
+    demo_base = cfg.profile == "auto" and sys.platform != "darwin"
+    if demo_base:
+        cfg.wake.mode = "manual"
+        cfg.stt.engine = "null"
+        cfg.planner.engine = "mock"
+        cfg.tts.engine = "null"
+
+    # Keys the demo base pins. The shipped config.default.toml describes the
+    # real (mac) install, so its pinned keys must not leak into demo mode —
+    # user files (explicit intent) still win over the demo base.
+    demo_pins = {"wake": {"mode"}, "stt": {"engine"},
+                 "planner": {"engine"}, "tts": {"engine"}}
     for path in (repo_default_config(), user_config_path(),
                  runtime_overrides_path(cfg.data_dir)):
         raw = _load_toml(path)
-        if raw:
-            _apply(cfg, raw)
+        if not raw:
+            continue
+        if demo_base and path == repo_default_config():
+            raw = {sec: ({k: v for k, v in vals.items()
+                          if k not in demo_pins.get(sec, set())}
+                         if isinstance(vals, dict) else vals)
+                   for sec, vals in raw.items()}
+        _apply(cfg, raw)
 
     if explicit_path:
         raw = _load_toml(Path(explicit_path).expanduser())
@@ -249,7 +313,8 @@ def load_config(explicit_path: str | None = None) -> Config:
     if os.environ.get("AURA_PORT"):
         cfg.server.port = int(os.environ["AURA_PORT"])
 
-    # Demo profile pinning: predictable providers so the flow works anywhere.
+    # An *explicit* demo profile stays pinned even over user files — that's
+    # the reproducible dev mode by definition (the UI says so too).
     if cfg.profile == "demo":
         cfg.wake.mode = "manual"
         cfg.stt.engine = "null"

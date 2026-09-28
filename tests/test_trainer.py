@@ -15,19 +15,19 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from conftest import DemoStack  # noqa: E402
 
-from aura.audio import AudioFrame  # noqa: E402
-from aura.wakeword import (  # noqa: E402
+from aura.audio import AudioFrame
+from aura.wakeword import (
     ManualTrigger,
     TemplateWakeEngine,
     build_wake_engine,
     load_template_meta,
 )
-from aura.wakeword_trainer import (  # noqa: E402
+from aura.wakeword_trainer import (
     EMBED_DIM,
     SR,
     WINDOW_S,
+    TrainingUnavailable,
     judge_sample,
     normalize_length,
     save_template,
@@ -142,7 +142,7 @@ class TestTrainWake:
         assert trained.positives == 4 and trained.negatives >= 6
 
     def test_needs_three_samples(self):
-        with pytest.raises(Exception):
+        with pytest.raises(TrainingUnavailable):
             train_wake(self._positives()[:2])
 
     def test_save_and_load_meta(self, tmp_path):

@@ -20,7 +20,7 @@ paranoid gate, and dumb-but-perfect executors.
 │      │        └────────────────────────┬────────────────────────────────┘ │
 │      │                                 │                                  │
 │  TTS  │        Planner ────────► SafetyGate ────────► SkillRegistry        │
-│ `say` │  OpenAI-compat local    blocklist          20 declared skills      │
+│ `say` │  OpenAI-compat local    blocklist          24 declared skills      │
 │ /Piper│  LLM (Ollama/mlx_lm/    + skill manifest   AppleScript · AX · `open`│
 │       │  llama.cpp/LM Studio)   + Laya gate        · pbcopy/pbpaste        │
 │       │                                 │                                  │
@@ -57,6 +57,14 @@ A deliberately *narrow* LLM contract:
   hold this format reliably with a tight prompt + one few-shot anchor.
 - Parsing is defensive (fence-stripping, brace-matching, schema coercion):
   a malformed model output degrades to a clarifying question, never a crash.
+- **`HybridPlanner` (v0.5):** the planner *is* the LLM client plus a
+  built-in-skill fallback behind one interface. A cheap, throttled
+  `GET /api/health` probe decides; offline ⇒ the plan comes from the skill
+  catalog ("open youtube" still opens YouTube) and the reply carries
+  `degraded: true` so the UI can say "running on basics". A planner crash
+  mid-session is caught by the orchestrator's session guard and answered
+  the same way — a slow Mac or a cold-starting Ollama can never make a
+  command vanish.
 - The planner never decides *safety*. It proposes; the gate disposes.
 
 ### 3. The Laya gate (`laya.py`) — the signature layer
@@ -97,6 +105,13 @@ first runs). Same answers, same interface, one-file swap.
   "did you mean …", never a guess.
 - **`skills/accessibility.py`** turns that into voice: "click the sign in
   button", "type aura into the search field", "what's on my screen".
+- **`skills/forms.py`** fills whole forms from dictation:
+  **`formfill.py`** scans the live tree for fields/buttons, maps spoken
+  values onto labels (grounded — an offline LLM pass only refines when the
+  heuristic matched nothing), and types with original casing kept.
+  `ax.fill_form` (safe), `ax.read_form` (reads the fields), `ax.dictate`
+  (~100 ms typing into the focused field). Pressing a submit button is
+  always a separate confirm-gated action.
 
 A skill = `SkillSpec` (catalog + risk declaration) + one async `execute()`.
 macOS work goes through **`MacBridge`** (osascript/CLI); **`DryRunBridge`**
@@ -111,6 +126,18 @@ in the planner catalog, the UI, and the safety manifest.
 - Stdlib `ThreadingHTTPServer` + SSE: **zero web dependencies**, loopback-only
   by default. POSTs hop to the orchestrator's loop via
   `run_coroutine_threadsafe`; events fan out through the `EventBus`.
+- **Thread-correct by construction (v0.5):** the HTTP handlers are *server*
+  threads; everything they touch on the orchestrator is scheduled — futures
+  resolved with `call_soon_threadsafe`, bus delivery re-dispatched onto the
+  owning loop, config changes applied *on* the loop (where wake/STT rebuilds
+  are safe). The v0.5 release fixed a real deadlock this rule catches
+  (confirm-posted-from-a-browser-thread hung the session forever) and
+  regression-tests it over real HTTP.
+- The endpoint surface: chat (`/api/input|confirm|cancel|correct`), state
+  (`/api/state|health|history|skills|metrics`), the consent layer
+  (`/api/permissions|request`), the live settings layer
+  (`/api/config` — validated, persisted, hot-applied), setup
+  (`/api/setup|setup/step`), and wake/training control (`/api/wake*`).
 - The UI is hand-rolled HTML/CSS/JS — no framework, no build step, no fonts to
   download (system SF stack). One SSE stream drives everything: orb states,
   live transcripts, plan proposals, confirm/cancel (⌘↩ / esc), the activity
@@ -128,21 +155,44 @@ deep links (`x-apple.systempreferences:…`) into the exact Privacy panes,
 a progress bar, and a Check-again loop. Nothing is faked, anywhere.
 
 ### 8. The native shell (`macos/`)
-A ~500-line AppKit executable built with `swift build` (no Xcode project):
-`NSStatusItem` whose icon mirrors orchestrator state (polled from
-`/api/health` every 2 s), an `NSPopover`+`WKWebView` panel, a global
-⌥Space hotkey via Carbon (`RegisterEventHotKey` — no permission needed),
-a Python process babysitter (launch, log rotation, crash-restart, clean
-shutdown), first-run folder picker, and `SMAppService` login item.
-`scripts/make_app.sh` assembles and ad-hoc-signs `Aura.app`.
+An AppKit executable built with `swift build` (no Xcode project):
+- **First run is native (v0.5):** a *Welcome to Aura* `NSWindow` hosts the
+  Setup wizard in a `WKWebView` (the browser never appears), and the app
+  itself asks macOS for Microphone (its bundle carries
+  `NSMicrophoneUsageDescription`) and shows the Accessibility prompt —
+  proactively, seconds after launch, once.
+- `NSStatusItem` whose icon mirrors orchestrator state (polled from
+  `/api/health` every 2 s: ready / busy / needs-OK / offline, with
+  offline→ready reload), a full right-click menu (open, wake, setup,
+  browser, restart engine, choose folder, login, log, quit), an
+  `NSPopover`+`WKWebView` panel behind a native "Waking Aura…" readiness
+  gate, and a global ⌥Space hotkey via Carbon (`RegisterEventHotKey` — no
+  permission needed).
+- The Python process babysitter discovers the engine (UserDefaults →
+  `Application Support/Aura/engine`, the installer's home → file picker),
+  spawns `.venv/bin/python -m aura serve` with `AURA_ENGINE_PATH` /
+  `AURA_DATA_DIR` and a GUI-safe PATH, rotates logs to
+  `~/Library/Logs/Aura.log`, restarts after crashes; `SMAppService`
+  login item. `scripts/make_app.sh` assembles and ad-hoc-signs `Aura.app`
+  (generated icon from `scripts/make_icon.py` — no binary hand-maintenance).
 
 ## Configuration
-`config.default.toml` → user `config.toml` → `AURA_*` env vars. Demo profile
-pins safe providers so behavior is reproducible everywhere.
+`config.default.toml` → user `config.toml` → `runtime.toml` (written by the
+app) → `AURA_*` env vars. The `auto` profile resolves to **mac** on macOS
+and **demo** elsewhere — but off-Mac the demo *base* is applied first and
+overridable, so developers can point the brain at their Ollama without
+touching the profile. `LIVE_FIELDS` marks the safe subset the UI may change
+at runtime (`POST /api/config` validates type + membership, persists to
+`runtime.toml`, hot-applies on the loop); restart-required fields are
+refused with a friendly message.
 
 ## Testing
-48 tests cover the JSON parser, mock planner routing, safety verdicts, the
-Laya heuristic + example buffer, memory/FTS/preferences, and **full
-orchestration over real HTTP** (typed session, confirmation flow, cancel flow,
-busy-state hints, feedback recording). The dry-run bridge makes the entire
-product testable on Linux CI — the same code path a Mac runs.
+144 tests cover the JSON parser, mock planner routing, the **hybrid
+planner's fallbacks** (dead endpoint ⇒ degraded plan that still acts), the
+**session guard** (planner crash ⇒ session still answers), wake fallback
+honesty, safety verdicts, the Laya heuristic + example buffer,
+memory/FTS/preferences, the **thread-correct confirm flow over real HTTP**,
+live config round-trips and refusals, and **full orchestration over real
+HTTP** (typed session, confirmation flow, cancel flow, busy-state hints,
+feedback recording). The dry-run bridge makes the entire product testable on
+Linux CI — the same code path a Mac runs.

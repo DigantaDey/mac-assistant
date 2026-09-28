@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import queue
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -35,11 +36,19 @@ class EventBus:
 
     def __init__(self, history: int = 500) -> None:
         self._async_subs: dict[int, asyncio.Queue[Event]] = {}
-        self._queue_subs: dict[int, "queue.SimpleQueue[Event]"] = {}
+        self._queue_subs: dict[int, queue.SimpleQueue[Event]] = {}
         self._ids = itertools.count(1)
         self._seq = itertools.count(1)
         self._history: list[Event] = []
         self._history_max = history
+        self._lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """The loop that owns the async subscriber queues. `publish()` may be
+        called from other threads (the HTTP server) — delivery to asyncio
+        queues is always scheduled back onto this loop."""
+        self._loop = loop
 
     # -- subscriptions ------------------------------------------------------
 
@@ -52,7 +61,7 @@ class EventBus:
     def unsubscribe_async(self, sid: int) -> None:
         self._async_subs.pop(sid, None)
 
-    def subscribe_queue(self) -> tuple[int, "queue.SimpleQueue[Event]"]:
+    def subscribe_queue(self) -> tuple[int, queue.SimpleQueue[Event]]:
         q: queue.SimpleQueue[Event] = queue.SimpleQueue()
         sid = next(self._ids)
         self._queue_subs[sid] = q
@@ -65,16 +74,30 @@ class EventBus:
 
     def publish(self, type_: str, **data: Any) -> Event:
         ev = Event(type=type_, data=data, seq=next(self._seq))
-        self._history.append(ev)
-        if len(self._history) > self._history_max:
-            del self._history[: len(self._history) - self._history_max]
-        for q in self._async_subs.values():
-            try:
-                q.put_nowait(ev)
-            except asyncio.QueueFull:  # a slow subscriber must never stall the bus
-                pass
-        for q in self._queue_subs.values():
-            q.put(ev)
+        with self._lock:
+            self._history.append(ev)
+            if len(self._history) > self._history_max:
+                del self._history[: len(self._history) - self._history_max]
+            async_qs = list(self._async_subs.values())
+            queue_qs = list(self._queue_subs.values())
+
+        def deliver_async() -> None:
+            for q in async_qs:
+                try:
+                    q.put_nowait(ev)
+                except asyncio.QueueFull:  # slow subscriber must not stall the bus
+                    pass
+
+        try:
+            here = asyncio.get_running_loop()
+        except RuntimeError:
+            here = None
+        if self._loop is not None and here is not self._loop:
+            self._loop.call_soon_threadsafe(deliver_async)
+        else:
+            deliver_async()
+        for q in queue_qs:
+            q.put(ev)  # queue.SimpleQueue is thread-safe
         return ev
 
     # -- reading ------------------------------------------------------------

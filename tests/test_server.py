@@ -7,7 +7,6 @@ import json
 import urllib.error
 
 import pytest
-
 from conftest import get, post
 
 
@@ -26,15 +25,28 @@ class TestServer:
         _, state = get(f"{base}/api/state")
         st = json.loads(state)
         assert st["state"] == "armed"
-        assert "skills" not in st or True
         status, skills = get(f"{base}/api/skills")
         assert status == 200 and json.loads(skills)["skills"]
 
     def test_path_traversal_refused(self, server):
         _, srv, cfg = server
-        import urllib.error
         with pytest.raises(urllib.error.HTTPError):
             get(f"http://127.0.0.1:{cfg.server.port}/../aura/config.py")
+
+    def test_port_in_use_raises_ostypes_cleanly(self, server):
+        """A second server on the same port fails with a clean OSError —
+        cmd_serve turns that into a friendly message, not a traceback."""
+        orch, srv, cfg = server
+        from aura.server import AuraServer
+
+        with pytest.raises(OSError):
+            AuraServer(orch, cfg).start()
+
+    def test_state_exposes_laya_confidence(self, server):
+        _, srv, cfg = server
+        _, state = get(f"http://127.0.0.1:{cfg.server.port}/api/state")
+        st = json.loads(state)
+        assert st["laya"]["confidence"] == cfg.laya.confidence_threshold
 
     def test_full_session_over_http(self, server):
         orch, srv, cfg = server

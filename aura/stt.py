@@ -19,11 +19,11 @@ from pathlib import Path
 
 
 class STTEngine:
-    def transcribe(self, pcm_frames) -> str:  # noqa: ANN001
+    def transcribe(self, pcm_frames) -> str:
         raise NotImplementedError
 
 
-def _write_wav(pcm_frames, path: Path, sample_rate: int = 16_000) -> None:  # noqa: ANN001
+def _write_wav(pcm_frames, path: Path, sample_rate: int = 16_000) -> None:
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
@@ -47,7 +47,7 @@ class WhisperCppSTT(STTEngine):
         if not self.bin:
             raise RuntimeError("whisper.cpp binary not found (looked for whisper-cli, main)")
 
-    def transcribe(self, pcm_frames) -> str:  # noqa: ANN001
+    def transcribe(self, pcm_frames) -> str:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             wav_path = Path(tmp.name)
         try:
@@ -92,7 +92,7 @@ class FasterWhisperSTT(STTEngine):
             return True
         return False
 
-    def transcribe(self, pcm_frames) -> str:  # noqa: ANN001
+    def transcribe(self, pcm_frames) -> str:
         model = self._ensure_model()
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             wav_path = Path(tmp.name)
@@ -107,11 +107,11 @@ class FasterWhisperSTT(STTEngine):
 class NullSTT(STTEngine):
     """Demo/CI: there is no audio to transcribe."""
 
-    def transcribe(self, pcm_frames) -> str:  # noqa: ANN001
+    def transcribe(self, pcm_frames) -> str:
         return ""
 
 
-def build_stt(cfg) -> STTEngine:  # noqa: ANN001
+def build_stt(cfg) -> STTEngine:
     engine = cfg.stt.engine
     attempts: list[STTEngine] = []
     if engine in ("auto", "whisper_cpp"):

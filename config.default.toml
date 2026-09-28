@@ -46,7 +46,9 @@ voice = ""                    # e.g. "Samantha"; empty = system default
 rate = 178
 
 [safety]
-show_plan_before_run = true
+# Strict mode: ask before EVERY action, even safe ones. Destructive and
+# risky actions always ask — this setting can never turn that off.
+show_plan_before_run = false
 confirm_destructive = true
 always_confirm = []
 blocked_patterns = ["rm -rf /", "diskutil erase", "sudo dd"]

@@ -11,7 +11,7 @@ from __future__ import annotations
 import urllib.parse
 from typing import Any
 
-from .base import Skill, SkillContext, SkillResult, SkillSpec
+from .base import Skill, SkillContext, SkillResult, SkillSpec, applescript_quote
 
 SEARCH_URL = "https://www.google.com/search?q={q}"
 
@@ -98,7 +98,7 @@ class FocusTab(Skill):
             return SkillResult(False, "Which tab?")
         script = (
             'tell application "Google Chrome" to set active tab index of window 1 to '
-            f'(index of first tab of window 1 whose title contains "{title}")'
+            f"(index of first tab of window 1 whose title contains {applescript_quote(title)})"
         )
         ok, out = ctx.bridge.osascript(script)
         return SkillResult(ok, f"Switched to {title}." if ok

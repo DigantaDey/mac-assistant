@@ -20,9 +20,13 @@ Endpoints:
   POST /api/wake/train/cancel   discard the session
   GET  /api/wake/train          session status
   POST /api/setup/install       in-app component install (progress → SSE)
+  POST /api/setup/step          one installer step {step: python|wake|whisper|tools}
   GET  /api/metrics       lightweight self-observation (RSS, engines, examples)
   POST /api/permissions/open            {target: microphone|accessibility|automation}
   POST /api/permissions/test_automation  sends one harmless AppleEvent probe
+  POST /api/permissions/request         {target} — actually ask macOS now
+  POST /api/config                  {updates: {section: {field: value}}} live settings
+  POST /api/system/open             {what: data|logs} — open folders in Finder
 
 The product binds 127.0.0.1 only. `AURA_HOST` can widen it for development
 (the sandboxed preview does this); there is no auth by design, so never
@@ -46,7 +50,7 @@ MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
 
 
 class AuraServer:
-    def __init__(self, orch, cfg) -> None:  # noqa: ANN001
+    def __init__(self, orch, cfg) -> None:
         self.orch = orch
         self.cfg = cfg
         self._http: ThreadingHTTPServer | None = None
@@ -83,7 +87,9 @@ class AuraServer:
 
             def _file(self, rel: str) -> None:
                 path = (UI_DIR / rel).resolve()
-                if not str(path).startswith(str(UI_DIR)) or not path.is_file():
+                # is_relative_to, not startswith — a sibling directory
+                # (ui-evil/) must never pass a prefix check.
+                if not path.is_relative_to(UI_DIR) or not path.is_file():
                     self._json({"error": "not found"}, 404)
                     return
                 body = path.read_bytes()
@@ -96,7 +102,7 @@ class AuraServer:
 
             # ---------------- GET ---------------- #
 
-            def do_GET(self) -> None:  # noqa: N802
+            def do_GET(self) -> None:
                 path = urlsplit(self.path).path
                 if path in ("/", "/index.html"):
                     self._file("index.html")
@@ -109,6 +115,8 @@ class AuraServer:
                 elif path == "/api/health":
                     self._json({"ok": True, "state": orch.state,
                                 "bridge": orch.bridge.platform,
+                                "mic_ready": bool(getattr(orch, "_has_audio", False)),
+                                "planner_online": getattr(orch, "planner_online", None),
                                 "version": _version()})
                 elif path == "/api/state":
                     self._json(_state_snapshot(orch, cfg))
@@ -157,7 +165,7 @@ class AuraServer:
 
             # ---------------- POST ---------------- #
 
-            def do_POST(self) -> None:  # noqa: N802
+            def do_POST(self) -> None:
                 path = urlsplit(self.path).path
                 body = self._read_body()
                 loop = orch.loop
@@ -193,6 +201,55 @@ class AuraServer:
                     from . import permissions as perms
                     status, msg = perms.test_automation()
                     self._json({"status": status, "message": msg})
+                elif path == "/api/permissions/request":
+                    from . import permissions as perms
+
+                    target = str(body.get("target", ""))
+                    if target == "microphone":
+                        status, msg = orch.run_blocking(perms.request_microphone)
+                    elif target == "accessibility":
+                        status, msg = orch.run_blocking(perms.request_accessibility)
+                    elif target == "automation":
+                        status, msg = orch.run_blocking(perms.test_automation)
+                    else:
+                        self._json({"ok": False, "status": "unknown",
+                                    "message": f"unknown target {target!r}"}, 400)
+                        return
+                    self._json({"ok": status in ("ok", "asked"),
+                                "status": status, "message": msg})
+                elif path == "/api/config":
+                    future = asyncio.run_coroutine_threadsafe(
+                        orch.set_config(body.get("updates") or {}), loop)
+                    try:
+                        self._json(future.result(timeout=10))
+                    except Exception:
+                        self._json({"ok": False, "message": "settings update timed out"}, 503)
+                elif path == "/api/system/open":
+                    from . import permissions as perms
+
+                    what = str(body.get("what", ""))
+                    if what == "data":
+                        target = orch.cfg.data_dir
+                    elif what == "logs":
+                        target = str(Path.home() / "Library" / "Logs" / "Aura.log")
+                    else:
+                        self._json({"ok": False, "message": f"unknown target {what!r}"}, 400)
+                        return
+                    ok, msg = (perms.open_path(target) if perms.is_mac()
+                               else (False, "Opening folders in Finder is a macOS thing"))
+                    self._json({"ok": ok, "message": msg})
+                elif path == "/api/setup/step":
+
+                    step = str(body.get("step", ""))
+                    future = asyncio.run_coroutine_threadsafe(
+                        orch.run_setup_step(step), loop)
+                    try:
+                        result = future.result(timeout=1500)
+                        self._json({"ok": result.status in ("ok", "skip"),
+                                    "status": result.status, "detail": result.detail,
+                                    "key": result.key})
+                    except Exception:
+                        self._json({"ok": False, "message": "that step timed out"}, 503)
                 elif path == "/api/wake":
                     mode = str(body.get("mode", ""))
                     phrase = body.get("phrase")
@@ -241,10 +298,11 @@ def _version() -> str:
     return __version__
 
 
-def _permissions_snapshot(orch, cfg) -> dict:  # noqa: ANN001
+def _permissions_snapshot(orch, cfg) -> dict:
     """The Setup wizard's data: honest, per-permission state, checked live."""
     from . import permissions as perms
 
+    wake_ready, wake_detail = perms.check_wake_models(cfg)
     return {
         "platform": "mac" if perms.is_mac() else "other",
         "profile": cfg.profile,
@@ -255,11 +313,13 @@ def _permissions_snapshot(orch, cfg) -> dict:  # noqa: ANN001
         "planner_server": perms.check_planner_server(cfg),
         "planner_engine": cfg.planner.engine,
         "model": cfg.planner.model,
+        "wake_models": {"ready": wake_ready, "detail": wake_detail},
     }
 
 
-def _state_snapshot(orch, cfg) -> dict:  # noqa: ANN001
+def _state_snapshot(orch, cfg) -> dict:
     session = orch.session
+    planner_status = dict(getattr(orch, "planner_status", {}) or {})
     return {
         "state": orch.state,
         "version": _version(),
@@ -268,12 +328,18 @@ def _state_snapshot(orch, cfg) -> dict:  # noqa: ANN001
         "wake_mode": cfg.wake.mode,
         "wake_phrase": cfg.wake.phrase,
         "tts_enabled": cfg.tts.enabled,
+        "ask_before_run": cfg.safety.show_plan_before_run,
+        "data_dir": cfg.data_dir,
+        "mic_ready": bool(getattr(orch, "_has_audio", False)),
+        "planner_online": getattr(orch, "planner_online", None),
         "laya": {
             "backend": type(orch.laya).__name__,
+            "confidence": cfg.laya.confidence_threshold,
             "examples": orch.examples.stats(),
         },
         "planner": {"engine": cfg.planner.engine, "model": cfg.planner.model,
-                    "base_url": cfg.planner.base_url},
+                    "base_url": cfg.planner.base_url,
+                    "last_error": planner_status.get("last_error", "")},
         "preferences": orch.memory.all_preferences(),
         "session": None if not session else {
             "id": session.id, "transcript": session.transcript,

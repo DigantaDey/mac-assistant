@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark light">
+<meta name="color-scheme" content="dark">
 <title>Aura</title>
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
@@ -44,6 +44,11 @@
         <svg viewBox="0 0 20 20"><path d="M3 3h6v6H3V3Zm8 0h6v6h-6V3ZM3 11h6v6H3v-6Zm8 0h6v6h-6v-6Z"/></svg>
         <span>Skills</span>
       </a>
+      <a href="#setup" class="nav-item" data-nav="setup">
+        <svg viewBox="0 0 20 20"><path d="M10 2 4 4.5v5c0 4 2.6 7 6 8.5 3.4-1.5 6-4.5 6-8.5v-5L10 2Zm-1.2 11L6 10.2l1.4-1.4 1.4 1.4 3.8-3.8L14 7.8 8.8 13Z"/></svg>
+        <span>Setup</span>
+        <span class="nav-badge" id="setup-badge" hidden></span>
+      </a>
       <a href="#wake" class="nav-item" data-nav="wake">
         <svg viewBox="0 0 20 20"><path d="M10 2a2.5 2.5 0 0 1 2.5 2.5v6a2.5 2.5 0 0 1-5 0v-6A2.5 2.5 0 0 1 10 2Zm-6 8.5a6 6 0 0 0 5 5.9V19h2v-2.6a6 6 0 0 0 5-5.9h-1.7a4.3 4.3 0 0 1-8.6 0H4Z"/></svg>
         <span>Wake Phrase</span>
@@ -59,7 +64,7 @@
         <svg viewBox="0 0 20 20"><path d="M10 2 4 4.5v5c0 4 2.6 7 6 8.5 3.4-1.5 6-4.5 6-8.5v-5L10 2Z"/></svg>
         <span>On-device</span>
       </div>
-      <div class="version" id="version">v0.1.0</div>
+      <div class="version" id="version">…</div>
     </div>
   </aside>
 
@@ -72,8 +77,37 @@
         <strong>Developer build</strong> — actions are simulated on this machine.
       </div>
 
+      <div class="warn-banner" id="mic-banner" hidden>
+        <span class="warn-ico" aria-hidden="true">
+          <svg viewBox="0 0 20 20"><path d="M10 2a2.5 2.5 0 0 1 2.5 2.5v6a2.5 2.5 0 0 1-5 0v-6A2.5 2.5 0 0 1 10 2Zm-6 8.5a6 6 0 0 0 5 5.9V19h2v-2.6a6 6 0 0 0 5-5.9h-1.7a4.3 4.3 0 0 1-8.6 0H4Z"/></svg>
+        </span>
+        <span class="warn-text">Aura can't hear you yet — the microphone isn't ready.</span>
+        <button class="warn-btn" data-goto="setup">Fix it in Setup</button>
+      </div>
+
+      <div class="warn-banner" id="brain-banner" hidden>
+        <span class="warn-ico" aria-hidden="true">
+          <svg viewBox="0 0 20 20"><path d="M7 7h6v6H7V7Zm2-5h2v3H9V2Zm0 13h2v3H9v-3ZM2 9h3v2H2V9Zm13 0h3v2h-3V9ZM4.5 3.1l1.4 1.4-1.4 1.4-1.4-1.4 1.4-1.4Zm9.6 9.6 1.4 1.4-1.4 1.4-1.4-1.4 1.4-1.4ZM15.5 3.1l1.4 1.4-1.4 1.4-1.4-1.4 1.4-1.4ZM4.5 12.7l1.4 1.4-1.4 1.4-1.4-1.4 1.4-1.4Z"/></svg>
+        </span>
+        <span class="warn-text" id="brain-banner-text">Aura is running on its built-in basics — the local language model isn't answering.</span>
+        <button class="warn-btn" data-goto="setup">Connect it</button>
+      </div>
+
+      <div class="welcome-card card" id="welcome-card" hidden>
+        <h2>Welcome to Aura <span class="wave" aria-hidden="true">👋</span></h2>
+        <p class="muted">Your private, on-device assistant. Try it right now — no setup needed:</p>
+        <div class="welcome-row">
+          <code class="welcome-cmd">Open YouTube</code>
+          <button class="btn btn-primary" id="welcome-try">Try it</button>
+        </div>
+        <p class="muted welcome-sub">…or tap the orb and say it. Everything runs on this Mac.</p>
+      </div>
+
       <div class="hero">
         <div class="caption" id="caption" hidden></div>
+        <div class="degraded-tag" id="degraded-tag" hidden>
+          basic mode — connect your mind in <a data-goto="setup">Setup</a>
+        </div>
         <div class="transcript-echo" id="transcript-echo" hidden></div>
 
         <button class="orb" id="orb" aria-label="Wake Aura" title="Wake Aura (⌥Space)">
@@ -98,6 +132,8 @@
           <button class="chip" data-cmd="Open Spotify">Open Spotify</button>
           <button class="chip" data-cmd="Set volume to 30">Volume 30</button>
           <button class="chip" data-cmd="Click the sign in button">Click “Sign in”</button>
+          <button class="chip" data-cmd="Fill this form: username demo, password demo123">Fill the form</button>
+          <button class="chip" data-cmd="What fields does this form have?">Ask the form</button>
           <button class="chip" data-cmd="What's on my screen?">Read my screen</button>
           <button class="chip" data-cmd="Search for the weather in Kolkata">Search weather</button>
           <button class="chip" data-cmd="Empty the trash">Empty trash</button>
@@ -133,6 +169,10 @@
         <p class="muted">Everything Aura does is kept here on this Mac — open to review, easy to correct.</p>
       </header>
       <div class="timeline" id="timeline"></div>
+      <div class="tl-empty" id="tl-empty" hidden>
+        Nothing here yet — talk to Aura and every session lands on this
+        timeline, with its plan and outcome, stored only on this Mac.
+      </div>
     </section>
 
     <!-- ── Skills ── -->

@@ -21,10 +21,8 @@ it by hand after a day of corrections:
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import sys
-import tempfile
 from pathlib import Path
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import Skill, SkillContext, SkillResult, SkillSpec
+from .base import Skill, SkillContext, SkillResult, SkillSpec, applescript_quote
 
 
 class GetClipboard(Skill):
@@ -36,7 +36,8 @@ class SetClipboard(Skill):
         if not text.strip():
             return SkillResult(False, "What should I copy?")
         # osascript keeps this dependency-free (pbcopy would need stdin plumbing).
-        ok, out = ctx.bridge.osascript(f'set the clipboard to "{text[:500]}"')
+        ok, out = ctx.bridge.osascript(
+            f"set the clipboard to {applescript_quote(text[:500])}")
         return SkillResult(ok, "Copied." if ok else f"Couldn't copy: {out}")
 
 

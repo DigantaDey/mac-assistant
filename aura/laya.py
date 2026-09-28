@@ -97,7 +97,7 @@ _DESTRUCTIVE_SKILLS = {
 _DESTRUCTIVE_ARGS = re.compile(
     r"(rm\s+-rf|/etc/|/system|diskutil|sudo|format|erase|shutdown|reboot|drop\s+table"
     r"|\bdelete\b|\bempty\b|\bpurchase\b|\bcheckout\b|\bpay\b|\bsubmit\b|\bpublish\b"
-    r"|\bsend\b|\binvite\b|\bshare\b)",
+    r"|\bsend\b|\binvite\b|\bshare\b|\bsign ?up\b|\bregister\w*\b|\bsubscrib\w*\b)",
     re.IGNORECASE,
 )
 _SHARED_ARG_KEYS = {"to", "recipient", "email", "share", "post"}
@@ -127,7 +127,7 @@ class HeuristicBackend(LayaBackend):
         return Decision(match=min(match, 0.99), destructive=destructive, backend="heuristic")
 
 
-def build_backend(cfg) -> LayaBackend:  # noqa: ANN001
+def build_backend(cfg) -> LayaBackend:
     if cfg.laya.backend in ("auto", "laya"):
         try:
             return RealLayaBackend(adapter_dir=cfg.laya.adapter_dir)
@@ -175,7 +175,8 @@ class ExampleBuffer:
 
     def record(self, transcript: str, skill: str, args: dict, outcome: str,
                match: float, destructive: float, weight: float = 1.0) -> None:
-        assert outcome in self.OUTCOMES
+        if outcome not in self.OUTCOMES:
+            raise ValueError(f"unknown outcome {outcome!r} (expected {self.OUTCOMES})")
         payload = json.dumps(args)
         with self._lock:
             self._record(transcript, skill, payload, outcome, match, destructive, weight)

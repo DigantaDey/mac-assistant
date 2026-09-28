@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
-from aura.config import (LIVE_FIELDS, load_config, runtime_overrides_path,
-                         watch_paths, write_overrides)
 from conftest import DemoStack
+
+from aura.config import (
+    LIVE_FIELDS,
+    load_config,
+    runtime_overrides_path,
+    watch_paths,
+    write_overrides,
+)
 
 
 class TestWriteOverrides:
@@ -31,7 +37,6 @@ class TestWriteOverrides:
     def test_atomic_and_valid_toml(self, tmp_path):
         for i in range(3):
             write_overrides(tmp_path, {"wake": {"threshold": 0.5 + i / 10}})
-        cfg = load_config.__wrapped__ if hasattr(load_config, "__wrapped__") else None
         import tomllib
         raw = tomllib.loads(runtime_overrides_path(tmp_path).read_text())
         assert raw["wake"]["threshold"] == 0.7
@@ -82,3 +87,27 @@ def test_live_fields_catalog_sane():
     assert "mode" in LIVE_FIELDS["wake"]
     assert "enabled" in LIVE_FIELDS["tts"]
     assert "planner" not in LIVE_FIELDS   # model swaps are restart-only, honestly
+
+
+def test_type_mismatch_is_skipped_with_warning(tmp_path, capsys):
+    """A typo'd value in the user's file must not corrupt the running config."""
+    from aura.config import Config, _apply
+
+    cfg = Config()
+    _apply(cfg.wake, {"models": "hey_jarvis"})        # a string where a list belongs
+    assert cfg.wake.models == ["hey_jarvis"]           # the default, untouched
+    _apply(cfg.laya, {"confidence_threshold": "high"})  # a string where a number belongs
+    assert cfg.laya.confidence_threshold == 0.62
+    _apply(cfg.safety, {"show_plan_before_run": 1})    # a number where a bool belongs
+    assert cfg.safety.show_plan_before_run is False
+    assert "ignoring" in capsys.readouterr().err
+
+
+def test_valid_overrides_still_apply(tmp_path):
+    from aura.config import Config, _apply
+
+    cfg = Config()
+    _apply(cfg.wake, {"models": ["hey_jarvis", "alexa"], "threshold": 0.7, "enabled": False})
+    assert cfg.wake.models == ["hey_jarvis", "alexa"]
+    assert cfg.wake.threshold == 0.7
+    assert cfg.wake.enabled is False

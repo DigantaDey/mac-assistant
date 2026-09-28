@@ -31,11 +31,11 @@ class Verdict:
 
 
 class SafetyGate:
-    def __init__(self, cfg, laya_backend) -> None:  # noqa: ANN001 - full Config
+    def __init__(self, cfg, laya_backend) -> None:
         self.cfg = cfg
         self.laya = laya_backend
 
-    def assess(self, action, transcript: str, known_skills: set[str]) -> Verdict:  # noqa: ANN001
+    def assess(self, action, transcript: str, known_skills: set[str]) -> Verdict:
         reasons: list[str] = []
 
         # 1 — absolute blocklist (substring over the raw transcript + args blob)

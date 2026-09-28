@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from aura.laya import HeuristicBackend
 from aura.planner import Action
 from aura.safety import SafetyGate
-from aura.laya import HeuristicBackend
 
 
 def make_gate(**overrides):

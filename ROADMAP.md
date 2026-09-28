@@ -71,15 +71,89 @@ mainstream gap.
       simulated surface appear only off-Mac; permissions drive the gating
 - [x] Full Apple-grade copy pass over every UI string; version 0.4.0
 
-## v0.5 — Depth
-- [ ] Browser extension (MV3) + CDP: read/act on DOM, forms, multi-tab flows
+## v0.5 — Ship-quality product ✅ (this tree)
+The theme: **a real user, on a real Mac, with zero patience for "almost
+works."** Every item below is something that could be shipped, plus the
+fixes that make it feel like it is.
+
+- [x] **One-command install** — `./scripts/install.sh`: brew deps →
+      Ollama + qwen3:4b → speech model → engine + venv → Aura.app in
+      /Applications → open. Idempotent, resumable, no second terminal
+- [x] **Native first-run** — Aura.app opens a *Welcome to Aura* window
+      (WKWebView on the Setup wizard) instead of a browser tab; macOS asks
+      for Microphone (bundle usage string) and Accessibility proactively;
+      no more "opened a URL at 127.0.0.1:7331"
+- [x] **Settings that work** — every card is live: re-request any
+      permission, open the exact System Settings pane, test Automation,
+      toggle the voice and confirmation modes, switch the brain engine,
+      change the data folder; changes persist and hot-apply
+- [x] **Honest permission UI** — Setup/Settings render the *real* state of
+      microphone / accessibility / automation / models on this machine,
+      with the exact action for each (grant, open settings, download,
+      install) — nothing simulated on a Mac
+- [x] **A brain that degrades, not dies** — HybridPlanner: local qwen3
+      (Ollama) when up, built-in skills + visible "running on basics"
+      badge when down; "open youtube" was doing nothing before, now it
+      always answers
+- [x] **The session guard** — a planner crash can no longer leave a
+      command stuck mid-flight; the session answers with built-in skills
+      instead of hanging
+- [x] **Wake-word honesty** — missing models are detected, the UI says so,
+      and the fallback happens gracefully (manual mode) with a note
+- [x] **Thread-correct engine** — confirm/feedback/config events from the
+      HTTP thread now schedule onto the orchestrator loop (a real
+      deadlock behind "I clicked Run and nothing happened" is fixed and
+      regression-tested)
+- [x] **Menu-bar app as a product surface** — full right-click menu
+      (Open Aura, Wake, Setup & Permissions, Open in Browser, Restart
+      Engine, Choose Aura Folder, Start at Login, Activity Log, Quit),
+      icon that mirrors live state (ready/busy/needs-OK/offline) with
+      recovery reload, native "Waking Aura…" gate instead of a dead page
+- [x] **App identity** — generated icon (`scripts/make_icon.py` →
+      ui/icon.png / .icns, no binary hand-maintenance), real bundle
+      strings (usage descriptions, category, copyright), v0.5.0
+- [x] **Doctor that speaks English** — `python -m aura doctor` live-checks
+      mic / accessibility / wake models / speech model / brain / app
+      install; `--version`
+- [x] 144 tests, all green — including the ship regressions above
+
+## v0.5.1 — Speak the form, fill the form ✅
+The theme: **forms in any browser, filled from your voice — seamless,
+fast, light, powerful.** No extension, no click-through: Aura reads the
+live accessibility tree, so it works wherever a normal field shows a
+normal label.
+
+- [x] **`ax.fill_form`** — “*fill this form: name John, email me at
+      smith dot com*”: scans the frontmost window's fields, maps the
+      dictation onto labels (synonyms: mail/email; grammar: “*set city to
+      Portland*”, “*the mail is …*”, ordinal “*first field …*”, bare
+      positional lists), and types every value with original casing kept.
+      Heuristic-first for speed; an offline LLM pass refines only when the
+      heuristic matched nothing and a brain is online
+- [x] **`ax.read_form`** — “*what fields does this form have?*” lists the
+      fields and the ending button in plain English
+- [x] **`ax.dictate`** — “*type 123 Main Street*”: plain dictation into
+      the focused field, ~100 ms, no tree read — the fast path
+- [x] **Honest by design** — unmentioned fields stay empty and are
+      reported (“Still empty: …”); values are never invented
+- [x] **Send is always your call** — filling auto-runs (it's safe);
+      pressing submit/send/save/sign-up is a separate confirm-gated
+      action; “*fill this form: … and press submit*” plans both
+- [x] **Sign-up / register / subscribe are confirm-gated** in the
+      destructive-argument list — a voice click can never sign you up
+- [x] 33 new tests: scan, parse (grammar/synonyms/case/ordinals/position),
+      LLM refine + failure, read, fill, dictation, routing, the safety
+      gate, and a full orchestrator end-to-end
+
+## v0.6 — Depth
+- [ ] Browser extension (MV3) + CDP: read/act on DOM, multi-tab flows
 - [ ] Window management skills (positions, spaces) via AX
 - [ ] Procedures: "watch me do this once" → recorded, editable, replayable
       workflows (OpenAdapt-style, voice-triggered)
 - [ ] Calendar / Mail / Notes / Reminders skills via AppleScript + EventKit
 - [ ] Optional local VLM fallback for AX-hostile apps (Moondream-class)
 
-## v0.5 — Polish & distribution
+## v0.7 — Polish & distribution
 - [ ] Signed + notarized DMG with bundled models; auto-update channel
 - [ ] Voice models: Kokoro premium voices; on-device voice-match (optional)
 - [ ] Multi-mac sync of preferences via user's own iCloud Drive folder (files

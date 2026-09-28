@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
-
 from conftest import DemoStack
+
 from aura.wakeword import phrase_gate, strip_phrase
 
 

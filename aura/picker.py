@@ -97,7 +97,7 @@ class LayaScorer:
     here can hallucinate.
     """
 
-    def __init__(self, backend) -> None:  # noqa: ANN001 - aura.laya.LayaBackend-like
+    def __init__(self, backend) -> None:
         self.backend = backend
 
     def score_option(self, query: str, node: AXNode) -> float:

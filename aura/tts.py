@@ -46,7 +46,7 @@ class NullTTS(TTS):
         return 0.0
 
 
-def build_tts(cfg) -> TTS:  # noqa: ANN001
+def build_tts(cfg) -> TTS:
     if not cfg.tts.enabled or cfg.tts.engine == "null":
         return NullTTS()
     try:

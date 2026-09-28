@@ -23,11 +23,12 @@ offers to install components — the UI never falls back to terminal steps.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -37,6 +38,8 @@ try:
 except Exception:  # pragma: no cover - numpy is in the [mac] extra
     np = None  # type: ignore[assignment]
     HAS_NUMPY = False
+
+log = logging.getLogger(__name__)
 
 
 class TrainingUnavailable(RuntimeError):
@@ -90,8 +93,7 @@ def spectral_embedding(pcm, sr: int = SR) -> np.ndarray:  # type: ignore[name-de
         x = np.pad(x, (0, WIN - len(x)))
 
     n = 1 + (len(x) - WIN) // HOP
-    if n < 1:
-        n = 1
+    n = max(n, 1)
     idx = np.arange(WIN)[None, :] + HOP * np.arange(n)[:, None]
     frames = x[idx] * np.hanning(WIN)[None, :]
     spec = np.abs(np.fft.rfft(frames, axis=1)) ** 2  # (n, WIN//2+1)
@@ -187,8 +189,8 @@ def synth_speech_negatives(count: int = 4) -> list[np.ndarray]:  # type: ignore[
                 with _wave.open(str(path), "rb") as wf:
                     pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
                 out.append(pcm.astype(np.float32))
-            except Exception:
-                continue
+            except Exception as exc:  # one bad render never sinks the batch
+                log.debug("negative render %d failed: %s", i, exc)
     return out
 
 
@@ -199,7 +201,7 @@ class tempfile_dir:
         self._tmp = tempfile.TemporaryDirectory()
         return self._tmp.name
 
-    def __exit__(self, *exc):  # noqa: ANN002
+    def __exit__(self, *exc):
         self._tmp.cleanup()
         return False
 
@@ -249,7 +251,7 @@ class TrainedWake:
     negatives: int
 
 
-def train_wake(positives: list, negatives: list | None = None) -> TrainedWake:  # noqa: ANN001
+def train_wake(positives: list, negatives: list | None = None) -> TrainedWake:
     """Calibrate a template detector on the user's own voice.
 
     Positives: samples of the phrase. Negatives: synthesized backgrounds
@@ -289,7 +291,7 @@ def train_wake(positives: list, negatives: list | None = None) -> TrainedWake:  
                        positives=len(positives), negatives=len(neg))
 
 
-def save_template(trained: TrainedWake, phrase: str, path: Path) -> Path:  # noqa: ANN001
+def save_template(trained: TrainedWake, phrase: str, path: Path) -> Path:
     _require_numpy()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

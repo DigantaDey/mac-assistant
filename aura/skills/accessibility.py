@@ -9,10 +9,10 @@ honest "did you mean …" instead of a wrong click.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
-from .base import Skill, SkillContext, SkillResult, SkillSpec
 from ..picker import PickResult, default_picker
+from .base import Skill, SkillContext, SkillResult, SkillSpec
 
 _FIELD_ROLES = ("textfield", "searchfield", "textarea", "combobox")
 
@@ -98,8 +98,10 @@ class AXReadScreen(Skill):
 
     # Structural containers are layout, not content — skip them, and skip
     # long static text (paragraphs, not controls).
-    _CONTAINERS = {"window", "group", "toolbar", "tabgroup", "list", "scrollarea",
-                   "splittergroup", "layoutarea", "application", "unknown"}
+    _CONTAINERS: ClassVar[frozenset[str]] = frozenset({
+        "window", "group", "toolbar", "tabgroup", "list", "scrollarea",
+        "splittergroup", "layoutarea", "application", "unknown",
+    })
 
     async def execute(self, args: dict[str, Any], ctx: SkillContext) -> SkillResult:
         tree = _tree(ctx)

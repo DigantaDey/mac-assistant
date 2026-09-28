@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .base import Skill, SkillContext, SkillResult, SkillSpec
+from .base import Skill, SkillContext, SkillResult, SkillSpec, applescript_quote
 
 
 def _spec(name: str, description: str, *, args: dict | None = None,
@@ -28,7 +28,7 @@ class OpenApp(Skill):
         if not app:
             return SkillResult(False, "Which app should I open?")
         ok, out = ctx.bridge.osascript(
-            f'tell application "{app}" to activate')
+            f"tell application {applescript_quote(app)} to activate")
         return SkillResult(ok, f"Opened {app}." if ok else f"Couldn't open {app}: {out}")
 
 
@@ -41,7 +41,7 @@ class QuitApp(Skill):
         app = str(args.get("app", "")).strip()
         if not app:
             return SkillResult(False, "Which app should I quit?")
-        ok, out = ctx.bridge.osascript(f'tell application "{app}" to quit')
+        ok, out = ctx.bridge.osascript(f"tell application {applescript_quote(app)} to quit")
         return SkillResult(ok, f"Quit {app}." if ok else f"Couldn't quit {app}: {out}")
 
 

@@ -41,7 +41,12 @@ const S = {
   historyCount: 0,
   activityUnread: 0,
   demo: false,
+  st: null,        // last /api/state snapshot
+  perms: null,     // last /api/permissions snapshot
 };
+
+/* The four core things a fresh Mac needs — everything else is optional. */
+const CORE_STEPS = ["mic", "ax", "whisper", "brain"];
 
 const STATE_TEXT = {
   starting:  ["Starting", ""],
@@ -160,7 +165,7 @@ document.querySelectorAll(".nav-item").forEach((n) =>
 
 /* Deep links: #setup / #onboarding (the menu-bar shell opens #onboarding on
    first run). Keep the hash and the view in sync. */
-const VIEW_ALIASES = { onboarding: "setup" };
+const VIEW_ALIASES = { onboarding: "setup", permissions: "setup" };
 
 function viewFromHash() {
   const h = location.hash.replace("#", "");
@@ -227,7 +232,7 @@ function showProposal(p) {
     "Aura checks before it touches anything. Take a look — then decide.";
   $("proposal-actions").innerHTML = p.actions.map((a) => `
     <li class="proposal-action">
-      <span class="risk-pill risk-confirm">${esc(a.verdict)}</span>
+      <span class="risk-pill ${a.verdict === "safe" ? "risk-safe" : "risk-confirm"}">${esc(a.verdict)}</span>
       <span class="skill">${esc(a.skill)}</span>
       <span class="args">${esc(JSON.stringify(a.args))}</span>
       <span class="why">${esc(a.why || "")}</span>
@@ -341,6 +346,7 @@ async function loadHistory() {
     $("timeline").innerHTML = "";
     events.forEach((ev) => timelineItem(ev));
     S.historyCount = events.length;
+    $("tl-empty").hidden = events.length > 0;
     updateActivityBadge();
   } catch { /* server warming up */ }
 }
@@ -364,43 +370,94 @@ async function loadSkills() {
 
 /* ── settings ─────────────────────────────────────────────────────────── */
 
+let lastSettingsKey = "";
+
 function renderSettings(st) {
+  const key = JSON.stringify({
+    t: st.tts_enabled, a: st.ask_before_run, po: st.planner_online,
+    pe: st.planner.engine, pm: st.planner.model, pl: st.planner.last_error,
+    lb: st.laya.backend, lc: st.laya.confidence, le: st.laya.examples,
+    d: st.data_dir, b: st.bridge, w: st.wake_mode,
+  });
+  if (key === lastSettingsKey) return;
+  lastSettingsKey = key;
   const rows = (items) => items.map(([k, help, value, control]) => `
     <div class="setting-row">
       <div><div class="setting-label">${k}</div><div class="setting-help">${help}</div></div>
       ${control || `<div class="setting-value">${esc(value)}</div>`}
     </div>`).join("");
 
-  const t = (on) => `<button class="toggle ${on ? "is-on" : ""}" disabled aria-label="toggle"></button>`;
+  const t = (path, on, label) =>
+    `<button class="toggle ${on ? "is-on" : ""}" data-config="${path}"
+        aria-label="${esc(label || path)}" role="switch" aria-checked="${on}"></button>`;
+  const pill = (ok, yes, no) =>
+    `<span class="risk-pill ${ok ? "risk-safe" : "risk-confirm"}">${ok ? yes : no}</span>`;
+
+  const plannerOk = st.planner.engine === "mock" ? null : st.planner_online === true;
+  const plannerRow = [
+    "Understanding",
+    st.planner_online === false
+      ? `Offline — basic mode is on. ${st.planner.last_error ? `(${esc(st.planner.last_error)})` : ""}`
+      : `${st.planner.model}, running locally`,
+    st.planner_online === false
+      ? pill(false, "Connected", "Offline") + ` <a class="mini-link" data-goto="setup">Fix it</a>`
+      : plannerOk === null ? "built-in (no model needed)" : pill(true, "Connected", "Offline"),
+  ];
+
+  const dataRows = [
+    ["Profile", "On your Mac this is always the real thing", st.profile],
+    ["Execution", st.bridge === "mac" ? "Full access" : "Simulated (developer build)", st.bridge],
+    ["Wake mode", st.wake_mode === "openwakeword" ? "Always listening" : "When I tap", st.wake_mode],
+    ["Your data", "History, preferences, lessons — plain files you can read",
+      `<div class="setting-value setting-value-btns">
+         <span>${esc(st.data_dir || "—")}</span>
+         ${st.bridge === "mac" ? '<button class="fb-btn" data-sysopen="data">Open in Finder</button>' : ""}
+       </div>`],
+    ["Activity log", "Every session, with its plan and outcome",
+      `<div class="setting-value setting-value-btns">
+         ${st.bridge === "mac" ? '<button class="fb-btn" data-sysopen="logs">Show log</button>' : ""}
+       </div>`],
+  ];
+
   $("settings-body").innerHTML = `
     <div class="settings-grid">
-      <div class="card"><h2>How Aura runs</h2>${rows([
-        ["Profile", "On your Mac this is always the real thing", st.profile],
-        ["Execution", st.bridge === "mac" ? "Full access" : "Simulated (developer build)", st.bridge],
-        ["Wake mode", st.wake_mode === "openwakeword" ? "Always listening" : "When I tap", st.wake_mode],
-        ["Your data", "History, preferences, lessons — plain files you can read", st.data_dir],
-      ])}</div>
+      <div class="card settings-perms-card">
+        <h2>Permissions</h2>
+        <p class="muted settings-perms-intro">Live status, checked on this Mac. Grant, re-grant, or
+        open the exact System Settings pane — any time.</p>
+        <div id="settings-perms"></div>
+      </div>
       <div class="card"><h2>Voice</h2>${rows([
-        ["Speak replies", "Aura answers out loud", "", t(st.tts_enabled)],
-        ["Understanding", `${st.planner.model}, running locally`, st.planner.model],
+        ["Speak replies", "Aura answers out loud", "", t("tts.enabled", st.tts_enabled, "Speak replies")],
+        plannerRow,
       ])}</div>
       <div class="card"><h2>Decisions</h2>${rows([
+        ["Ask before every action", "Strict mode — even safe, confident actions wait for your yes. Risky actions always ask, with this on or off.",
+          "", t("safety.show_plan_before_run", st.ask_before_run, "Ask before every action")],
         ["Decision engine", st.laya.backend === "RealLayaBackend" ? "Laya decision model" : "Built-in rules (upgradeable)", st.laya.backend],
         ["Confidence floor", "Below this, Aura asks instead of acting", st.laya.confidence ?? "—"],
         ["Lessons learned", "Every confirmation and correction, ready for the next lesson",
           `${st.laya.examples.total} total · ${st.laya.examples.confirmed} confirmed · ${st.laya.examples.corrected} corrected`],
       ])}</div>
+      <div class="card"><h2>Data &amp; diagnostics</h2>${rows(dataRows)}</div>
     </div>`;
+  wireSettingsActions($("settings-body"));
 }
 
-/* ── setup (permissions & readiness) ──────────────────────────────────── */
+/* ── setup (permissions & readiness) ────────────────────────────────────
+   One renderer feeds both the Setup wizard and the Settings → Permissions
+   card, so granting, re-granting, and re-checking work from anywhere.  */
 
 let lastAutomationTest = null;
 let installing = false;
+let stepRunning = null;
 
 async function loadPermissions() {
   try {
-    renderSetup(await api("/api/permissions"));
+    const p = await api("/api/permissions");
+    S.perms = p;
+    renderPermissionCards(p);
+    updateBanners();
   } catch { /* server warming up */ }
 }
 
@@ -433,42 +490,41 @@ function setupCard({ icon, title, status, body, buttons = [], result }) {
   </div>`;
 }
 
-function renderSetup(p) {
-  const demo = p.bridge !== "mac" && p.platform !== "mac";
-  const mic = demo ? "unknown" : p.microphone ? "ready" : "action";
-  const ax = demo ? "unknown"
-    : p.accessibility === true ? "ready" : p.accessibility === false ? "action" : "unknown";
-  const whisper = demo ? "unknown" : p.whisper_cpp ? "ready" : "action";
-  const planner = demo ? "unknown" : p.planner_server ? "ready" : "action";
+let lastCardsKey = "";
 
-  const done = [mic, ax, whisper, planner].filter((s) => s === "ready").length;
-  $("setup-progress").innerHTML = demo
-    ? `<div class="progress-row"><strong>Developer build</strong>
-       <span class="muted">On your Mac, this panel walks you through each permission —
-       with live checks, once.</span></div>`
-    : `<div class="progress-row"><strong>${done} of 4 ready</strong>
-       <span class="muted">${done === 4 ? "Aura is ready. Say the word." : "Each step takes under a minute."}</span></div>
-       <div class="progress"><div class="progress-fill" style="width:${(done / 4) * 100}%"></div></div>`;
+function renderPermissionCards(p) {
+  const mac = p.platform === "mac";
+  const mic = mac ? (p.microphone ? "ready" : "action") : "unknown";
+  const ax = mac ? (p.accessibility === true ? "ready" : p.accessibility === false ? "action" : "unknown")
+    : "unknown";
+  const auto = mac
+    ? (lastAutomationTest && lastAutomationTest.status === "ok" ? "ready" : "action")
+    : "unknown";
+  const whisper = mac ? (p.whisper_cpp ? "ready" : "action") : "unknown";
+  const brain = p.planner_engine === "mock" ? "ready"
+    : mac ? (p.planner_server ? "ready" : "action") : "unknown";
+  const wakePending = mac && p.wake_models && p.wake_models.ready === false;
 
-  const refresh = [{ action: "refresh", label: "Check again" }];
-  const openBtn = (arg) => demo ? [] :
-    [{ action: "open", arg, label: "Open System Settings" }];
+  const openBtn = (arg) => mac ? [{ action: "open", arg, label: "Open System Settings" }] : [];
+  const refresh = mac ? [{ action: "refresh", label: "Check again" }] : [];
 
   const cards = [
     setupCard({
       icon: "mic", title: "Microphone", status: mic,
       body: "Aura hears you only through this. What you say is transcribed on this Mac and never leaves it.",
-      buttons: demo ? [] : [...openBtn("microphone"), ...refresh],
+      buttons: mac ? [{ action: "enable", arg: "microphone", label: "Enable microphone" },
+                      ...openBtn("microphone"), ...refresh] : [],
     }),
     setupCard({
       icon: "shield", title: "Accessibility", status: ax,
       body: "Lets Aura see and act inside your apps — the same permission Voice Control uses. Aura reads structured labels, never screenshots.",
-      buttons: demo ? [] : [...openBtn("accessibility"), ...refresh],
+      buttons: mac ? [{ action: "enable", arg: "accessibility", label: "Enable accessibility" },
+                      ...openBtn("accessibility"), ...refresh] : [],
     }),
     setupCard({
-      icon: "bolt", title: "Automation", status: ax,
+      icon: "bolt", title: "Automation", status: auto,
       body: "macOS asks once, per app, the first time Aura acts for you. That prompt is a feature — run the test to see it.",
-      buttons: demo ? [] : [{ action: "test", label: "Send a test event" }, ...openBtn("automation")],
+      buttons: mac ? [{ action: "test", label: "Send a test event" }, ...openBtn("automation")] : [],
       result: lastAutomationTest,
     }),
     setupCard({
@@ -476,35 +532,116 @@ function renderSetup(p) {
       body: p.whisper_cpp
         ? "Ready. Your voice is transcribed on this Mac — on the Neural Engine where available."
         : "A compact speech model (about 150 MB) that turns your voice into text, entirely on this Mac.",
-      buttons: demo ? [] : (p.whisper_cpp ? refresh
-        : [{ action: "install", label: "Download and set up" }, ...refresh]),
+      buttons: mac ? (p.whisper_cpp ? refresh
+        : [{ action: "step", arg: "whisper", label: "Download and set up" }, ...refresh]) : [],
     }),
     setupCard({
-      icon: "chip", title: "Aura's mind", status: planner,
-      body: p.planner_server
-        ? `Connected — ${esc(p.model)} is answering, right on this Mac.`
-        : "A small language model that understands your requests. Get Ollama from " +
-          "<a href='https://ollama.com/download' target='_blank' rel='noopener'>ollama.com</a> — " +
-          "once it's running, Aura finds it on its own.",
-      buttons: demo ? [] : refresh,
+      icon: "chip", title: "Aura's mind", status: brain,
+      body: p.planner_engine === "mock"
+        ? "This build runs the built-in brain — there's nothing to install."
+        : p.planner_server
+          ? `Connected — ${esc(p.model)} is answering, right on this Mac.`
+          : "A small language model that understands your requests. Get Ollama from " +
+            "<a href='https://ollama.com/download' target='_blank' rel='noopener'>ollama.com</a> — " +
+            "once it's running, Aura finds it on its own. Until then, basic commands still work.",
+      buttons: mac && p.planner_engine !== "mock" ? refresh : [],
     }),
   ];
-  $("setup-grid").innerHTML = cards.join("");
+  if (wakePending) {
+    cards.push(setupCard({
+      icon: "mic", title: "Always listening", status: "action",
+      body: p.wake_models.detail || "The wake-word models aren't on this Mac yet.",
+      buttons: [{ action: "step", arg: "wake", label: "Download wake models" },
+                { action: "refresh", label: "Check again" }],
+    }));
+  }
+  const html = cards.join("");
+  // Don't re-render mid-click: only when something actually changed.
+  const cardKey = JSON.stringify({
+    m: p.microphone, a: p.accessibility, w: p.whisper_cpp, b: p.planner_server,
+    ws: p.wake_models, e: p.planner_engine, mo: p.model, at: lastAutomationTest,
+  });
+  if (cardKey === lastCardsKey) return;
+  lastCardsKey = cardKey;
+  const setupGrid = $("setup-grid");
+  if (setupGrid) setupGrid.innerHTML = html;
+  const settingsPerms = $("settings-perms");
+  if (settingsPerms) settingsPerms.innerHTML = html;
+
+  // Sidebar badge: how many things a fresh Mac still needs.
+  const badge = $("setup-badge");
+  if (badge) {
+    const core = [mic, ax, whisper, brain];
+    const need = core.filter((s) => s !== "ready").length + (wakePending ? 1 : 0);
+    badge.hidden = !(mac && need > 0);
+    badge.textContent = need;
+  }
+
+  // Wizard progress + the "do it all" button.
+  const prog = $("setup-progress");
+  if (prog) {
+    const core = [mic, ax, whisper, brain];
+    const done = core.filter((s) => s === "ready").length;
+    prog.innerHTML = mac
+      ? `<div class="progress-row"><strong>${done} of ${core.length} ready</strong>
+         <span class="muted">${done === core.length ? "Aura is ready. Say the word."
+            : "Each step takes under a minute."}</span></div>
+         <div class="progress"><div class="progress-fill" style="width:${(done / core.length) * 100}%"></div></div>
+         <div class="setup-buttons">
+           <button class="btn btn-primary" data-setup="step-all">Set everything up</button>
+         </div>`
+      : `<div class="progress-row"><strong>Developer build</strong>
+         <span class="muted">On your Mac, this panel walks you through each permission —
+         with live checks, once.</span></div>`;
+  }
+}
+
+function updateBanners() {
+  const { st, perms } = S;
+  if (!perms || !st) return;
+  const mac = perms.platform === "mac";
+  $("mic-banner").hidden = !(mac && perms.bridge === "mac" && perms.microphone === false);
+  const brainOff = st.planner.engine !== "mock" && st.planner_online === false;
+  $("brain-banner").hidden = !brainOff;
+  if (brainOff) {
+    const err = st.planner.last_error;
+    $("brain-banner-text").textContent = err
+      ? `Aura is running on its built-in basics — ${err}`
+      : "Aura is running on its built-in basics — the local language model isn't answering.";
+  }
 }
 
 async function runInstall() {
   if (installing) return;
   installing = true;
   toast("Setting things up — this can take a few minutes.");
-  try { await api("/api/setup/install", {}); } catch { toast("Aura isn't responding."); }
+  try { await api("/api/setup/install", {}); }
+  catch { toast("Aura isn't responding."); }
+  setTimeout(() => { installing = false; loadPermissions(); }, 800);
 }
 
-$("setup-grid") && $("setup-grid").addEventListener("click", async (e) => {
+async function runSetupStep(step) {
+  if (stepRunning) return;
+  stepRunning = step;
+  toast(step === "whisper" ? "Downloading the speech model — a minute or two."
+    : step === "wake" ? "Downloading the wake models."
+    : "Installing the voice components — this can take a while.");
+  try {
+    const res = await api("/api/setup/step", { step });
+    toast(res.detail || (res.ok ? "Done." : "That didn't take — check again."));
+  } catch { toast("Aura isn't responding."); }
+  stepRunning = null;
+  loadPermissions();
+}
+
+async function handleSetupClick(e) {
   const btn = e.target.closest("[data-setup]");
   if (!btn) return;
+  btn.disabled = true;
   const action = btn.dataset.setup;
   if (action === "refresh") { loadPermissions(); return; }
-  if (action === "install") { runInstall(); return; }
+  if (action === "step-all") { runInstall(); return; }
+  if (action === "step") { await runSetupStep(btn.dataset.arg); return; }
   if (action === "open") {
     try {
       await api("/api/permissions/open", { target: btn.dataset.arg });
@@ -512,8 +649,19 @@ $("setup-grid") && $("setup-grid").addEventListener("click", async (e) => {
     } catch { toast("Couldn't open System Settings."); }
     return;
   }
+  if (action === "enable") {
+    const label = btn.textContent;
+    btn.textContent = "Asking macOS…";
+    try {
+      const res = await api("/api/permissions/request", { target: btn.dataset.arg });
+      toast(res.message || (res.status === "ok" ? "Granted." : "Check System Settings."));
+    } catch { toast("Aura isn't responding."); }
+    btn.textContent = label;
+    loadPermissions();
+    return;
+  }
   if (action === "test") {
-    btn.disabled = true; btn.textContent = "Testing…";
+    btn.textContent = "Testing…";
     try {
       lastAutomationTest = await api("/api/permissions/test_automation", {});
       const s = lastAutomationTest.status;
@@ -522,7 +670,13 @@ $("setup-grid") && $("setup-grid").addEventListener("click", async (e) => {
         : "Not available on this machine.");
     } catch { lastAutomationTest = { status: "bad", message: "Aura isn't responding." }; }
     loadPermissions();
+    return;
   }
+  btn.disabled = false;
+}
+["setup-grid", "settings-perms"].forEach((id) => {
+  const el = $(id);
+  if (el) el.addEventListener("click", handleSetupClick);
 });
 
 function showSetupProgress(d) {
@@ -547,6 +701,69 @@ function showSetupProgress(d) {
   row.innerHTML = `<span class="install-mark ${d.status}">${mark}</span>` +
     `<span>${esc(d.title)}</span><span class="install-detail">${esc(d.detail || "")}</span>`;
 }
+
+/* ── settings actions: live toggles + Finder buttons ──────────────────── */
+
+function wireSettingsActions(container) {
+  container.querySelectorAll("[data-config]").forEach((btn) => {
+    if (btn._wired) return;
+    btn._wired = true;
+    btn.addEventListener("click", async () => {
+      const [section, key] = btn.dataset.config.split(".");
+      const next = !btn.classList.contains("is-on");
+      btn.classList.toggle("is-on", next);
+      btn.setAttribute("aria-checked", String(next));
+      try {
+        const res = await api("/api/config", { updates: { [section]: { [key]: next } } });
+        if (!res.ok) throw new Error(res.message);
+        toast(res.message || "Saved.");
+      } catch (e) {
+        btn.classList.toggle("is-on", !next);
+        btn.setAttribute("aria-checked", String(!next));
+        toast(e.message || "Couldn't save that.");
+      }
+    });
+  });
+  container.querySelectorAll("[data-sysopen]").forEach((btn) => {
+    if (btn._wired) return;
+    btn._wired = true;
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        const r = await api("/api/system/open", { what: btn.dataset.sysopen });
+        toast(r.message);
+      } catch { toast("Aura isn't responding."); }
+      btn.disabled = false;
+    });
+  });
+}
+
+/* ── first-visit welcome ──────────────────────────────────────────────── */
+
+function maybeShowWelcome() {
+  const el = $("welcome-card");
+  if (!el) return;
+  if (S.demo || localStorage.getItem("aura.welcome.v1")) { el.hidden = true; return; }
+  el.hidden = false;
+}
+
+function dismissWelcome() {
+  localStorage.setItem("aura.welcome.v1", "1");
+  const el = $("welcome-card");
+  if (el) el.hidden = true;
+}
+
+$("welcome-try").addEventListener("click", () => {
+  dismissWelcome();
+  $("command-input").value = "Open YouTube";
+  $("composer").requestSubmit();
+});
+
+/* "Go to Setup" links anywhere in the app (banners, settings, …) */
+document.addEventListener("click", (e) => {
+  const g = e.target.closest("[data-goto]");
+  if (g) { e.preventDefault(); showView(g.dataset.goto); }
+});
 
 /* ── Wake Phrase Studio — train your phrase in-app ────────────────────── */
 
@@ -691,11 +908,25 @@ function handleEvent(type, d) {
       startLiveRow(d.index, d.skill);
       break;
     case "action_result": endLiveRow(d.index, d.ok); break;
-    case "reply":
+    case "reply": {
       showCaption(d.text);
+      if (d.degraded) {
+        const tag = $("degraded-tag");
+        if (tag) {
+          tag.hidden = false;
+          clearTimeout(S._degradedT);
+          S._degradedT = setTimeout(() => { tag.hidden = true; }, 5000);
+        }
+      }
       if (d.total_ms > 0) addLiveTimelineItem(d);
+      if (!localStorage.getItem("aura.welcome.v1")) dismissWelcome();
       break;
+    }
     case "feedback": break;
+    case "wake_fallback":
+      toast(d.reason || "Always-listening couldn't start — manual wake is on.");
+      loadPermissions();
+      break;
     case "train_sample": {
       wakeTrain.count = d.count;
       renderDots();
@@ -738,6 +969,7 @@ function addLiveTimelineItem(d) {
     plan: S.lastPlan || { actions: [] },
   };
   timelineItem(ev, true);
+  $("tl-empty").hidden = true;
   S.historyCount++;
   if (document.body.dataset.view !== "activity") S.activityUnread++;
   updateActivityBadge();
@@ -752,7 +984,7 @@ function connect() {
   };
   const types = ["state", "hint", "transcript", "plan", "proposal", "action_started",
     "action_result", "reply", "feedback", "log", "train_update", "train_sample",
-    "setup_progress", "setup_done"];
+    "setup_progress", "setup_done", "wake_fallback"];
   types.forEach((t) => es.addEventListener(t, (e) => {
     try {
       const payload = JSON.parse(e.data);
@@ -765,22 +997,21 @@ function connect() {
 
 /* ── boot ─────────────────────────────────────────────────────────────── */
 
-(async function boot() {
-  let platform = "mac";
+async function refreshCore() {
   try {
-    const perms = await api("/api/permissions");
-    platform = perms.platform;
-  } catch { /* ignore */ }
-  S.demo = platform !== "mac";      // users never see this; dev machines do
-  $("demo-banner").hidden = !S.demo;
-
-  try {
-    const st = await api("/api/state");
+    const [perms, st] = await Promise.all([api("/api/permissions"), api("/api/state")]);
+    S.perms = perms;
+    S.st = st;
+    S.demo = perms.platform !== "mac";   // users never see this; dev machines do
+    $("demo-banner").hidden = !S.demo;
     $("version").textContent = `v${st.version}`;
     $("status-meta").textContent =
       `${st.bridge === "mac" ? "Ready on this Mac" : "Developer build"} · ` +
       `${st.wake_mode === "openwakeword" ? "always listening" : "tap to listen"}`;
-    renderSettings({ ...st, data_dir: st.data_dir || "—" });
+    renderSettings({ ...st, data_dir: st.data_dir || "—",
+                     ask_before_run: st.ask_before_run ?? true });
+    renderPermissionCards(perms);
+    updateBanners();
     setStatus(st.state === "starting" ? "armed" : st.state);
     $("wake-phrase").value = st.wake_phrase || "";
     document.querySelectorAll("#wake-mode .seg").forEach((seg) =>
@@ -789,13 +1020,19 @@ function connect() {
       $("wake-mode-help").textContent =
         "Always listening: Aura responds to your wake phrase — nothing else.";
     }
+    maybeShowWelcome();
   } catch { $("conn-badge").textContent = "offline"; }
+}
 
+(async function boot() {
+  await refreshCore();
   loadSkills();
   loadHistory();
-  loadPermissions();
   connect();
 
   const initial = viewFromHash();
   if ($(`view-${initial}`)) showView(initial);
+
+  // Keep the live checks honest without hammering: one local round-trip, 20 s.
+  setInterval(refreshCore, 20000);
 })();

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 
-from aura.memory import Memory
 from aura.laya import ExampleBuffer
+from aura.memory import Memory
 
 
 class TestMemory:

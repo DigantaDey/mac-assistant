@@ -45,13 +45,13 @@ class SkillResult:
 class Skill:
     spec: SkillSpec
 
-    async def execute(self, args: dict[str, Any], ctx: "SkillContext") -> SkillResult:
+    async def execute(self, args: dict[str, Any], ctx: SkillContext) -> SkillResult:
         raise NotImplementedError
 
 
 @dataclass
 class SkillContext:
-    bridge: "MacBridge"          # macOS execution surface (real or dry-run)
+    bridge: MacBridge          # macOS execution surface (real or dry-run)
     memory: Any                  # aura.memory.Memory
     config: Any                  # aura.config.Config
 
@@ -89,6 +89,16 @@ class SkillRegistry:
 # --------------------------------------------------------------------------- #
 
 
+def applescript_quote(value: str) -> str:
+    """`value` as a safe AppleScript string literal.
+
+    Skill args originate in the LLM (i.e. in the user's words) and must never
+    be able to break out of the literal — a stray `"` in an app name is
+    otherwise an AppleScript injection (`… & (do shell script "…") & …`).
+    """
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 class MacBridge:
     """Runs AppleScript/osascript + small CLI tools on a real Mac."""
 
@@ -105,6 +115,12 @@ class MacBridge:
 
     def open_url(self, url: str) -> tuple[bool, str]:
         return self.run(["open", url])
+
+    def keystroke(self, text: str) -> tuple[bool, str]:
+        """Type into whatever the system has focused — the dictation path.
+        No tree read, no targeting: one keystroke event, ~100 ms."""
+        safe = text.replace("\\", "\\\\").replace('"', '\\"')
+        return self.osascript(f'tell application "System Events" to keystroke "{safe}"')
 
     def ax_tree(self):
         """The frontmost app's accessibility tree (MacAXTree on a Mac)."""
@@ -133,6 +149,10 @@ class DryRunBridge(MacBridge):
     def open_url(self, url: str) -> tuple[bool, str]:
         self.calls.append(("open", url))
         return True, f"[dry-run] open {url}"
+
+    def keystroke(self, text: str) -> tuple[bool, str]:
+        self.calls.append(("keystroke", text))
+        return True, f"[dry-run] typed {text!r} into the focused field"
 
     def ax_tree(self):
         """The deterministic mock window — same interface as the real thing."""

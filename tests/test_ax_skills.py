@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
 from conftest import DemoStack
 
 
@@ -14,7 +13,7 @@ def orch(stack: DemoStack):
     return stack.build_orchestrator()
 
 
-async def session_transcript(orch: "object", text: str) -> str:  # noqa: ANN001
+async def session_transcript(orch: object, text: str) -> str:
     """Run a session and return the final reply text."""
     sid = orch.bus.subscribe_async()
     task = asyncio.create_task(orch.submit_text(text))
@@ -86,3 +85,59 @@ class TestSkillDeclarations:
         catalog = stack.registry.catalog_prompt()
         assert "ax.click" in catalog
         assert "by name" in catalog
+
+
+class TestNoAppleScriptInjection:
+    """Skill args come from the LLM (the user's words). A stray quote must not
+    be able to break out of the AppleScript string literal."""
+
+
+    def _script_for(self, stack: DemoStack, skill: str, args: dict) -> str:
+        import asyncio as _aio
+
+        from aura.skills.base import SkillContext
+
+        ctx = SkillContext.__new__(SkillContext)
+        ctx.bridge = stack.bridge
+        ctx.config = stack.cfg
+        ctx.memory = stack.memory
+        skill_obj = stack.registry.get(skill)
+        _aio.run(skill_obj.execute(args, ctx))
+        # the last osascript this call issued
+        scripts = [d for k, d in stack.bridge.calls if k == "osascript"]
+        return scripts[-1]
+
+    @staticmethod
+    def _unescaped_quotes(script: str) -> int:
+        return script.count('"') - script.count('\\"')
+
+    @staticmethod
+    def _outside_literals(script: str) -> str:
+        """The script with everything inside string literals removed."""
+        import re
+        return re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"', "", script)
+
+    def test_app_name_quote_cannot_escape(self, stack: DemoStack):
+        payload = 'X" & (do shell script "rm -rf ~") & "'
+        script = self._script_for(stack, "system.open_app", {"app": payload})
+        # the whole app name must sit inside ONE string literal, and nothing
+        # from the payload may exist as a command outside it
+        assert self._unescaped_quotes(script) == 2, script
+        assert "do shell script" not in self._outside_literals(script), script
+
+    def test_quit_app_quote_cannot_escape(self, stack: DemoStack):
+        payload = 'Q" & (do shell script "id") & "'
+        script = self._script_for(stack, "system.quit_app", {"app": payload})
+        assert self._unescaped_quotes(script) == 2, script
+
+    def test_clipboard_text_quote_cannot_escape(self, stack: DemoStack):
+        script = self._script_for(stack, "clipboard.set_text",
+                                  {"text": 'a" & (do shell script "id") & "b'})
+        assert self._unescaped_quotes(script) == 2, script
+
+    def test_focus_tab_title_quote_cannot_escape(self, stack: DemoStack):
+        script = self._script_for(stack, "browser.focus_tab",
+                                  {"title": 't" & (do shell script "id") & "'})
+        # one literal for the app ("Google Chrome") + one for the title
+        assert self._unescaped_quotes(script) == 4, script
+        assert script.count(chr(92) + chr(34)) >= 2, script

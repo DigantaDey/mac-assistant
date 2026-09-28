@@ -12,6 +12,12 @@ final class PythonProcess {
     private var process: Process?
     private var restartTimer: Timer?
     private var intentionalStop = false
+    private var processStartedAt = Date.distantPast
+    // Bounded auto-restart: an engine that dies on startup (missing venv,
+    // wrong Python) must not respawn every 3 s forever — back off to 2 min
+    // and stop trying after 8 straight failures. "Restart Engine" always works.
+    private var consecutiveFailures = 0
+    private let maxConsecutiveFailures = 8
 
     static var logURL: URL {
         let logs = FileManager.default
@@ -25,6 +31,7 @@ final class PythonProcess {
 
     func start() {
         intentionalStop = false
+        consecutiveFailures = 0
         spawn()
     }
 
@@ -48,20 +55,41 @@ final class PythonProcess {
         start()
     }
 
+    /// Menu → "Choose Aura Folder…": forget the remembered folder, ask for a
+    /// new one, relaunch. Cancelling leaves the standard discovery in place.
+    func chooseRepo() {
+        UserDefaults.standard.removeObject(forKey: "repoPath")
+        guard let picked = Self.pickRepo() else { return }
+        UserDefaults.standard.set(picked, forKey: "repoPath")
+        restart()
+    }
+
     // MARK: internals
 
     private func spawn() {
         let defaults = UserDefaults.standard
         let fm = FileManager.default
 
+        // Engine discovery — no file picker on a normal install:
+        //   1. the folder a user explicitly chose (menu → "Choose Aura Folder…")
+        //   2. the standard installed copy the installer places in
+        //      ~/Library/Application Support/Aura/engine
+        //   3. last resort: ask the user to pick the mac-assistant folder
         var repoPath = defaults.string(forKey: "repoPath") ?? ""
         if repoPath.isEmpty || !fm.fileExists(atPath: repoPath + "/aura") {
-            guard let picked = Self.pickRepo() else {
-                onStateChange?()          // stayed down; user can retry from the menu
-                return
+            let installed = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Aura/engine", isDirectory: true)
+            if fm.fileExists(atPath: installed.appendingPathComponent("aura").path) {
+                repoPath = installed.path
+                defaults.set(repoPath, forKey: "repoPath")
+            } else {
+                guard let picked = Self.pickRepo() else {
+                    onStateChange?()          // stayed down; user can retry from the menu
+                    return
+                }
+                repoPath = picked
+                defaults.set(picked, forKey: "repoPath")
             }
-            repoPath = picked
-            defaults.set(picked, forKey: "repoPath")
         }
 
         let repo = URL(fileURLWithPath: repoPath, isDirectory: true)
@@ -82,6 +110,7 @@ final class PythonProcess {
             .appendingPathComponent("Aura", isDirectory: true)
         try? fm.createDirectory(at: support, withIntermediateDirectories: true)
         environment["AURA_DATA_DIR"] = support.path
+        environment["AURA_ENGINE_PATH"] = repo.path   // the engine knows its own home
         environment["PYTHONUNBUFFERED"] = "1"
         child.environment = environment
 
@@ -104,8 +133,22 @@ final class PythonProcess {
             guard let self = self else { return }
             self.onStateChange?()
             guard !self.intentionalStop else { return }
+            // A process that lived a while isn't a startup failure — reset the
+            // backoff so a crash after hours restarts promptly.
+            if Date().timeIntervalSince(self.processStartedAt) > 60 {
+                self.consecutiveFailures = 0
+            }
+            self.consecutiveFailures += 1
+            guard self.consecutiveFailures <= self.maxConsecutiveFailures else {
+                NSLog("Aura: engine has failed \(self.consecutiveFailures) times in a row — " +
+                      "stopping auto-restart. Pick “Restart Engine” from the menu bar " +
+                      "(or check ~/Library/Logs/Aura.log).")
+                return
+            }
+            let delay = min(3.0 * pow(2.0, Double(self.consecutiveFailures - 1)), 120.0)
+            NSLog("Aura: engine exited — restarting in \(Int(delay)) s (failure \(self.consecutiveFailures)/\(self.maxConsecutiveFailures))")
             DispatchQueue.main.async { [weak self] in
-                self?.restartTimer = Timer.scheduledTimer(withTimeInterval: 3.0,
+                self?.restartTimer = Timer.scheduledTimer(withTimeInterval: delay,
                                                           repeats: false) { [weak self] _ in
                     self?.spawn()
                 }
@@ -115,6 +158,7 @@ final class PythonProcess {
         do {
             try child.run()
             process = child
+            processStartedAt = Date()
         } catch {
             NSLog("Aura: could not launch \(python.path): \(error.localizedDescription)")
         }
