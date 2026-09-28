@@ -4,7 +4,9 @@ Ship order matters: each stage is usable on its own, and every stage widens
 the moat (offline + personal + fast) before Apple's Siri V2 closes the
 mainstream gap.
 
-## v0.1 — Foundation ✅ (this tree)
+**Current release: v0.6.0 — the native macOS app** (✅ shipped; see below).
+
+## v0.1 — Foundation ✅
 - [x] Orchestrator state machine with confirmation as a real state
 - [x] Voice front-end interfaces: mic, wake (pretrained + custom models), VAD,
       STT (whisper.cpp / faster-whisper), TTS (`say`)
@@ -22,7 +24,7 @@ mainstream gap.
 ## v0.2 — Real Mac bring-up ✅
 - [x] Permissions onboarding wizard (live TCC detection, System Settings
       deep links, AppleScript probe, readiness checks)
-- [x] Menu-bar shell (Swift/AppKit: popover + WKWebView, global ⌥Space,
+- [x] Menu-bar shell (Swift/AppKit: menu-bar popover, global ⌥Space,
       process babysitter, logs, login item, `make_app.sh` bundler)
 - [x] Always-listening wake mode with phrase gate (second factor), live
       manual↔always-on switch from the UI, persisted to runtime.toml
@@ -71,7 +73,7 @@ mainstream gap.
       simulated surface appear only off-Mac; permissions drive the gating
 - [x] Full Apple-grade copy pass over every UI string; version 0.4.0
 
-## v0.5 — Ship-quality product ✅ (this tree)
+## v0.5 — Ship-quality product ✅
 The theme: **a real user, on a real Mac, with zero patience for "almost
 works."** Every item below is something that could be shipped, plus the
 fixes that make it feel like it is.
@@ -80,9 +82,9 @@ fixes that make it feel like it is.
       Ollama + qwen3:4b → speech model → engine + venv → Aura.app in
       /Applications → open. Idempotent, resumable, no second terminal
 - [x] **Native first-run** — Aura.app opens a *Welcome to Aura* window
-      (WKWebView on the Setup wizard) instead of a browser tab; macOS asks
-      for Microphone (bundle usage string) and Accessibility proactively;
-      no more "opened a URL at 127.0.0.1:7331"
+      instead of a browser tab; macOS asks for Microphone (bundle usage
+      string) and Accessibility proactively; no more "opened a URL at
+      127.0.0.1:7331" (the window itself became fully native in v0.6)
 - [x] **Settings that work** — every card is live: re-request any
       permission, open the exact System Settings pane, test Automation,
       toggle the voice and confirmation modes, switch the brain engine,
@@ -105,10 +107,10 @@ fixes that make it feel like it is.
       deadlock behind "I clicked Run and nothing happened" is fixed and
       regression-tested)
 - [x] **Menu-bar app as a product surface** — full right-click menu
-      (Open Aura, Wake, Setup & Permissions, Open in Browser, Restart
-      Engine, Choose Aura Folder, Start at Login, Activity Log, Quit),
-      icon that mirrors live state (ready/busy/needs-OK/offline) with
-      recovery reload, native "Waking Aura…" gate instead of a dead page
+      (Open Aura, Wake, Setup & Permissions, Restart Engine, Choose Aura
+      Folder, Start at Login, Activity Log, Quit), icon that mirrors live
+      state (ready/busy/needs-OK/offline) with recovery reload — all of it
+      native UI by v0.6, with no web view in the shot
 - [x] **App identity** — generated icon (`scripts/make_icon.py` →
       ui/icon.png / .icns, no binary hand-maintenance), real bundle
       strings (usage descriptions, category, copyright), v0.5.0
@@ -145,7 +147,32 @@ normal label.
       LLM refine + failure, read, fill, dictation, routing, the safety
       gate, and a full orchestrator end-to-end
 
-## v0.6 — Depth
+## v0.6 — Native macOS app ✅ (this tree)
+The theme: **nothing in a browser.** The UI is AppKit + SwiftUI, the product
+surface is the menu bar, and the engine got the security model a localhost
+server needs.
+- [x] **Native panel** — an `NSPopover` hosting SwiftUI: orb, transcript,
+      reply, a real confirmation card (⌘↩ / Esc), composer and suggestions.
+      No `WKWebView` anywhere, and CI fails the build if one reappears
+- [x] **Menu-bar product** — status icon mirrors engine state; right-click
+      menu (wake · settings · restart · choose engine folder · log · login ·
+      quit); global ⌥Space re-registered the moment the shortcut changes
+- [x] **Settings + onboarding** — eight live sections (General · Voice ·
+      Understanding · Safety · Permissions · Wake Phrase · Activity · About)
+      and a first-run window that explains what stays local *before* macOS
+      asks for Microphone and Accessibility
+- [x] **Loopback API, hardened** — `X-Aura-Token` on every request; browser
+      `Origin` and foreign `Host` refused; JSON-only surface (no HTML, JSON
+      404/405); `/api/setup/install` answers immediately and streams progress
+      over SSE instead of holding a request open for minutes
+- [x] **Engine supervisor** — adopts a healthy engine, reclaims the port from
+      a stale *Aura* process, refuses to touch anything else and names the
+      occupant, bounded exponential backoff, no orphan child on quit
+- [x] **Verified on every push** — 207 engine tests, ruff clean, Swift
+      syntax gate, `swift build` + 16 Swift tests, `Aura.app` assembled and
+      its bundle validated (LSUIElement, usage strings, WebKit ban)
+
+## v0.7 — Depth
 - [ ] Browser extension (MV3) + CDP: read/act on DOM, multi-tab flows
 - [ ] Window management skills (positions, spaces) via AX
 - [ ] Procedures: "watch me do this once" → recorded, editable, replayable
@@ -153,7 +180,7 @@ normal label.
 - [ ] Calendar / Mail / Notes / Reminders skills via AppleScript + EventKit
 - [ ] Optional local VLM fallback for AX-hostile apps (Moondream-class)
 
-## v0.7 — Polish & distribution
+## v0.8 — Polish & distribution
 - [ ] Signed + notarized DMG with bundled models; auto-update channel
 - [ ] Voice models: Kokoro premium voices; on-device voice-match (optional)
 - [ ] Multi-mac sync of preferences via user's own iCloud Drive folder (files

@@ -672,6 +672,35 @@ class Orchestrator:
     # In-app component install (Setup panel — nothing typed, ever)         #
     # ------------------------------------------------------------------ #
 
+    def start_setup(self) -> dict:
+        """Begin the component install *without* holding an HTTP request open.
+
+        The installer takes minutes; the client that asked for it should get an
+        answer in milliseconds and then watch `setup_progress` events (SSE).
+        Returns the honest reason when it can't start.
+        """
+        if config_mod.resolved_profile(self.cfg) == "demo":
+            return {"ok": False, "started": False,
+                    "message": "Development build — component install runs on a real install."}
+        if self._setup_running:
+            return {"ok": False, "started": False,
+                    "message": "An install is already running."}
+        # Claim the slot here (not inside the coroutine) so two quick taps on
+        # "Install" can't both start one.
+        self._setup_running = True
+
+        async def _install() -> None:
+            try:
+                await self.loop.run_in_executor(None, self._run_setup_sync)
+            except Exception as exc:
+                self.bus.publish("log", line=f"install failed: {exc!r}")
+            finally:
+                self._setup_running = False
+
+        asyncio.run_coroutine_threadsafe(_install(), self.loop)
+        return {"ok": True, "started": True,
+                "message": "Install started — progress appears in Setup."}
+
     async def run_setup(self) -> dict:
         if self._setup_running:
             return {"ok": False, "message": "An install is already running."}

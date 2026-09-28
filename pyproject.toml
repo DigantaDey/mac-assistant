@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aura-mac"
-version = "0.5.0"
-description = "Aura — a private, offline, voice-controlled assistant for macOS. Laya-gated, self-improving, blazing fast."
+version = "0.6.0"
+description = "Aura — a private, offline voice assistant for macOS, with a native menu-bar app and the whole engine on your Mac."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -33,7 +33,9 @@ mac = [
   "laya>=0.1",               # the System-1 decision model (Apache-2.0)
   "piper-tts>=1.2",          # optional local TTS
 ]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4",
+  # Swift syntax gate that runs anywhere (see scripts/check_swift_syntax.py)
+  "tree-sitter>=0.23", "tree-sitter-swift>=0.6"]
 
 [project.scripts]
 aura = "aura.__main__:main"

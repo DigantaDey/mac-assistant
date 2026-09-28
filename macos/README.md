@@ -1,85 +1,100 @@
-# Aura — the native shell
+# Aura.app — the native macOS app
 
-A thin AppKit host that makes Aura feel like a real Mac app — while all
-product logic stays in the Python engine you can read and test anywhere.
+Aura is a **menu-bar app** (AppKit + SwiftUI) with a local Python engine
+behind it. There is no browser UI and no WebKit anywhere: CI fails the build
+on purpose if `import WebKit` or `WKWebView` appears under `Sources/`.
 
 ```
-┌─ Aura.app (LSUIElement — menu-bar app) ─────────────────────────────────┐
-│                                                                          │
-│  ◉ NSStatusItem ──── left-click: NSPopover ▸ WKWebView                   │
-│   │  (icon mirrors live state)        loading http://127.0.0.1:7331      │
-│   │  ● ready   ◉ busy   ▲ needs OK   ⚠ offline                           │
-│   └─ right-click: menu                                                        │
-│        Open Aura · Wake Aura (⌥Space) · Setup & Permissions…            │
-│        Open in Browser · Restart Engine                                    │
-│        Choose Aura Folder… · Start at Login · Activity Log · Quit        │
-│                                                                          │
-│  First launch — "Welcome to Aura" NSWindow (720 pt)                      │
-│   · WKWebView loads the Setup wizard directly                            │
-│   · the app itself asks macOS for Microphone (its dialog carries         │
-│     NSMicrophoneUsageDescription) and shows the Accessibility prompt     │
-│   · closes when the user is done; the menu-bar icon takes over           │
-│                                                                          │
-│  Server readiness gate — the webview shows a native "Waking Aura…"       │
-│  placeholder until /api/health answers; never a blank or dead URL.       │
-│                                                                          │
-│  PythonProcess — spawns the engine:                                       │
-│   · discovery:  UserDefaults folder → Application Support/Aura/engine    │
-│     (the copy the installer places) → file picker as a last resort       │
-│   · `.venv/bin/python -m aura serve`, AURA_ENGINE_PATH + AURA_DATA_DIR    │
-│   · logs → ~/Library/Logs/Aura.log (5 MB rotating)                       │
-│   · crash → restart after 3 s · menu → Restart Engine                    │
-│   · GUI-safe PATH (+ /opt/homebrew/bin)                                  │
-│                                                                          │
-│  ServerMonitor — polls /api/health every 2 s → icon state                 │
-│  Carbon hotkey  — global ⌥Space (no permission required)                 │
-│  SMAppService   — Start at Login toggle                                  │
-└──────────────────────────────────────────────────────────────────────────┘
+┌─ Aura.app (LSUIElement — no Dock icon) ───────────────────────────────────┐
+│                                                                           │
+│  ◉ NSStatusItem ─── left-click: NSPopover ▸ SwiftUI panel                 │
+│  │   (icon mirrors live state)   orb · transcript · reply · confirm card  │
+│  │   ● ready   ◉ working   ▲ needs your OK   ⚠ attention needed            │
+│  └─ right-click: menu                                                     │
+│        Open Aura (⌘O) · Wake Aura · Settings… (⌘,)                        │
+│        Setup & Permissions… (⌘S) · Activity… (⌘A)                         │
+│        Restart Engine (⌘R) · Choose Engine Folder… · Start at Login       │
+│        Open Data Folder · Open Log (⌘L) · Quit Aura (⌘Q)                  │
+│                                                                           │
+│  Settings window — eight live sections: General · Voice · Understanding   │
+│  · Safety · Permissions · Wake Phrase · Activity · About                  │
+│                                                                           │
+│  Onboarding (first launch, once) — explains what stays on this Mac       │
+│  before asking for Microphone and Accessibility; the app owns both        │
+│  dialogs, and the engine inherits the grants as its child.                │
+│                                                                           │
+│  The engine is still local: `.venv/bin/python -m aura serve` on           │
+│  127.0.0.1:7331, token-protected, JSON only. The panel is native UI       │
+│  talking to it — no page, no URL, no readiness gate.                      │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Build (no Xcode project needed)
+## Inside the package
+
+| Path | What it is |
+|---|---|
+| `Sources/AuraCore` | Foundation only: `EngineClient` (typed async client + self-healing SSE stream), `EngineSupervisor` (finds, adopts or reclaims the Python engine; bounded backoff restarts; no orphan child on quit), `AppPaths`, `AccessToken`, `AuraLog`, `Prefs`, and the typed models of the engine's JSON. Compiles and unit-tests in seconds. |
+| `Sources/AuraMenuBar` | The product: `AppDelegate` (status item, popover, menu, windows), `AppModel` (the single object the UI binds to), `PanelView`, `SettingsView`, `OnboardingView`, `HotKey` (Carbon global ⌥Space + `SMAppService` login item), `Permissions`, `Theme`, `OrbView`. |
+| `Tests/AuraCoreTests` | `swift test` — JSON value handling, the SSE parser, the client (token header on every request, 401 ⇒ “another engine holds this port”, 403 ⇒ the engine's own message, unreachable), paths, tokens and the shortcut map. |
+
+## Build
+
+The Xcode command line tools are enough — there is no Xcode project.
 
 ```bash
-# Xcode command line tools are enough:
-xcode-select --install        # if you don't have swift already
-
-./scripts/make_app.sh             # → build/Aura.app
-./scripts/make_app.sh --install   # → /Applications/Aura.app
+xcode-select --install             # once
+./scripts/make_app.sh              # swift build -c release → macos/build/Aura.app
+./scripts/make_app.sh --install    # → /Applications/Aura.app
 ```
 
-Or skip both: `./scripts/install.sh` does everything, including this.
+`./scripts/install.sh` does the whole journey (Homebrew dependencies, models,
+engine venv, the app, then opens it).
 
 ## First run
 
-1. Double-click `Aura.app` — the **Welcome to Aura** window opens.
-2. macOS asks for the **Microphone** (the dialog says audio never leaves
-   your Mac) and for **Accessibility** (with an Open System Settings
-   button). Grant both — or do it later any time from
-   **Settings → Permissions** or the menu bar → *Setup & Permissions…*.
-3. The Setup panel shows the honest state of each piece: microphone,
-   accessibility, automation (test event), speech model, and Aura's mind.
-   Each card has the exact action — enable, open the right System
-   Settings pane, or download.
-
-If you installed from a clone (not via `scripts/install.sh`), the app asks
-you to pick the `mac-assistant` folder **once**; it remembers it.
+1. Aura appears in the menu bar and shows a short welcome: what it can do,
+   and that speech, planning and memory stay on this Mac.
+2. macOS asks for **Microphone** (audio never leaves the Mac) and
+   **Accessibility** (so Aura can type and click for you). Declining is fine
+   — the app offers the exact System Settings pane instead.
+3. If you built from a clone and the engine isn't installed under
+   `~/Library/Application Support/Aura/engine`, Aura asks you to pick the
+   folder **once**; it remembers it (changeable in Settings → General).
 
 ## Daily use
 
 | Gesture | Result |
 |---|---|
-| `⌥Space` anywhere | Wake Aura + open the panel |
-| Click `◉` | Open/close the panel (480 pt popover, compact UI) |
-| Right-click `◉` | Menu (wake, setup, browser, restart, login, log, quit) |
-| Icon colors | white = ready · blue = working · orange = needs your OK · red = offline |
+| `⌥Space` anywhere | Wake Aura and show the panel (configurable) |
+| Click `◉` | Show or hide the panel |
+| Right-click `◉` | Wake · Settings · Restart engine · Choose engine folder · log · login · Quit |
+| Icon | template = ready · accent = working · orange = needs your OK · red = attention |
 
-## Trust notes
+## Where things live
 
-- The app is **local-only**: it talks to `127.0.0.1` and spawns one child
-  process. No telemetry, no network beyond what the engine does (nothing).
-- TCC prompts are attributed to Aura.app because the app owns the consent
-  conversation (AVFoundation mic request + `AXIsProcessTrustedWithOptions`),
-  and the engine is its child — which is why the bundle carries
-  `NSMicrophoneUsageDescription` / `NSAppleEventsUsageDescription`.
-- Ad-hoc signed (`codesign -s -`). For distribution you'd replace this with
-  a Developer ID signature + notarization — see ROADMAP.
+- Data, config and the access token: `~/Library/Application Support/Aura/`
+- Engine log (5 MB rotating, openable from the menu): `~/Library/Logs/Aura.log`
+- Engine API: `http://127.0.0.1:7331` — loopback only, JSON only, no HTML.
+
+## Privacy model
+
+- Everything runs locally: speech, planning and actions happen on this Mac,
+  and the only process Aura talks to is its own engine on loopback.
+- The port is guarded: every request carries `X-Aura-Token` (a 0600 file
+  generated on first launch), requests with a browser `Origin` or a
+  non-loopback `Host` are refused, and no CORS headers are ever sent.
+- No telemetry, no accounts, no cloud. Uninstalling is `rm` of the app plus
+  the two folders above.
+
+## Troubleshooting
+
+- **The panel names the problem.** Engine missing, port taken by another
+  program, permissions revoked — the panel says which, and what to do. The
+  menu keeps working while it does.
+- **The engine won't start** — open the log (menu → Open Log, or Settings →
+  Activity). The supervisor retries with backoff, adopts an engine that is
+  already running, and reclaims the port from a stale Aura process — but
+  never touches a process that isn't Aura; it names the occupant instead.
+- **Start over with defaults** — delete
+  `~/Library/Application Support/Aura/config.toml`; shipped defaults are in
+  the repo's `config.default.toml`.

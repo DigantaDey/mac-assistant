@@ -4,9 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
-  test:
+  engine:
+    name: Engine (Python)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +26,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-          pip install numpy httpx
+          pip install numpy httpx tree-sitter tree-sitter-swift
 
       - name: Lint (ruff — must be fully clean)
         run: ruff check .
@@ -31,15 +37,72 @@ jobs:
       - name: Byte-compile everything (syntax gate)
         run: python -m compileall -q aura scripts tests
 
-      # The Swift shell can't compile on Linux runners; keep it honest by
-      # checking the files exist and the package manifest parses structurally.
-      - name: Sanity-check the Swift package tree
+      # Swift can't be compiled here — but a syntax error is a syntax error,
+      # and catching it on Linux saves the macOS runner a whole cycle.
+      - name: Swift syntax gate
+        run: python scripts/check_swift_syntax.py
+
+  native:
+    name: Native app (macOS / Swift)
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The shell is the one part of Aura that can't be compiled on Linux, so
+      # it gets a real macOS runner: a broken build is caught here, in CI,
+      # instead of on a user's Mac.
+      - name: Swift version
+        run: swift --version
+
+      - name: Build the Swift package (release)
+        id: build
+        working-directory: macos
         run: |
-          test -f macos/Package.swift
-          test -f macos/Sources/AuraMenuBar/main.swift
-          test -f macos/Sources/AuraMenuBar/AppDelegate.swift
-          test -f macos/Sources/AuraMenuBar/Permissions.swift
-          test -f macos/Sources/AuraMenuBar/PythonProcess.swift
-          test -f macos/Sources/AuraMenuBar/ServerMonitor.swift
-          test -f ui/icon.icns
-          test -f ui/icon.png
+          set -o pipefail
+          swift build -c release 2>&1 | tee /tmp/swift-build.log
+
+      - name: Run the Swift unit tests
+        id: test
+        working-directory: macos
+        run: |
+          set -o pipefail
+          swift test 2>&1 | tee /tmp/swift-test.log
+
+      - name: Report Swift problems
+        if: failure() && (steps.build.outcome == 'failure' || steps.test.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x scripts/ci_swift_report.sh
+          if [ "${{ steps.build.outcome }}" = "failure" ]; then
+            scripts/ci_swift_report.sh /tmp/swift-build.log "Swift build"
+          else
+            scripts/ci_swift_report.sh /tmp/swift-test.log "Swift tests"
+          fi
+
+      - name: Assemble Aura.app
+        run: ./scripts/make_app.sh
+
+      - name: Validate the bundle
+        run: |
+          set -euo pipefail
+          APP=macos/build/Aura.app
+          test -x "$APP/Contents/MacOS/Aura"
+          plutil -lint "$APP/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$APP/Contents/Info.plist")" = "true"
+          # The menu-bar app must never grow a browser dependency again: Aura
+          # ships as a native macOS app, not a page in a webview.
+          if grep -rIn -e 'import WebKit' -e 'WKWebView' macos/Sources; then
+            echo "::error title=Native only::WebKit found in the native shell — Aura is a native macOS app."
+            exit 1
+          fi
+
+      - name: Upload the built app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aura.app
+          path: macos/build/Aura.app
+          if-no-files-found: error
