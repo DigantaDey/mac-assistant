@@ -118,12 +118,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func observe() {
         model.$phase
             .sink { [weak self] _ in
-                Task { @MainActor in self?.updateIcon() }
+                guard let self else { return }
+                Task { @MainActor in self.updateIcon() }
             }
             .store(in: &cancellables)
         model.$engineStatus
             .sink { [weak self] _ in
-                Task { @MainActor in self?.updateIcon() }
+                guard let self else { return }
+                Task { @MainActor in self.updateIcon() }
             }
             .store(in: &cancellables)
     }
@@ -131,9 +133,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func observeNotifications() {
         NotificationCenter.default.addObserver(forName: .auraOpenPanel, object: nil,
                                                queue: .main) { [weak self] note in
+            guard let self else { return }
             let target = note.object as? String
             Task { @MainActor in
-                guard let self else { return }
                 if let target, target.hasPrefix("settings") || target == "activity" {
                     self.showSettings(section: target)
                 } else {
@@ -144,7 +146,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         NotificationCenter.default.addObserver(forName: .auraShortcutChanged, object: nil,
                                                queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.registerHotKey() }
+            guard let self else { return }
+            Task { @MainActor in self.registerHotKey() }
         }
     }
 
