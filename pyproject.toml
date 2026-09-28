@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aura-mac"
+version = "0.4.0"
+description = "Aura — a private, offline, voice-controlled assistant for macOS. Laya-gated, self-improving, blazing fast."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Aura Contributors" }]
+keywords = ["macos", "voice-assistant", "offline", "laya", "apple-silicon", "on-device-ai"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Desktop Environment",
+]
+
+# The core runs on the standard library alone so it can be tested anywhere.
+# Platform accelerators are optional extras — see [project.optional-components].
+dependencies = []
+
+[project.optional-dependencies]
+mac = [
+  "sounddevice>=0.4.6",      # microphone capture (PortAudio)
+  "numpy>=1.26",             # PCM processing
+  "openwakeword>=0.6",       # on-device wake word models (ONNX)
+  "faster-whisper>=1.0",     # local STT (alternative to whisper.cpp)
+  "httpx>=0.27",             # async client for the local OpenAI-compatible server
+  "laya>=0.1",               # the System-1 decision model (Apache-2.0)
+  "piper-tts>=1.2",          # optional local TTS
+]
+dev = ["pytest>=8.0", "ruff>=0.4"]
+
+[project.scripts]
+aura = "aura.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/DigantaDey/mac-assistant"
+
+[tool.setuptools.packages.find]
+include = ["aura*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Aura local data (history, adapters, learned preferences)
+.aura-data/
+data/
+*.sqlite3
+*.session
+
+# Models — never commit weights
+models/
+*.bin
+*.onnx
+*.gguf
+*.safetensors
+
+# macOS
+.DS_Store
+
+# Env / secrets
+.env
+
+# dev venv
+.venv-dev/

@@ -1,0 +1,58 @@
+# Aura — default configuration.
+# This file ships sensible, privacy-first defaults. Copy it to
+#   macOS:  ~/Library/Application Support/Aura/config.toml
+#   other:  ~/.config/aura/config.toml
+# and edit freely — everything here is optional.
+
+profile = "auto"              # auto | mac | demo
+
+[server]
+host = "127.0.0.1"            # never expose the assistant beyond loopback
+port = 7331
+
+[wake]
+enabled = true
+mode = "manual"               # manual | openwakeword
+models = ["hey_jarvis"]       # or absolute paths to YOUR trained phrase model
+threshold = 0.55
+refractory_seconds = 2.5
+phrase = ""                   # e.g. "hey aura" — spoken prefix gate in always-on mode
+
+[stt]
+engine = "auto"               # auto | whisper_cpp | faster_whisper | null
+language = "en"
+whisper_model = ""            # e.g. "~/models/ggml-small.en.bin" (whisper.cpp)
+faster_whisper_model = "small"
+
+[planner]
+engine = "auto"               # auto | openai_compat | mock
+base_url = "http://127.0.0.1:11434/v1"   # Ollama default; mlx_lm/llama-server/LM Studio also work
+model = "qwen3:4b"
+temperature = 0.2
+timeout_seconds = 20.0
+max_actions = 3
+
+[laya]
+enabled = true
+backend = "auto"              # auto uses the `laya` package when installed
+confidence_threshold = 0.62
+destructive_threshold = 0.55
+adapter_dir = ""              # your fine-tuned Laya adapter (feedback loop output)
+
+[tts]
+engine = "auto"               # auto → `say` on macOS
+enabled = true
+voice = ""                    # e.g. "Samantha"; empty = system default
+rate = 178
+
+[safety]
+show_plan_before_run = true
+confirm_destructive = true
+always_confirm = []
+blocked_patterns = ["rm -rf /", "diskutil erase", "sudo dd"]
+
+[session]
+max_utterance_seconds = 12.0
+end_of_speech_seconds = 0.7
+confirmation_timeout_seconds = 45.0
+idle_unload_seconds = 180.0
