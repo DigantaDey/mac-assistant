@@ -45,10 +45,14 @@ for _ in $(seq 1 15); do
   if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then break; fi
   sleep 1
 done
-if curl -sf http://127.0.0.1:11434/api/tags | grep -q 'qwen3:4b'; then
+if ! curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+  note "Ollama isn't answering yet — skipping the brain for now."
+  note "Aura still works (built-in skills); start Ollama later with:"
+  note "  brew services start ollama"
+elif curl -sf http://127.0.0.1:11434/api/tags | grep -q 'qwen3:4b'; then
   note "qwen3:4b already pulled."
 else
-  ollama pull qwen3:4b
+  ollama pull qwen3:4b || note "Pull didn't finish — Aura runs on built-in skills until the brain can be fetched (re-run this script)."
 fi
 
 say_step "3/6  Speech model (whisper.cpp ggml-base.en, ~150 MB, once)"
@@ -69,8 +73,20 @@ rsync -a --delete \
   "$REPO/" "$ENGINE_DIR/"
 cd "$ENGINE_DIR"
 if [ ! -x .venv/bin/python ]; then
-  note "Creating the Python environment (first time)…"
-  python3 -m venv .venv
+  # The Xcode command-line tools ship an old python3 (3.9); Aura needs ≥3.11.
+  # Prefer a real 3.11/3.12, brew or otherwise, before falling back.
+  PYBIN="$(command -v python3.12 || command -v python3.11 || true)"
+  if [ -z "$PYBIN" ]; then
+    if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+      PYBIN="$(command -v python3)"
+    else
+      note "Need Python 3.11+ — installing python@3.12 via Homebrew (one time)…"
+      brew install python@3.12
+      PYBIN="$(command -v python3.12)"
+    fi
+  fi
+  note "Creating the Python environment with $PYBIN (first time)…"
+  "$PYBIN" -m venv .venv
 fi
 .venv/bin/python -m pip install --quiet --upgrade pip
 .venv/bin/python -m pip install --quiet ".[mac]"

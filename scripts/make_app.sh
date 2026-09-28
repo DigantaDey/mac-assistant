@@ -23,6 +23,11 @@ INSTALL=false
 DEST="build/Aura.app"
 
 say "Assembling $DEST"
+# The icon is a generated artifact; regenerate it rather than fail the build.
+if [ ! -f ../ui/icon.icns ]; then
+  say "Icon missing — generating (needs Pillow: pip install pillow)"
+  python3 ../scripts/make_icon.py
+fi
 rm -rf "$DEST"
 mkdir -p "$DEST/Contents/MacOS" "$DEST/Contents/Resources"
 cp .build/release/AuraMenuBar "$DEST/Contents/MacOS/Aura"

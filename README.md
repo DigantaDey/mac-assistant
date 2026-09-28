@@ -103,8 +103,9 @@ Laya on your machine later (ROADMAP).
 - **Ongoing** — preferences Aura learns from your corrections
   (“I prefer Spotify for music”) and remembers in Settings
 
-The skill catalog is data, not code — add a skill by adding JSON
-(`aura/skills/*.json`); tests keep them honest.
+The skill catalog is data, not code — a skill is a `SkillSpec`
+(name, examples, risk) plus one `execute()` in `aura/skills/`, and it
+automatically appears in the planner, the UI, and the safety manifest.
 
 ## The product, end to end
 

@@ -82,6 +82,15 @@ def step_wake(orch) -> StepResult:
 
         openwakeword.utils.download_models()
         result = StepResult("wake", title, "ok", "Pretrained models cached on this Mac.")
+        # If the user already chose "Always listening" while the models were
+        # missing, the wake engine fell back to tap-to-talk. Now it can go
+        # real — rebuild it right here, no restart.
+        if getattr(orch.cfg.wake, "mode", "manual") == "openwakeword":
+            try:
+                orch._wake = orch._build_wake()
+                result.detail += " Always-listening is now active."
+            except Exception:
+                pass
     except Exception as exc:
         result = StepResult("wake", title, "fail",
                             f"Download didn't take ({exc.__class__.__name__}). "
@@ -172,7 +181,8 @@ def run_installer(orch, repo: Path) -> list[StepResult]:
 def _download_with_progress(orch, key: str, title: str, url: str, target: Path, total_mb: int) -> None:
     def report(bytes_done: int, total: int) -> None:
         mb = bytes_done / (1024 * 1024)
-        _publish(orch, key, title, "running", f"{mb:.0f} MB of {total_mb} MB")
+        _publish(orch, key, title, "running",
+                 f"{mb:.0f} MB of {total_mb} MB" if total else f"{mb:.0f} MB…")
 
     tmp = target.with_suffix(".part")
     last = 0.0
@@ -193,4 +203,5 @@ def _download_with_progress(orch, key: str, title: str, url: str, target: Path, 
             fh.write(chunk)
             report(fh.tell(), 0)
     os.replace(tmp, target)
-    report(target.stat().st_size, 1)
+    _publish(orch, key, title, "running",
+             f"{target.stat().st_size / (1024 * 1024):.0f} MB — done")

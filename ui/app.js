@@ -232,7 +232,7 @@ function showProposal(p) {
     "Aura checks before it touches anything. Take a look — then decide.";
   $("proposal-actions").innerHTML = p.actions.map((a) => `
     <li class="proposal-action">
-      <span class="risk-pill risk-confirm">${esc(a.verdict)}</span>
+      <span class="risk-pill ${a.verdict === "safe" ? "risk-safe" : "risk-confirm"}">${esc(a.verdict)}</span>
       <span class="skill">${esc(a.skill)}</span>
       <span class="args">${esc(JSON.stringify(a.args))}</span>
       <span class="why">${esc(a.why || "")}</span>
