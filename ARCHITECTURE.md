@@ -122,10 +122,21 @@ plan before ever granting permissions.
 Adding a skill is ~20 lines + one `register()` call; it automatically appears
 in the planner catalog, the UI, and the safety manifest.
 
-### 6. Server & UI (`server.py`, `ui/`)
-- Stdlib `ThreadingHTTPServer` + SSE: **zero web dependencies**, loopback-only
-  by default. POSTs hop to the orchestrator's loop via
+### 6. The engine's local API (`server.py`, `localauth.py`)
+- Stdlib `ThreadingHTTPServer` + SSE: **zero web dependencies**, bound to
+  `127.0.0.1` only. POSTs hop to the orchestrator's loop via
   `run_coroutine_threadsafe`; events fan out through the `EventBus`.
+- **It is not a website.** There is no HTML, no static file serving and no
+  browser UI: `/` answers a JSON banner, unknown paths answer JSON `404`,
+  unsupported methods answer JSON `405`. The product UI is the native app.
+- **Access control (v0.6).** A loopback port is reachable by any process and
+  by any web page you have open, so every request must carry
+  `X-Aura-Token` — a 32-byte secret stored `0600` in
+  `Application Support/Aura/token` and passed to the child through
+  `AURA_TOKEN`. Requests with a browser `Origin` are refused (CSRF), as are
+  requests whose `Host` isn't loopback (DNS rebinding), and no CORS headers
+  are ever emitted. `AURA_NO_AUTH=1` exists for local development and says so
+  in the banner; widening the bind needs an explicit `AURA_ALLOW_REMOTE=1`.
 - **Thread-correct by construction (v0.5):** the HTTP handlers are *server*
   threads; everything they touch on the orchestrator is scheduled — futures
   resolved with `call_soon_threadsafe`, bus delivery re-dispatched onto the
@@ -133,17 +144,14 @@ in the planner catalog, the UI, and the safety manifest.
   are safe). The v0.5 release fixed a real deadlock this rule catches
   (confirm-posted-from-a-browser-thread hung the session forever) and
   regression-tests it over real HTTP.
-- The endpoint surface: chat (`/api/input|confirm|cancel|correct`), state
-  (`/api/state|health|history|skills|metrics`), the consent layer
-  (`/api/permissions|request`), the live settings layer
-  (`/api/config` — validated, persisted, hot-applied), setup
-  (`/api/setup|setup/step`), and wake/training control (`/api/wake*`).
-- The UI is hand-rolled HTML/CSS/JS — no framework, no build step, no fonts to
-  download (system SF stack). One SSE stream drives everything: orb states,
-  live transcripts, plan proposals, confirm/cancel (⌘↩ / esc), the activity
-  timeline with 👍/👎 correction, skills grid, settings. A compact layout
-  (sidebar collapses to an icon rail under 620 px) makes it first-class inside
-  the 480 pt menu-bar popover.
+- The endpoint surface: input (`/api/input|confirm|cancel|correct|trigger`),
+  state (`/api/state|health|history|skills|metrics|config`), the consent
+  layer (`/api/permissions*`), live settings (`/api/config` — validated,
+  persisted, hot-applied), setup (`/api/setup/install|setup/step` — the
+  install *starts* and streams progress over SSE instead of holding an HTTP
+  request open for minutes), and wake/training control (`/api/wake*`).
+- One SSE stream (`/api/events`) drives everything in the app: state, live
+  transcripts, plans, proposals, action results, setup progress, log lines.
 
 ### 7. Permissions (`permissions.py`, Setup wizard)
 Aura treats TCC as *the* consent system, not an obstacle. Every check is
@@ -154,27 +162,40 @@ real binary/endpoint probes. The Setup wizard renders these as cards with
 deep links (`x-apple.systempreferences:…`) into the exact Privacy panes,
 a progress bar, and a Check-again loop. Nothing is faked, anywhere.
 
-### 8. The native shell (`macos/`)
-An AppKit executable built with `swift build` (no Xcode project):
-- **First run is native (v0.5):** a *Welcome to Aura* `NSWindow` hosts the
-  Setup wizard in a `WKWebView` (the browser never appears), and the app
-  itself asks macOS for Microphone (its bundle carries
-  `NSMicrophoneUsageDescription`) and shows the Accessibility prompt —
-  proactively, seconds after launch, once.
-- `NSStatusItem` whose icon mirrors orchestrator state (polled from
-  `/api/health` every 2 s: ready / busy / needs-OK / offline, with
-  offline→ready reload), a full right-click menu (open, wake, setup,
-  browser, restart engine, choose folder, login, log, quit), an
-  `NSPopover`+`WKWebView` panel behind a native "Waking Aura…" readiness
-  gate, and a global ⌥Space hotkey via Carbon (`RegisterEventHotKey` — no
-  permission needed).
-- The Python process babysitter discovers the engine (UserDefaults →
-  `Application Support/Aura/engine`, the installer's home → file picker),
-  spawns `.venv/bin/python -m aura serve` with `AURA_ENGINE_PATH` /
-  `AURA_DATA_DIR` and a GUI-safe PATH, rotates logs to
-  `~/Library/Logs/Aura.log`, restarts after crashes; `SMAppService`
-  login item. `scripts/make_app.sh` assembles and ad-hoc-signs `Aura.app`
-  (generated icon from `scripts/make_icon.py` — no binary hand-maintenance).
+### 8. The app (`macos/` — AuraCore + AuraMenuBar)
+Two Swift targets in one package (`swift build`, no Xcode project):
+
+**`AuraCore`** — Foundation only, so it compiles and unit-tests in seconds
+and has no UI dependencies:
+- `EngineClient`: a typed async client for every endpoint, plus a
+  **self-healing SSE stream** (reconnects with backoff; the UI has one code
+  path for “everything that happens”);
+- `EngineSupervisor`: owns the Python process — discovers the engine
+  (remembered folder → installer copy), **adopts** an engine that is already
+  running instead of fighting for the port, reclaims the port from a *stale
+  Aura engine* (and refuses to touch anything that isn't ours), restarts with
+  bounded exponential backoff, and never leaves the child behind on quit;
+- `AppPaths`, `AccessToken` (0600), `AuraLog` (rotating at 5 MB, with an
+  in-app tail reader), `Prefs`, and the typed models of the engine's JSON.
+
+**`AuraMenuBar`** — the product: AppKit + SwiftUI, `LSUIElement` (no Dock
+icon, one instance):
+- `NSStatusItem` whose icon mirrors the engine state (ready / working /
+  needs-your-OK / attention), an `NSPopover` hosting the SwiftUI panel (orb,
+  transcript, reply, **native confirmation card** with ⌘↩ / Esc, composer,
+  suggestions, Activity, My data), and a right-click menu wired to the
+  delegate;
+- a Settings window with eight sections driven by the engine's own state
+  (General, Voice, Understanding, Safety, Permissions, Wake Phrase, Activity,
+  About) and a first-run onboarding window that explains what stays local
+  before asking macOS for the two permissions;
+- global ⌥Space via Carbon `RegisterEventHotKey` (no permission needed),
+  `SMAppService` for “Start at Login”, `AVFoundation`/`AXIsProcessTrusted`
+  for the consent dialogs the app owns.
+- **No WebKit anywhere** — CI fails the build if `import WebKit` or
+  `WKWebView` reappears under `macos/Sources`.
+- `scripts/make_app.sh` assembles and ad-hoc-signs `Aura.app`; the icon is
+  generated by `scripts/make_icon.py`.
 
 ## Configuration
 `config.default.toml` → user `config.toml` → `runtime.toml` (written by the
@@ -187,12 +208,25 @@ at runtime (`POST /api/config` validates type + membership, persists to
 refused with a friendly message.
 
 ## Testing
-144 tests cover the JSON parser, mock planner routing, the **hybrid
-planner's fallbacks** (dead endpoint ⇒ degraded plan that still acts), the
-**session guard** (planner crash ⇒ session still answers), wake fallback
-honesty, safety verdicts, the Laya heuristic + example buffer,
-memory/FTS/preferences, the **thread-correct confirm flow over real HTTP**,
-live config round-trips and refusals, and **full orchestration over real
-HTTP** (typed session, confirmation flow, cancel flow, busy-state hints,
-feedback recording). The dry-run bridge makes the entire product testable on
-Linux CI — the same code path a Mac runs.
+**Engine (Linux CI, `pytest`):** 200+ tests cover the JSON parser, mock
+planner routing, the **hybrid planner's fallbacks** (dead endpoint ⇒ degraded
+plan that still acts), the **session guard** (planner crash ⇒ session still
+answers), wake fallback honesty, safety verdicts, the Laya heuristic +
+example buffer, memory/FTS/preferences, **access control** (token required,
+browser `Origin` and foreign `Host` refused, no HTML surface), live config
+round-trips and refusals, and **full orchestration over real HTTP** (typed
+session, confirmation flow, cancel flow, busy-state hints, feedback
+recording). The dry-run bridge makes the whole product testable on Linux —
+the same code path a Mac runs.
+
+**App (macOS CI, `swift test`):** `AuraCoreTests` cover the JSON model, the
+SSE parser (multi-line data, keepalives, whole-block feeds), the client
+(token header on every request, 401 ⇒ “another engine holds this port”,
+403 ⇒ the engine's own message, decoding of state/config), path and token
+handling, and the shortcut map. A second job builds the release binary,
+runs those tests, assembles `Aura.app`, and validates the bundle
+(executable bit, `plutil`, `LSUIElement=true`, and the WebKit ban).
+
+**Anywhere:** `scripts/check_swift_syntax.py` parses every Swift file with
+tree-sitter in about a second, so a syntax error is caught on Linux instead
+of costing a macOS runner cycle.

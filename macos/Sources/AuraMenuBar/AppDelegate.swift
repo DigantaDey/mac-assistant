@@ -40,7 +40,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.start()
 
         if !Prefs.hasOnboarded {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+            // A moment after the icon appears, so the welcome has context.
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 700_000_000)
                 self?.showOnboarding()
             }
         }
@@ -110,33 +112,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return item
     }
 
+    /// Combine and NotificationCenter hand us *nonisolated* closures even when
+    /// they arrive on the main queue, so each one hops back to the actor
+    /// explicitly. Being honest here is what keeps this class warning-free.
     private func observe() {
         model.$phase
-            .sink { [weak self] _ in self?.updateIcon() }
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.updateIcon() }
+            }
             .store(in: &cancellables)
         model.$engineStatus
-            .sink { [weak self] _ in self?.updateIcon() }
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.updateIcon() }
+            }
             .store(in: &cancellables)
     }
 
     private func observeNotifications() {
         NotificationCenter.default.addObserver(forName: .auraOpenPanel, object: nil,
                                                queue: .main) { [weak self] note in
-            guard let self else { return }
-            guard let target = note.object as? String else {
-                self.togglePopover()
-                return
-            }
-            if target.hasPrefix("settings") || target == "activity" {
-                self.showSettings(section: target)
-            } else {
-                self.togglePopover()
+            let target = note.object as? String
+            Task { @MainActor in
+                guard let self else { return }
+                if let target, target.hasPrefix("settings") || target == "activity" {
+                    self.showSettings(section: target)
+                } else {
+                    self.togglePopover()
+                }
             }
         }
 
         NotificationCenter.default.addObserver(forName: .auraShortcutChanged, object: nil,
                                                queue: .main) { [weak self] _ in
-            self?.registerHotKey()
+            Task { @MainActor in self?.registerHotKey() }
         }
     }
 

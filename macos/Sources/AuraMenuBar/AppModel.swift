@@ -2,6 +2,7 @@ import AppKit
 import AuraCore
 import Combine
 import Foundation
+import SwiftUI
 
 // MARK: - small view models
 
