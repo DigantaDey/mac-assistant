@@ -4,65 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import socket
-import threading
-import urllib.request
+import urllib.error
 
 import pytest
 
-from conftest import DemoStack
-
-
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture()
-def server(stack: DemoStack):
-    from aura.server import AuraServer
-
-    orch = stack.build_orchestrator()
-    stack.cfg.server.port = free_port()
-    srv = AuraServer(orch, stack.cfg)
-
-    async def boot():
-        await orch.start()
-        srv.start()
-
-    loop = asyncio.new_event_loop()
-    started = threading.Event()
-
-    def run():
-        loop.run_until_complete(boot())  # sets orch._loop, starts HTTP thread
-        started.set()
-        loop.run_forever()               # keep serving, like cmd_serve does
-
-    threading.Thread(target=run, daemon=True).start()
-    assert started.wait(5), "orchestrator failed to boot"
-    yield orch, srv, stack.cfg
-
-    async def down():
-        srv.stop()
-        await orch.stop()
-
-    asyncio.run_coroutine_threadsafe(down(), loop).result(5)
-    loop.call_soon_threadsafe(loop.stop)
-    threading.Event().wait(0.1)
-
-
-def get(url: str) -> tuple[int, bytes]:
-    with urllib.request.urlopen(url, timeout=5) as r:
-        return r.status, r.read()
-
-
-def post(url: str, body: dict) -> tuple[int, dict]:
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=5) as r:
-        return r.status, json.loads(r.read())
+from conftest import get, post
 
 
 class TestServer:

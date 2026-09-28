@@ -12,6 +12,9 @@ Endpoints:
   POST /api/cancel        resolve a proposal  {token}
   POST /api/correct       timeline feedback    {transcript, skill, verdict, note}
   GET  /api/skills        the skill catalog
+  GET  /api/permissions   honest permission + readiness snapshot
+  POST /api/permissions/open            {target: microphone|accessibility|automation}
+  POST /api/permissions/test_automation  sends one harmless AppleEvent probe
 
 The product binds 127.0.0.1 only. `AURA_HOST` can widen it for development
 (the sandboxed preview does this); there is no auth by design, so never
@@ -103,6 +106,8 @@ class AuraServer:
                     self._json(_state_snapshot(orch, cfg))
                 elif path == "/api/skills":
                     self._json({"skills": orch.registry.specs()})
+                elif path == "/api/permissions":
+                    self._json(_permissions_snapshot(orch, cfg))
                 elif path == "/api/history":
                     self._json({"events": orch.memory.recent_events(100)})
                 elif path == "/api/events":
@@ -168,6 +173,14 @@ class AuraServer:
                                          "confirmed" if body.get("verdict") == "good" else "corrected",
                                          str(body.get("note", ""))[:500])
                     self._json({"ok": True})
+                elif path == "/api/permissions/open":
+                    from . import permissions as perms
+                    ok, msg = perms.open_settings(str(body.get("target", "")))
+                    self._json({"ok": ok, "message": msg})
+                elif path == "/api/permissions/test_automation":
+                    from . import permissions as perms
+                    status, msg = perms.test_automation()
+                    self._json({"status": status, "message": msg})
                 else:
                     self._json({"error": "not found"}, 404)
 
@@ -186,6 +199,23 @@ class AuraServer:
 def _version() -> str:
     from . import __version__
     return __version__
+
+
+def _permissions_snapshot(orch, cfg) -> dict:  # noqa: ANN001
+    """The Setup wizard's data: honest, per-permission state, checked live."""
+    from . import permissions as perms
+
+    return {
+        "platform": "mac" if perms.is_mac() else "other",
+        "profile": cfg.profile,
+        "bridge": orch.bridge.platform,
+        "microphone": perms.check_microphone(orch),
+        "accessibility": perms.check_accessibility(),
+        "whisper_cpp": perms.check_whisper_cpp(cfg),
+        "planner_server": perms.check_planner_server(cfg),
+        "planner_engine": cfg.planner.engine,
+        "model": cfg.planner.model,
+    }
 
 
 def _state_snapshot(orch, cfg) -> dict:  # noqa: ANN001

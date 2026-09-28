@@ -70,7 +70,19 @@ python -m aura serve                      # real mic, real executors
 
 Then grant permissions when macOS asks (**System Settings → Privacy & Security**):
 **Accessibility** (drive apps), **Microphone** (hear you), and per-app
-**Automation** (AppleScript). Aura's UI walks you through it.
+**Automation** (AppleScript). The built-in **Setup wizard** (sidebar → Setup)
+detects each one live and deep-links you to the exact pane.
+
+### Make it feel like a native app
+
+```bash
+./scripts/make_app.sh --install   # → /Applications/Aura.app (menu-bar shell)
+```
+
+A thin Swift/AppKit shell (no Xcode project needed — just `swift build`):
+◉ in your menu bar, the full UI in a popover, **⌥Space wakes Aura globally**,
+launches/restarts the Python engine for you, and offers Start-at-Login.
+See [macos/README.md](macos/README.md).
 
 ### Make the wake word yours
 

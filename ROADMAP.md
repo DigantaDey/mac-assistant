@@ -19,14 +19,15 @@ mainstream gap.
       settings — SSE-live
 - [x] 48 tests, all green; dry-run bridge runs the product on any OS
 
-## v0.2 — Real Mac bring-up (config, not code)
+## v0.2 — Real Mac bring-up
+- [x] Permissions onboarding wizard (live TCC detection, System Settings
+      deep links, AppleScript probe, readiness checks)
+- [x] Menu-bar shell (Swift/AppKit: popover + WKWebView, global ⌥Space,
+      process babysitter, logs, login item, `make_app.sh` bundler)
 - [ ] Field-test on Apple Silicon: mic input, whisper.cpp via Homebrew,
       Ollama qwen3:4b planner, real executors end to end
-- [ ] Permissions onboarding flow (Accessibility, Microphone, Automation)
-      as a first-run wizard in the UI
 - [ ] Always-listening mode with phrase gate; refine thresholds from logs
 - [ ] Idle model unload; energy check (<1% CPU idle, <250 MB idle RSS)
-- [ ] `launchd` plist + menu-bar shell (Swift, thin: status item + WKWebView)
 - [ ] Settings hot-reload (watch config.toml; no restart)
 
 ## v0.3 — Laya, for real

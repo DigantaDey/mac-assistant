@@ -102,7 +102,27 @@ in the planner catalog, the UI, and the safety manifest.
 - The UI is hand-rolled HTML/CSS/JS — no framework, no build step, no fonts to
   download (system SF stack). One SSE stream drives everything: orb states,
   live transcripts, plan proposals, confirm/cancel (⌘↩ / esc), the activity
-  timeline with 👍/👎 correction, skills grid, settings.
+  timeline with 👍/👎 correction, skills grid, settings. A compact layout
+  (sidebar collapses to an icon rail under 620 px) makes it first-class inside
+  the 480 pt menu-bar popover.
+
+### 7. Permissions (`permissions.py`, Setup wizard)
+Aura treats TCC as *the* consent system, not an obstacle. Every check is
+honest and live: Accessibility via `AXIsProcessTrusted()`, microphone via
+whether Aura's own audio bridge opened, automation via a harmless AppleEvent
+actually sent (the consent dialog is the feature), whisper/LLM readiness via
+real binary/endpoint probes. The Setup wizard renders these as cards with
+deep links (`x-apple.systempreferences:…`) into the exact Privacy panes,
+a progress bar, and a Check-again loop. Nothing is faked, anywhere.
+
+### 8. The native shell (`macos/`)
+A ~500-line AppKit executable built with `swift build` (no Xcode project):
+`NSStatusItem` whose icon mirrors orchestrator state (polled from
+`/api/health` every 2 s), an `NSPopover`+`WKWebView` panel, a global
+⌥Space hotkey via Carbon (`RegisterEventHotKey` — no permission needed),
+a Python process babysitter (launch, log rotation, crash-restart, clean
+shutdown), first-run folder picker, and `SMAppService` login item.
+`scripts/make_app.sh` assembles and ad-hoc-signs `Aura.app`.
 
 ## Configuration
 `config.default.toml` → user `config.toml` → `AURA_*` env vars. Demo profile

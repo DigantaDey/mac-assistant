@@ -164,6 +164,20 @@ function showView(name) {
 document.querySelectorAll(".nav-item").forEach((n) =>
   n.addEventListener("click", (e) => { e.preventDefault(); showView(n.dataset.nav); }));
 
+/* Deep links: #setup / #onboarding (the menu-bar shell opens #onboarding on
+   first run). Keep the hash and the view in sync. */
+const VIEW_ALIASES = { onboarding: "setup" };
+
+function viewFromHash() {
+  const h = location.hash.replace("#", "");
+  return VIEW_ALIASES[h] || h;
+}
+
+window.addEventListener("hashchange", () => {
+  const v = viewFromHash();
+  if ($(`view-${v}`)) showView(v);
+});
+
 function updateActivityBadge() {
   const el = $("activity-count");
   el.hidden = !(S.activityUnread > 0);

@@ -432,6 +432,50 @@ kbd {
 .toggle.is-on { background: var(--green); }
 .toggle.is-on::after { transform: translateX(15px); }
 
+/* ── Setup wizard ─────────────────────────────────────────────────────── */
+
+.setup-progress { margin-bottom: 14px; }
+.progress-row { display: flex; align-items: baseline; gap: 10px; margin-bottom: 9px; flex-wrap: wrap; }
+.progress { height: 6px; background: rgba(255, 255, 255, 0.08); border-radius: 999px; overflow: hidden; }
+.progress-fill { height: 100%; background: var(--grad-accent); border-radius: 999px;
+  transition: width 400ms var(--ease); }
+.setup-grid { display: flex; flex-direction: column; gap: 12px; }
+.setup-head { display: flex; align-items: center; gap: 10px; }
+.setup-icon { width: 30px; height: 30px; border-radius: 9px; flex: 0 0 30px;
+  background: rgba(10, 132, 255, 0.14); display: grid; place-items: center; }
+.setup-icon svg { width: 16px; height: 16px; fill: #6db3ff; }
+.setup-title { display: flex; align-items: center; gap: 10px; }
+.setup-title h2 { font-size: 14px; }
+.setup-body { margin: 10px 0 0; font-size: 12.5px; max-width: 660px; }
+.setup-buttons { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.setup-result { margin-top: 10px; font-size: 12px; color: var(--ink-2);
+  background: rgba(0, 0, 0, 0.25); border: 1px solid var(--hairline);
+  border-radius: 8px; padding: 7px 10px; }
+.setup-result.ok { color: #7ddf9a; border-color: rgba(48, 209, 88, 0.25); }
+.setup-result.bad { color: #ffb4ad; border-color: rgba(255, 69, 58, 0.25); }
+.risk-unknown { color: var(--ink-3); background: rgba(255, 255, 255, 0.06); }
+
+/* ── Compact layout — the menu-bar popover is 480 pt wide ─────────────── */
+
+@media (max-width: 620px) {
+  :root { --sidebar-w: 58px; }
+  .sidebar { padding: 14px 8px 12px; align-items: center; }
+  .brand { padding-bottom: 12px; justify-content: center; }
+  .brand-text, .nav-item span, .status-card, .privacy-pill span, .version { display: none; }
+  .privacy-pill { padding: 6px; }
+  .nav-item { justify-content: center; padding: 9px 0; width: 40px; }
+  .nav-badge { display: none; }
+  .view { padding: 22px 18px 44px; }
+  .hero { padding-top: 2px; }
+  .orb { width: 128px; height: 128px; }
+  .orb-core { inset: 26px; }
+  .orb-core svg { width: 34px; height: 34px; }
+  .orb-title { font-size: 18px; margin-top: 16px; }
+  .composer { margin-top: 18px; }
+  .chips { gap: 6px; }
+  .proposal { margin-top: 18px; }
+}
+
 /* ── Toasts ───────────────────────────────────────────────────────────── */
 
 .toasts {
