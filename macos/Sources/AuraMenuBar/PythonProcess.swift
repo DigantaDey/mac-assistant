@@ -124,7 +124,7 @@ final class PythonProcess {
             fm.createFile(atPath: logURL.path, contents: nil)
         }
         if let handle = try? FileHandle(forWritingTo: logURL) {
-            try? handle.seekToEnd()
+            _ = try? handle.seekToEnd()
             child.standardOutput = handle
             child.standardError = handle
         }

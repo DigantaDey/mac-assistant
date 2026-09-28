@@ -30,3 +30,7 @@ models/
 
 # dev venv
 .venv-dev/
+
+# Swift Package Manager
+.build/
+macos/.build/

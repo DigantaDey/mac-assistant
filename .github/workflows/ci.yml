@@ -4,9 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
-  test:
+  engine:
+    name: Engine (Python)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,15 +33,46 @@ jobs:
       - name: Byte-compile everything (syntax gate)
         run: python -m compileall -q aura scripts tests
 
-      # The Swift shell can't compile on Linux runners; keep it honest by
-      # checking the files exist and the package manifest parses structurally.
-      - name: Sanity-check the Swift package tree
+  native:
+    name: Native shell (macOS / Swift)
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # The shell is the only part of Aura that can't be compiled on Linux,
+      # so it gets a real macOS runner: a broken build is caught here instead
+      # of on a user's Mac.
+      - name: Swift version
+        run: swift --version
+
+      - name: Build the Swift package (release)
+        working-directory: macos
+        run: swift build -c release
+
+      - name: Assemble Aura.app
+        run: ./scripts/make_app.sh
+
+      - name: Validate the bundle
         run: |
-          test -f macos/Package.swift
-          test -f macos/Sources/AuraMenuBar/main.swift
-          test -f macos/Sources/AuraMenuBar/AppDelegate.swift
-          test -f macos/Sources/AuraMenuBar/Permissions.swift
-          test -f macos/Sources/AuraMenuBar/PythonProcess.swift
-          test -f macos/Sources/AuraMenuBar/ServerMonitor.swift
-          test -f ui/icon.icns
-          test -f ui/icon.png
+          set -euo pipefail
+          APP=macos/build/Aura.app
+          test -x "$APP/Contents/MacOS/Aura"
+          plutil -lint "$APP/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$APP/Contents/Info.plist")" = "true"
+          # The menu-bar shell must never grow a browser dependency again.
+          if grep -rIl -e 'import WebKit' -e 'WKWebView' macos/Sources; then
+            echo "::error::WebKit found in the native shell — Aura is a native macOS app."
+            exit 1
+          fi
+
+      - name: Run the Swift unit tests
+        working-directory: macos
+        run: swift test
+
+      - name: Upload the built app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aura.app
+          path: macos/build/Aura.app
+          if-no-files-found: error

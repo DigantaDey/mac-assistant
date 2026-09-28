@@ -177,8 +177,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let up = (response as? HTTPURLResponse)?.statusCode == 200
                 DispatchQueue.main.async {
                     if up {
+                        // URL.appending(fragment:) doesn't exist — the hash has
+                        // to be composed into the URL itself (and must not be
+                        // percent-escaped away).
                         var target = self.baseURL
-                        if onboarding { target = target.appending(fragment: "onboarding") }
+                        if onboarding,
+                           let withFragment = URL(string: self.baseURL.absoluteString + "#onboarding") {
+                            target = withFragment
+                        }
                         web.load(URLRequest(url: target))
                     } else if tries < 40 {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { poll() }
@@ -350,20 +356,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: global hotkey (⌥Space) — Carbon registration, no permission needed
 
     private func registerHotkey() {
-        var hotKeyID = EventHotKeyID(signature: fourCC("AURA"), id: 1)
+        let hotKeyID = EventHotKeyID(signature: fourCC("AURA"), id: 1)
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                       eventKind: UInt32(kEventHotKeyPressed))
+        // InstallApplicationEventHandler is a C macro, and Swift can't import
+        // function-like macros — expand it by hand into InstallEventHandler,
+        // which is the real symbol underneath.
         let handler: EventHandlerUPP = { _, eventRef, userData in
-            guard let eventRef = eventRef, let userData = userData else { return noErr }
+            guard let eventRef, let userData else { return noErr }
             guard GetEventKind(eventRef) == UInt32(kEventHotKeyPressed) else { return noErr }
             let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
             DispatchQueue.main.async { delegate.wake() }
             return noErr
         }
-        InstallApplicationEventHandler(handler, 1, [eventType],
-                                       Unmanaged.passUnretained(self).toOpaque(), nil)
-        RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), hotKeyID,
-                            GetApplicationEventTarget(), 0, nil)
+        let userData = Unmanaged.passUnretained(self).toOpaque()
+        InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, userData, nil)
+
+        var hotKeyRef: EventHotKeyRef?
+        let status = RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), hotKeyID,
+                                         GetApplicationEventTarget(), 0, &hotKeyRef)
+        if status != noErr {
+            NSLog("Aura: ⌥Space is already taken (status \(status)) — use the menu bar icon.")
+        }
     }
 
     private func fourCC(_ string: String) -> OSType {
