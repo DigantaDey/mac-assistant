@@ -287,6 +287,12 @@ class MockAXTree:
                             "Actions", "Sponsors",
                         )
                     ]),
+                    AXNode("group", label="Sign in form", children=[
+                        text("Sign in to keep going — it only takes a second."),
+                        field("Username", value="", role="textfield"),
+                        field("Password", value="", role="securetextfield"),
+                        btn("Continue"),
+                    ]),
                     AXNode("group", label="Settings", children=[
                         btn("Save preferences"),
                         btn("Delete repository"),

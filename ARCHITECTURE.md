@@ -20,7 +20,7 @@ paranoid gate, and dumb-but-perfect executors.
 │      │        └────────────────────────┬────────────────────────────────┘ │
 │      │                                 │                                  │
 │  TTS  │        Planner ────────► SafetyGate ────────► SkillRegistry        │
-│ `say` │  OpenAI-compat local    blocklist          20 declared skills      │
+│ `say` │  OpenAI-compat local    blocklist          24 declared skills      │
 │ /Piper│  LLM (Ollama/mlx_lm/    + skill manifest   AppleScript · AX · `open`│
 │       │  llama.cpp/LM Studio)   + Laya gate        · pbcopy/pbpaste        │
 │       │                                 │                                  │
@@ -105,6 +105,13 @@ first runs). Same answers, same interface, one-file swap.
   "did you mean …", never a guess.
 - **`skills/accessibility.py`** turns that into voice: "click the sign in
   button", "type aura into the search field", "what's on my screen".
+- **`skills/forms.py`** fills whole forms from dictation:
+  **`formfill.py`** scans the live tree for fields/buttons, maps spoken
+  values onto labels (grounded — an offline LLM pass only refines when the
+  heuristic matched nothing), and types with original casing kept.
+  `ax.fill_form` (safe), `ax.read_form` (reads the fields), `ax.dictate`
+  (~100 ms typing into the focused field). Pressing a submit button is
+  always a separate confirm-gated action.
 
 A skill = `SkillSpec` (catalog + risk declaration) + one async `execute()`.
 macOS work goes through **`MacBridge`** (osascript/CLI); **`DryRunBridge`**

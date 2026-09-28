@@ -94,6 +94,14 @@ Laya on your machine later (ROADMAP).
 
 ## What Aura can do today
 
+- **Forms** — tell it the values and it fills the form open in front of you,
+  in any browser: “*fill this form: name John, email me at smith dot com*.”
+  It reads the live accessibility tree, maps what you say onto the right
+  fields (grounded — no guessing), and types each value with its original
+  casing kept. It will *never* press submit for you — ending a form is a
+  confirm-gated action, so the send is always your call. Also:
+  “*what fields does this form have?*” to read it, and plain dictation
+  (“*type 123 Main Street*”) to drop text into the focused field.
 - **System** — open apps, find files, copy / set the clipboard, mute,
   DND, sleep, screenshots, volume, trash (asks first), quit apps (asks)
 - **Automation** — System Events (launch/quit/set frontmost), Accessibility

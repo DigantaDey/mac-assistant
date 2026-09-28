@@ -97,7 +97,7 @@ _DESTRUCTIVE_SKILLS = {
 _DESTRUCTIVE_ARGS = re.compile(
     r"(rm\s+-rf|/etc/|/system|diskutil|sudo|format|erase|shutdown|reboot|drop\s+table"
     r"|\bdelete\b|\bempty\b|\bpurchase\b|\bcheckout\b|\bpay\b|\bsubmit\b|\bpublish\b"
-    r"|\bsend\b|\binvite\b|\bshare\b)",
+    r"|\bsend\b|\binvite\b|\bshare\b|\bsign ?up\b|\bregister\w*\b|\bsubscrib\w*\b)",
     re.IGNORECASE,
 )
 _SHARED_ARG_KEYS = {"to", "recipient", "email", "share", "post"}

@@ -106,6 +106,12 @@ class MacBridge:
     def open_url(self, url: str) -> tuple[bool, str]:
         return self.run(["open", url])
 
+    def keystroke(self, text: str) -> tuple[bool, str]:
+        """Type into whatever the system has focused — the dictation path.
+        No tree read, no targeting: one keystroke event, ~100 ms."""
+        safe = text.replace("\\", "\\\\").replace('"', '\\"')
+        return self.osascript(f'tell application "System Events" to keystroke "{safe}"')
+
     def ax_tree(self):
         """The frontmost app's accessibility tree (MacAXTree on a Mac)."""
         from ..ax import MacAXTree
@@ -133,6 +139,10 @@ class DryRunBridge(MacBridge):
     def open_url(self, url: str) -> tuple[bool, str]:
         self.calls.append(("open", url))
         return True, f"[dry-run] open {url}"
+
+    def keystroke(self, text: str) -> tuple[bool, str]:
+        self.calls.append(("keystroke", text))
+        return True, f"[dry-run] typed {text!r} into the focused field"
 
     def ax_tree(self):
         """The deterministic mock window — same interface as the real thing."""

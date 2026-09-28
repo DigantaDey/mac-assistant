@@ -117,8 +117,36 @@ fixes that make it feel like it is.
       install; `--version`
 - [x] 144 tests, all green — including the ship regressions above
 
+## v0.5.1 — Speak the form, fill the form ✅
+The theme: **forms in any browser, filled from your voice — seamless,
+fast, light, powerful.** No extension, no click-through: Aura reads the
+live accessibility tree, so it works wherever a normal field shows a
+normal label.
+
+- [x] **`ax.fill_form`** — “*fill this form: name John, email me at
+      smith dot com*”: scans the frontmost window's fields, maps the
+      dictation onto labels (synonyms: mail/email; grammar: “*set city to
+      Portland*”, “*the mail is …*”, ordinal “*first field …*”, bare
+      positional lists), and types every value with original casing kept.
+      Heuristic-first for speed; an offline LLM pass refines only when the
+      heuristic matched nothing and a brain is online
+- [x] **`ax.read_form`** — “*what fields does this form have?*” lists the
+      fields and the ending button in plain English
+- [x] **`ax.dictate`** — “*type 123 Main Street*”: plain dictation into
+      the focused field, ~100 ms, no tree read — the fast path
+- [x] **Honest by design** — unmentioned fields stay empty and are
+      reported (“Still empty: …”); values are never invented
+- [x] **Send is always your call** — filling auto-runs (it's safe);
+      pressing submit/send/save/sign-up is a separate confirm-gated
+      action; “*fill this form: … and press submit*” plans both
+- [x] **Sign-up / register / subscribe are confirm-gated** in the
+      destructive-argument list — a voice click can never sign you up
+- [x] 33 new tests: scan, parse (grammar/synonyms/case/ordinals/position),
+      LLM refine + failure, read, fill, dictation, routing, the safety
+      gate, and a full orchestrator end-to-end
+
 ## v0.6 — Depth
-- [ ] Browser extension (MV3) + CDP: read/act on DOM, forms, multi-tab flows
+- [ ] Browser extension (MV3) + CDP: read/act on DOM, multi-tab flows
 - [ ] Window management skills (positions, spaces) via AX
 - [ ] Procedures: "watch me do this once" → recorded, editable, replayable
       workflows (OpenAdapt-style, voice-triggered)

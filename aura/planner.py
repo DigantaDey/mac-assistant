@@ -301,8 +301,13 @@ class MockPlanner(Planner):
         started = time.monotonic()
         # Chain support: "open spotify and set volume to 30" → two actions.
         # (The real local LLM does this natively; the mock mirrors it.)
-        parts = [p for p in re.split(r"\s+and then\s+|\s+and\s+", transcript.strip(), maxsplit=2)
-                 if p.strip()] or [transcript.strip()]
+        # A dictated form fill is atomic — its "and submit" belongs to the
+        # fill, not to a second step, so it stays one part.
+        if re.search(r"\b(?:fill|complete)\b.*\b(?:form|fields)\b", transcript, re.IGNORECASE):
+            parts = [transcript.strip()]
+        else:
+            parts = [p for p in re.split(r"\s+and then\s+|\s+and\s+", transcript.strip(), maxsplit=2)
+                     if p.strip()] or [transcript.strip()]
         actions: list[Action] = []
         replies: list[str] = []
         for part in parts[: self.max_actions]:
@@ -368,10 +373,37 @@ class MockPlanner(Planner):
             target = m.group(1).strip(" .!?")
             actions.append(Action("ax.click", {"target": target}, "safe", "click by label"))
             reply = ""  # the grounded skill message ("Pressed … 95% sure") is the reply
+        elif ("fill" in t or "complete" in t) and ("form" in t or "fields" in t or "this out" in t):
+            # Dictated form fill — the skill parses the raw dictation against
+            # the live form. "…and press submit" becomes one extra,
+            # confirm-gated action; the fill itself stays frictionless.
+            actions.append(Action("ax.fill_form", {"raw": transcript.strip()}, "safe",
+                                  "user dictated the form's values"))
+            m_sub = re.search(
+                r"(?:and|then)\s+(?:press|click|hit|tap|select)?\s*(?:the )?"
+                r"(submit|send|save|continue|sign ?up|register|complete|check ?out)\b", t)
+            if m_sub:
+                actions.append(Action("ax.click", {"target": m_sub.group(1)}, "confirm",
+                                      "presses the form's ending button"))
+            reply = ""  # the skill's grounded message ("Filled … with …") is the reply
         elif m := re.search(r"type (.+?) into (?:the )?(.+)", t):
+            # Values keep their original casing — passwords aren't lowercase.
+            m2 = re.search(r"type (.+?) into (?:the )?(.+)", transcript, re.IGNORECASE)
+            text = (m2.group(1) if m2 else m.group(1)).strip()
             actions.append(Action("ax.type_into",
-                                  {"text": m.group(1).strip(), "target": m.group(2).strip(" .!?")},
+                                  {"text": text, "target": m.group(2).strip(" .!?")},
                                   "safe", "type into a named field"))
+            reply = ""
+        elif m := re.search(r"^(?:please )?(?:type|dictate|say)\s*:?\s+(.+)$", t):
+            # Plain dictation into whatever field is focused — the fast path.
+            m2 = re.search(r"^(?:please )?(?:type|dictate|say)\s*:?\s+(.+)$",
+                           transcript, re.IGNORECASE)
+            text = (m2.group(1) if m2 else m.group(1)).strip(" .!?")
+            actions.append(Action("ax.dictate", {"text": text}, "safe",
+                                  "typed into the focused field"))
+            reply = ""
+        elif ("form" in t or "fields" in t) and re.search(r"\b(what|list|which|show)\b", t):
+            actions.append(Action("ax.read_form", {}, "safe", "listing the form's fields"))
             reply = ""
         elif "on my screen" in t or "read my screen" in t or "what do you see" in t:
             actions.append(Action("ax.read_screen", {}, "safe", "reading visible controls"))
