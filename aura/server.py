@@ -1,80 +1,158 @@
-"""The local server — zero-dependency HTTP + SSE on the loopback address.
+"""The engine's local API — headless, loopback-only, token-guarded.
 
-Endpoints:
-  GET  /                  the UI (single page, hand-rolled, no build step)
-  GET  /api/health        liveness + capability matrix
-  GET  /api/state         current snapshot (state, session, skills, config)
-  GET  /api/events        SSE stream of the EventBus
-  GET  /api/history       recent sessions (for the Activity timeline)
-  POST /api/trigger       wake Aura manually (orb / hotkey / tests)
-  POST /api/input         submit a typed command
-  POST /api/confirm       resolve a proposal  {token}
-  POST /api/cancel        resolve a proposal  {token}
-  POST /api/correct       timeline feedback    {transcript, skill, verdict, note}
-  GET  /api/skills        the skill catalog
-  GET  /api/permissions   honest permission + readiness snapshot
-  POST /api/wake          live wake-mode switch {mode: manual|openwakeword, phrase?}
-  POST /api/wake/train          start a training session {phrase}
-  POST /api/wake/train/capture  record the next utterance as a sample
-  POST /api/wake/train/finish   train + go live (watches for the phrase)
-  POST /api/wake/train/cancel   discard the session
-  GET  /api/wake/train          session status
-  POST /api/setup/install       in-app component install (progress → SSE)
-  POST /api/setup/step          one installer step {step: python|wake|whisper|tools}
-  GET  /api/metrics       lightweight self-observation (RSS, engines, examples)
-  POST /api/permissions/open            {target: microphone|accessibility|automation}
-  POST /api/permissions/test_automation  sends one harmless AppleEvent probe
-  POST /api/permissions/request         {target} — actually ask macOS now
-  POST /api/config                  {updates: {section: {field: value}}} live settings
-  POST /api/system/open             {what: data|logs} — open folders in Finder
+Aura is a native macOS app; this HTTP server is *not* a website. It is the
+contract between the SwiftUI shell (and the test suite) and the Python
+orchestrator, and it is deliberately boring:
 
-The product binds 127.0.0.1 only. `AURA_HOST` can widen it for development
-(the sandboxed preview does this); there is no auth by design, so never
-expose it beyond loopback on a real machine.
+  GET  /                       who am I (JSON banner — no HTML, no assets)
+  GET  /api/health             liveness + capability summary
+  GET  /api/state              current snapshot (state, session, planner)
+  GET  /api/config             live-editable settings + read-only truth
+  GET  /api/permissions        honest permission + readiness snapshot
+  GET  /api/skills             the skill catalog
+  GET  /api/metrics            self-observation (RSS, engines, examples)
+  GET  /api/history            recent sessions (Activity timeline)
+  GET  /api/wake/train         wake-phrase training session status
+  GET  /api/events             SSE stream of the EventBus
+  POST /api/trigger            wake Aura (orb click / ⌥Space / tests)
+  POST /api/input              submit a typed command            {text}
+  POST /api/confirm            approve a proposal                {token}
+  POST /api/cancel             decline a proposal                {token}
+  POST /api/correct            timeline feedback
+  POST /api/config             live settings    {updates: {section: {…}}}
+  POST /api/wake               switch wake mode  {mode, phrase?}
+  POST /api/wake/train         start training    {phrase}
+  POST /api/wake/train/capture record one sample
+  POST /api/wake/train/finish  train + go live
+  POST /api/wake/train/cancel  discard the session
+  POST /api/setup/install      start the component installer (progress → SSE)
+  POST /api/setup/step         one installer step {step}
+  POST /api/permissions/open           {target}
+  POST /api/permissions/request        {target}
+  POST /api/permissions/test_automation
+  POST /api/system/open                {what: data|logs}
+
+Access rules (see aura/localauth.py): every request needs the `X-Aura-Token`
+header, must not carry a browser `Origin`, and must address a loopback Host.
+The socket binds `127.0.0.1` only — widening that is an explicit, logged
+opt-in (`AURA_ALLOW_REMOTE=1`) and never something the app does.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import queue
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
-UI_DIR = Path(__file__).resolve().parent.parent / "ui"
-MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
-        ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml",
-        ".png": "image/png", ".woff2": "font/woff2"}
+from . import localauth
+
+TOKEN_HEADER = "X-Aura-Token"
+
+#: Sent with every response. Aura is not a browser app: no CORS headers are
+#: ever emitted, because no web page should be able to read these answers.
+_SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "DENY",
+}
 
 
 class AuraServer:
-    def __init__(self, orch, cfg) -> None:
+    """Owns the HTTP thread. All product logic stays in the orchestrator."""
+
+    def __init__(self, orch, cfg, token: str | None = None) -> None:
         self.orch = orch
         self.cfg = cfg
+        # None → resolve from env/file (and create one if needed).
+        self.token: str | None = (
+            localauth.resolve_token(cfg.data_dir) if token is None else token
+        )
         self._http: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
     # ---------------------------------------------------------------- #
 
     def start(self) -> None:
-        orch, cfg = self.orch, self.cfg
+        orch, cfg, token = self.orch, self.cfg, self.token
+        host = cfg.server.host or "127.0.0.1"
+        if not localauth.is_loopback_host(host) and not os.environ.get(
+            localauth.ALLOW_REMOTE_ENV
+        ):
+            raise RuntimeError(
+                f"refusing to bind {host!r}: Aura's API is loopback-only. "
+                f"Set {localauth.ALLOW_REMOTE_ENV}=1 if you really mean it."
+            )
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            server_version = "AuraEngine"
 
-            def log_message(self, fmt, *args):  # quiet by default
-                pass
+            def log_message(self, fmt, *args):  # quiet unless debugging
+                if os.environ.get("AURA_HTTP_DEBUG"):
+                    super().log_message(fmt, *args)
 
-            def _json(self, obj, status: int = 200) -> None:
+            # ---------------- plumbing ---------------- #
+
+            def _json(self, obj: Any, status: int = 200,
+                      extra: dict[str, str] | None = None) -> None:
                 body = json.dumps(obj).encode()
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
+                for key, value in _SECURITY_HEADERS.items():
+                    self.send_header(key, value)
+                for key, value in (extra or {}).items():
+                    self.send_header(key, value)
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    self.close_connection = True
+
+            def _deny(self, status: int, message: str, note: str = "") -> None:
+                # Drain an unread body and close: a half-read keep-alive
+                # connection would desync into the next request.
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if 0 < length <= 64_000:
+                        self.rfile.read(length)
+                except (OSError, ValueError):
+                    pass
+                self.close_connection = True
+                if note:
+                    orch.bus.publish("log", line=f"api: refused {self.path} — {note}")
+                self._json({"ok": False, "error": message}, status)
+
+            def _guard(self) -> bool:
+                """The front door. Returns True when the request may proceed."""
+                origin = (self.headers.get("Origin") or "").strip()
+                if origin:
+                    self._deny(403, "Aura's engine only answers the Aura app.",
+                               f"browser origin {origin!r}")
+                    return False
+
+                host = (self.headers.get("Host") or "").strip()
+                if not host:
+                    self._deny(403, "Aura's engine only answers requests for this machine.",
+                               "missing Host header")
+                    return False
+                hostname = host.rsplit(":", 1)[0] if not host.startswith("[") else host.split("]")[0] + "]"
+                if not localauth.is_loopback_host(hostname):
+                    self._deny(403, "Aura's engine only answers requests for this machine.",
+                               f"host {host!r}")
+                    return False
+
+                if not localauth.token_matches(self.headers.get(TOKEN_HEADER), token):
+                    self._deny(401, "Not authorised — the Aura app holds the key for this engine.",
+                               "bad or missing token")
+                    return False
+                return True
 
             def _read_body(self) -> dict:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -85,41 +163,50 @@ class AuraServer:
                 except json.JSONDecodeError:
                     return {}
 
-            def _file(self, rel: str) -> None:
-                path = (UI_DIR / rel).resolve()
-                # is_relative_to, not startswith — a sibling directory
-                # (ui-evil/) must never pass a prefix check.
-                if not path.is_relative_to(UI_DIR) or not path.is_file():
-                    self._json({"error": "not found"}, 404)
-                    return
-                body = path.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", MIME.get(path.suffix, "application/octet-stream"))
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-cache")
-                self.end_headers()
-                self.wfile.write(body)
+            def _run(self, coro, timeout: float = 30.0, label: str = "request") -> None:
+                """Fire an orchestrator coroutine from this server thread."""
+
+                async def _wrapped():
+                    return await asyncio.wait_for(coro, timeout=timeout)
+
+                future = asyncio.run_coroutine_threadsafe(_wrapped(), orch.loop)
+
+                def _done(fut) -> None:
+                    try:
+                        fut.result()
+                    except Exception as exc:  # never lose a background failure
+                        orch.bus.publish(
+                            "log", line=f"{label} failed: {exc.__class__.__name__}: {exc}")
+
+                future.add_done_callback(_done)
 
             # ---------------- GET ---------------- #
 
             def do_GET(self) -> None:
+                if not self._guard():
+                    return
                 path = urlsplit(self.path).path
-                if path in ("/", "/index.html"):
-                    self._file("index.html")
-                elif path == "/app.css":
-                    self._file("app.css")
-                elif path == "/app.js":
-                    self._file("app.js")
-                elif path == "/icon.svg":
-                    self._file("icon.svg")
+                if path == "/":
+                    # Deliberately not a UI: Aura is the menu-bar app.
+                    self._json({
+                        "app": "Aura",
+                        "surface": "engine",
+                        "version": _version(),
+                        "message": ("Aura's engine is running. Use the Aura menu-bar app — "
+                                    "there is no browser interface by design."),
+                        "endpoints": ["/api/health", "/api/state", "/api/events"],
+                    })
                 elif path == "/api/health":
                     self._json({"ok": True, "state": orch.state,
                                 "bridge": orch.bridge.platform,
                                 "mic_ready": bool(getattr(orch, "_has_audio", False)),
                                 "planner_online": getattr(orch, "planner_online", None),
+                                "auth": bool(token),
                                 "version": _version()})
                 elif path == "/api/state":
-                    self._json(_state_snapshot(orch, cfg))
+                    self._json(_state_snapshot(orch, cfg, auth=bool(token)))
+                elif path == "/api/config":
+                    self._json(_config_snapshot(cfg))
                 elif path == "/api/skills":
                     self._json({"skills": orch.registry.specs()})
                 elif path == "/api/permissions":
@@ -133,17 +220,19 @@ class AuraServer:
                 elif path == "/api/events":
                     self._sse()
                 else:
-                    self._json({"error": "not found"}, 404)
+                    self._json({"ok": False, "error": "not found"}, 404)
 
             def _sse(self) -> None:
                 self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
                 self.close_connection = True
                 self.end_headers()
                 sid, q = orch.bus.subscribe_queue()
                 try:
+                    self.wfile.write(b"retry: 2000\n\n")
                     for ev in orch.bus.recent(20):
                         self._write_sse(ev.seq, ev.type, ev.as_dict()["data"], ev.ts)
                     self.wfile.flush()
@@ -166,21 +255,26 @@ class AuraServer:
             # ---------------- POST ---------------- #
 
             def do_POST(self) -> None:
+                if not self._guard():
+                    return
                 path = urlsplit(self.path).path
                 body = self._read_body()
-                loop = orch.loop
-
-                async def _run(coro):
-                    return await asyncio.wait_for(coro, timeout=30)
+                loop = orch.loop      # the closure's orchestrator, not self
 
                 if path == "/api/trigger":
-                    asyncio.run_coroutine_threadsafe(orch.trigger_manual(), loop)
+                    self._run(orch.trigger_manual(), label="wake")
                     self._json({"ok": True})
                 elif path == "/api/input":
-                    text = str(body.get("text", ""))[:500]
-                    if text:
-                        asyncio.run_coroutine_threadsafe(orch.submit_text(text), loop)
-                    self._json({"ok": True, "accepted": bool(text)})
+                    text = str(body.get("text", ""))[:500].strip()
+                    if not text:
+                        self._json({"ok": True, "accepted": False,
+                                    "message": "Type a command first."})
+                    elif orch.state != "armed":
+                        self._json({"ok": True, "accepted": False,
+                                    "message": "Aura is still working on the last request."})
+                    else:
+                        self._run(orch.submit_text(text), label="input")
+                        self._json({"ok": True, "accepted": True})
                 elif path == "/api/confirm":
                     ok = orch.resolve_confirmation(str(body.get("token", "")), "confirm")
                     self._json({"ok": ok})
@@ -231,7 +325,7 @@ class AuraServer:
                     if what == "data":
                         target = orch.cfg.data_dir
                     elif what == "logs":
-                        target = str(Path.home() / "Library" / "Logs" / "Aura.log")
+                        target = str(_log_file())
                     else:
                         self._json({"ok": False, "message": f"unknown target {what!r}"}, 400)
                         return
@@ -239,7 +333,6 @@ class AuraServer:
                                else (False, "Opening folders in Finder is a macOS thing"))
                     self._json({"ok": ok, "message": msg})
                 elif path == "/api/setup/step":
-
                     step = str(body.get("step", ""))
                     future = asyncio.run_coroutine_threadsafe(
                         orch.run_setup_step(step), loop)
@@ -250,6 +343,14 @@ class AuraServer:
                                     "key": result.key})
                     except Exception:
                         self._json({"ok": False, "message": "that step timed out"}, 503)
+                elif path == "/api/setup/install":
+                    # Long install: answer immediately and stream progress over
+                    # SSE (setup_progress events). A 30 s HTTP stall was a lie —
+                    # the install kept running while the app showed an error.
+                    # 200 with ok:false — "understood, but I won't" is the
+                    # convention everywhere else in this API, and the app shows
+                    # the message verbatim.
+                    self._json(orch.start_setup())
                 elif path == "/api/wake":
                     mode = str(body.get("mode", ""))
                     phrase = body.get("phrase")
@@ -272,16 +373,17 @@ class AuraServer:
                         self._json(future.result(timeout=120))
                     except Exception:
                         self._json({"ok": False, "message": "training timed out"}, 503)
-                elif path == "/api/setup/install":
-                    future = asyncio.run_coroutine_threadsafe(orch.run_setup(), loop)
-                    try:
-                        self._json(future.result(timeout=30))
-                    except Exception:
-                        self._json({"ok": False, "message": "install timed out"}, 503)
                 else:
-                    self._json({"error": "not found"}, 404)
+                    self._json({"ok": False, "error": "not found"}, 404)
 
-        self._http = ThreadingHTTPServer((cfg.server.host, cfg.server.port), Handler)
+            # Everything else is a method Aura doesn't speak. Answer with JSON
+            # rather than an HTML error page (there is no HTML here).
+            def _method_not_allowed(self) -> None:
+                self._json({"ok": False, "error": f"{self.command} is not supported"}, 405)
+
+            do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = _method_not_allowed
+
+        self._http = ThreadingHTTPServer((host, cfg.server.port), Handler)
         self._http.daemon_threads = True
         self._thread = threading.Thread(target=self._http.serve_forever,
                                         name="aura-http", daemon=True)
@@ -291,6 +393,12 @@ class AuraServer:
         if self._http:
             self._http.shutdown()
             self._http.server_close()
+            self._http = None
+
+
+# --------------------------------------------------------------------------- #
+# Snapshots — the shapes the native app renders                               #
+# --------------------------------------------------------------------------- #
 
 
 def _version() -> str:
@@ -298,14 +406,53 @@ def _version() -> str:
     return __version__
 
 
+def _log_file():
+    from pathlib import Path
+
+    return Path.home() / "Library" / "Logs" / "Aura.log"
+
+
+def _config_snapshot(cfg) -> dict:
+    """Live-editable fields (what the app may change) plus read-only truth."""
+    from . import config as config_mod
+
+    live: dict[str, dict[str, Any]] = {}
+    for section, allowed in sorted(config_mod.LIVE_FIELDS.items()):
+        current = getattr(cfg, section, None)
+        if current is None:
+            continue
+        live[section] = {name: getattr(current, name)
+                         for name in sorted(allowed)
+                         if hasattr(current, name)}
+    return {
+        "version": _version(),
+        "profile": cfg.profile,
+        "resolved_profile": config_mod.resolved_profile(cfg),
+        "data_dir": cfg.data_dir,
+        "host": cfg.server.host,
+        "port": cfg.server.port,
+        "live": live,
+        "planner": {"engine": cfg.planner.engine, "model": cfg.planner.model,
+                    "base_url": cfg.planner.base_url},
+        "stt": {"engine": cfg.stt.engine, "language": cfg.stt.language},
+        "wake_models": list(cfg.wake.models),
+        "files": {
+            "user_config": str(config_mod.user_config_path()),
+            "runtime": str(config_mod.runtime_overrides_path(cfg.data_dir)),
+        },
+    }
+
+
 def _permissions_snapshot(orch, cfg) -> dict:
     """The Setup wizard's data: honest, per-permission state, checked live."""
+    from . import config as config_mod
     from . import permissions as perms
 
     wake_ready, wake_detail = perms.check_wake_models(cfg)
     return {
         "platform": "mac" if perms.is_mac() else "other",
         "profile": cfg.profile,
+        "resolved_profile": config_mod.resolved_profile(cfg),
         "bridge": orch.bridge.platform,
         "microphone": perms.check_microphone(orch),
         "accessibility": perms.check_accessibility(),
@@ -317,7 +464,7 @@ def _permissions_snapshot(orch, cfg) -> dict:
     }
 
 
-def _state_snapshot(orch, cfg) -> dict:
+def _state_snapshot(orch, cfg, auth: bool = True) -> dict:
     session = orch.session
     planner_status = dict(getattr(orch, "planner_status", {}) or {})
     return {
@@ -332,6 +479,7 @@ def _state_snapshot(orch, cfg) -> dict:
         "data_dir": cfg.data_dir,
         "mic_ready": bool(getattr(orch, "_has_audio", False)),
         "planner_online": getattr(orch, "planner_online", None),
+        "auth": auth,
         "laya": {
             "backend": type(orch.laya).__name__,
             "confidence": cfg.laya.confidence_threshold,

@@ -68,26 +68,42 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+# The engine demands a shared secret on every request (see aura/localauth.py).
+# The `server` fixture publishes the live token here; raw urllib callers in the
+# test suite use `auth_headers()` so they speak the same protocol as the app.
+AUTH_TOKEN: str | None = None
+
+
+def auth_headers(extra: dict | None = None) -> dict:
+    headers = dict(extra or {})
+    if AUTH_TOKEN:
+        headers["X-Aura-Token"] = AUTH_TOKEN
+    return headers
+
+
 def get(url: str) -> tuple[int, bytes]:
-    with _urllib.urlopen(url, timeout=5) as r:
+    req = _urllib.Request(url, headers=auth_headers())
+    with _urllib.urlopen(req, timeout=5) as r:
         return r.status, r.read()
 
 
 def post(url: str, body: dict) -> tuple[int, dict]:
     req = _urllib.Request(
         url, data=_json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"}, method="POST")
+        headers=auth_headers({"Content-Type": "application/json"}), method="POST")
     with _urllib.urlopen(req, timeout=5) as r:
         return r.status, _json.loads(r.read())
 
 
 @pytest.fixture()
 def server(stack: DemoStack):
+    global AUTH_TOKEN
     from aura.server import AuraServer
 
     orch = stack.build_orchestrator()
     stack.cfg.server.port = free_port()
     srv = AuraServer(orch, stack.cfg)
+    AUTH_TOKEN = srv.token
 
     async def boot():
         await orch.start()
@@ -112,6 +128,7 @@ def server(stack: DemoStack):
     asyncio.run_coroutine_threadsafe(down(), loop).result(5)
     loop.call_soon_threadsafe(loop.stop)
     _threading.Event().wait(0.1)
+    AUTH_TOKEN = None
 
 
 async def collect(bus: EventBus, sid: int, coro, timeout: float = 5.0) -> list[str]:

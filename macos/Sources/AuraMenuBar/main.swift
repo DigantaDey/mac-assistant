@@ -1,14 +1,13 @@
 import AppKit
 
-// Aura — menu-bar shell.
+// Aura — a native menu-bar app.
 //
-// Spawns and babysits the Python orchestrator, presents the product UI in a
-// WKWebView popover, owns the global ⌥Space hotkey, and optionally registers
-// itself as a login item. Deliberately thin: all product logic lives in the
-// Python engine; this layer only hosts, launches, and reflects.
+// No storyboard, no nib, no web view: an accessory-policy NSApplication (so
+// there is no Dock icon) with one delegate that builds the menu-bar item, the
+// SwiftUI popover, and the windows on top of the local engine.
 
 let application = NSApplication.shared
 let delegate = AppDelegate()
 application.delegate = delegate
-application.setActivationPolicy(.accessory)   // menu-bar only — no Dock icon
+application.setActivationPolicy(.accessory)
 application.run()

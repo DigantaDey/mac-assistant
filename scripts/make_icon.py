@@ -6,9 +6,9 @@ matches the in-app orb: a dark rounded square with a glowing indigo-blue
 orb, three conic rings and a fine waveform tick ring.
 
 Usage (on a dev machine):
-    python scripts/make_icon.py            # writes ui/icon.png + ui/icon.icns
+    python scripts/make_icon.py            # writes assets/icon.png + assets/icon.icns
 Requires Pillow:  pip install pillow
-The repo ships the generated ui/icon.png + ui/icon.icns, so a Mac install
+The repo ships the generated assets/icon.png + assets/icon.icns, so a Mac install
 never needs this script — it's for regenerating the art.
 """
 
@@ -154,11 +154,11 @@ def pack_icns(png: Path, icns: Path) -> None:
 
 
 def main() -> None:
-    ui = ROOT / "ui"
-    ui.mkdir(exist_ok=True)
-    build_master(ui / "icon.png")
-    pack_icns(ui / "icon.png", ui / "icon.icns")
-    print(f"wrote {ui / 'icon.png'} and {ui / 'icon.icns'}")
+    assets = ROOT / "assets"
+    assets.mkdir(exist_ok=True)
+    build_master(assets / "icon.png")
+    pack_icns(assets / "icon.png", assets / "icon.icns")
+    print(f"wrote {assets / 'icon.png'} and {assets / 'icon.icns'}")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,11 @@
 """Aura CLI.
 
-    python -m aura serve     start the orchestrator + local UI
+    python -m aura serve     start the engine (the app talks to it over loopback)
     python -m aura doctor    capability matrix (what will run on this machine)
+
+There is no browser UI: the product is the native macOS app. `serve` exists so
+the engine can run head-less on any machine — for the test suite, for CI, and
+for developers poking at the API with a token.
 """
 
 from __future__ import annotations
@@ -67,6 +71,8 @@ def cmd_doctor(cfg) -> int:
                   (" — is Ollama running?" if not live else ""))
         else:
             check("planner server", True, "mock (basic mode)")
+        check("engine token", True, str(__import__("aura.localauth", fromlist=["localauth"])
+              .token_path(cfg.data_dir)))
         check("Aura.app installed",
               shutil.which("open") is not None and
               (__import__("pathlib").Path("/Applications/Aura.app").is_dir()),
@@ -79,7 +85,7 @@ def cmd_doctor(cfg) -> int:
         mark = "✔" if ok else "✘"
         print(f"  {mark}  {name:20s} {note}")
     print("=" * 52)
-    print("Run `python -m aura serve` to start (or open Aura from /Applications).")
+    print("Run `python -m aura serve` to start the engine (or open Aura from /Applications).")
     return 0
 
 
@@ -92,7 +98,7 @@ def cmd_serve(cfg) -> int:
     from .orchestrator import Orchestrator
     from .planner import build_planner
     from .safety import SafetyGate
-    from .server import AuraServer
+    from .server import TOKEN_HEADER, AuraServer
     from .skills import build_default_registry
     from .stt import build_stt
     from .tts import build_tts
@@ -125,11 +131,23 @@ def cmd_serve(cfg) -> int:
             print(f"\nPort {cfg.server.port} is already in use — is Aura already running?")
             print("(Change the port: AURA_PORT=<port> python -m aura serve)\n")
             raise SystemExit(1) from exc
-        url = f"http://{'127.0.0.1' if cfg.server.host == '0.0.0.0' else cfg.server.host}:{cfg.server.port}"
+        except RuntimeError as exc:
+            print(f"\n{exc}\n")
+            raise SystemExit(1) from exc
+        from . import localauth
+
+        host = "127.0.0.1" if cfg.server.host == "0.0.0.0" else cfg.server.host
         print(f"Aura v{__import__('aura', fromlist=['__version__']).__version__} "
               f"— profile={_profile_for(cfg)} bridge={bridge.platform}")
-        print(f"UI:      {url}")
+        print(f"Engine:  http://{host}:{cfg.server.port}  (JSON API — the app is the UI)")
         print(f"Data:    {data_dir}")
+        if server.token:
+            print(f"Token:   {localauth.token_path(data_dir)}  (send it as {TOKEN_HEADER} = X-Aura-Token)")
+        else:
+            print("Token:   DISABLED — anyone on this Mac can drive Aura (AURA_NO_AUTH=1).")
+        if not localauth.is_loopback_host(cfg.server.host):
+            print("WARNING: the engine is bound beyond loopback — anyone who can reach "
+                  "this port can drive Aura.")
         print("Press Ctrl-C to quit.")
         try:
             await asyncio.Event().wait()
@@ -142,7 +160,6 @@ def cmd_serve(cfg) -> int:
     except KeyboardInterrupt:
         print("\nBye.")
     return 0
-
 
 def _build_bridge(cfg):
     from .skills import DryRunBridge, MacBridge

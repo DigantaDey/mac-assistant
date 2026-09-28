@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 
-from conftest import DemoStack, collect, get, post
+from conftest import DemoStack, auth_headers, collect, get, post
 
 # --------------------------------------------------------------------------- #
 # HybridPlanner: the brain with a spine                                        #
@@ -197,7 +197,7 @@ class TestNewEndpoints:
         req = urllib.request.Request(
             base + "/api/permissions/request",
             data=json.dumps({"target": "bogus"}).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
+            headers=auth_headers({"Content-Type": "application/json"}), method="POST")
         try:
             urllib.request.urlopen(req, timeout=5)
             raise AssertionError("bogus target should be refused")
@@ -224,7 +224,7 @@ class TestNewEndpoints:
         req = urllib.request.Request(
             base + "/api/system/open",
             data=json.dumps({"what": "bogus"}).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
+            headers=auth_headers({"Content-Type": "application/json"}), method="POST")
         try:
             urllib.request.urlopen(req, timeout=5)
             raise AssertionError("bogus target should be refused")
@@ -251,14 +251,15 @@ def test_confirm_over_http_releases_the_session(server):
     def post_json(path, body):
         req = urllib.request.Request(
             base + path, data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
+            headers=auth_headers({"Content-Type": "application/json"}), method="POST")
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read())
 
     post_json("/api/input", {"text": "empty the trash"})
     token = None
     for _ in range(40):
-        with urllib.request.urlopen(base + "/api/state", timeout=5) as r:
+        state_req = urllib.request.Request(base + "/api/state", headers=auth_headers())
+        with urllib.request.urlopen(state_req, timeout=5) as r:
             st = json.loads(r.read())
         if st["state"] == "proposing" and st["session"]:
             token = st["session"]["token"]
@@ -269,7 +270,8 @@ def test_confirm_over_http_releases_the_session(server):
     assert post_json("/api/confirm", {"token": token})["ok"] is True
 
     for _ in range(60):
-        with urllib.request.urlopen(base + "/api/state", timeout=5) as r:
+        state_req = urllib.request.Request(base + "/api/state", headers=auth_headers())
+        with urllib.request.urlopen(state_req, timeout=5) as r:
             st = json.loads(r.read())
         if st["state"] == "armed":
             break
