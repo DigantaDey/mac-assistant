@@ -19,25 +19,41 @@ mainstream gap.
       settings — SSE-live
 - [x] 48 tests, all green; dry-run bridge runs the product on any OS
 
-## v0.2 — Real Mac bring-up
+## v0.2 — Real Mac bring-up ✅
 - [x] Permissions onboarding wizard (live TCC detection, System Settings
       deep links, AppleScript probe, readiness checks)
 - [x] Menu-bar shell (Swift/AppKit: popover + WKWebView, global ⌥Space,
       process babysitter, logs, login item, `make_app.sh` bundler)
-- [ ] Field-test on Apple Silicon: mic input, whisper.cpp via Homebrew,
-      Ollama qwen3:4b planner, real executors end to end
-- [ ] Always-listening mode with phrase gate; refine thresholds from logs
-- [ ] Idle model unload; energy check (<1% CPU idle, <250 MB idle RSS)
-- [ ] Settings hot-reload (watch config.toml; no restart)
+- [x] Always-listening wake mode with phrase gate (second factor), live
+      manual↔always-on switch from the UI, persisted to runtime.toml
+- [x] Lightweight enforcement: lazy STT loading + idle model unload,
+      config hot-reload (safe fields live, restart-fields refused),
+      `/api/metrics` self-observation (RSS, engines, example counts)
+- [x] Install-time fetch: install_mac.sh downloads every model up front
+      (whisper ggml, wake-word models, qwen3:4b) — nothing later at runtime
+- [ ] Field-test on Apple Silicon (the only item that needs your Mac:
+      mic input, Homebrew whisper.cpp, Ollama planner, real executors)
 
-## v0.3 — Laya, for real
-- [ ] Generate skill-routing + safety datasets (synthetic + curated); wire the
-      `laya` pip backend into daily use; publish accuracy/latency benchmarks
-- [ ] Ship `scripts/nightly_laya.py` v1: export → on-device fine-tune →
-      adapter hot-swap; measure before/after on a held-out set
-- [ ] Laya element-picking for the Accessibility tree (coarse-to-fine chunking
-      after the `laya-browser` v3 recipe) — clicks *any* app's UI by label
-- [ ] Confidence UX: "I'm only 54% sure — did you mean X?" instead of raw asks
+## v0.3 — Laya element-picking ✅ (core shipped)
+- [x] `aura/ax.py` — the Accessibility substrate: real AXUIElement reader
+      (pyobjc) + deterministic MockAXTree; press / focus / insert behind one
+      interface
+- [x] `aura/picker.py` — coarse-to-fine element picking (≤16-option chunks,
+      two winning chunks, fine scoring): Laya-scored when the backend is
+      real, deterministic heuristic otherwise; below-threshold → honest
+      "did you mean …" instead of a wrong click
+- [x] Skills: `ax.click`, `ax.type_into`, `ax.read_screen` — Aura can now
+      act inside any app that exposes accessibility labels, by name
+- [x] Safety integration: destructive labels (delete/purchase/send…) flip
+      ax.click into the confirmation flow automatically
+- [ ] Generate skill-routing + safety datasets; wire the `laya` pip backend
+      into daily use; publish accuracy/latency benchmarks
+- [ ] Ship `scripts/nightly_laya.py` v1 end-to-end: export → on-device
+      fine-tune → adapter hot-swap; measure before/after on a held-out set
+- [ ] Confidence UX upgrade: "I'm only 54% sure — did you mean X?" as an
+      interactive clarification (currently a spoken suggestion)
+- [ ] Laya element-picking with the real Laya fine-tune (v10s-style
+      checkpoint over AX labels; coarse-to-fine already wired)
 
 ## v0.4 — Depth
 - [ ] Browser extension (MV3) + CDP: read/act on DOM, forms, multi-tab flows

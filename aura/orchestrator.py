@@ -15,6 +15,9 @@ Design rules:
 * The Laya gate + SafetyGate decide *before* anything executes. Confirmation
   is a real state, not a synchronous prompt: the turn ends, the proposal
   waits (with a timeout), and any client can resolve it.
+* Lightweight is enforced, not promised: a maintenance loop unloads warm
+  models after idle time and hot-applies safe config changes without a
+  restart.
 """
 
 from __future__ import annotations
@@ -25,11 +28,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-try:
-    import numpy as np
-except Exception:  # pragma: no cover
-    np = None  # type: ignore[assignment]
-
+from . import config as config_mod
 from .audio import AudioFrame, MicStream, SilentMic
 from .events import EventBus
 from .laya import ExampleBuffer
@@ -40,7 +39,7 @@ from .skills import MacBridge, SkillRegistry
 from .stt import STTEngine
 from .tts import TTS
 from .vad import EnergyVAD
-from .wakeword import WakeEngine
+from .wakeword import WakeEngine, phrase_gate, strip_phrase
 
 State = Literal["armed", "capturing", "transcribing", "planning",
                 "proposing", "executing", "responding", "disabled"]
@@ -93,8 +92,11 @@ class Orchestrator:
         self._mic: MicStream | SilentMic | None = None
         self._has_audio = False
         self._audio_task: asyncio.Task | None = None
+        self._maintenance_task: asyncio.Task | None = None
         self._queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=200)
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._last_activity = time.monotonic()
+        self._file_mtimes: dict[str, float] = {}
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop:
@@ -109,18 +111,20 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
 
     async def start(self) -> None:
-        from .wakeword import build_wake_engine
-
         self._loop = asyncio.get_running_loop()
-        self._wake = build_wake_engine(self.cfg)
+        self._wake = self._build_wake()
         try:
             self._mic = MicStream(self._loop, self._on_audio_frame)
             self._mic.start()
             mic_kind = "microphone"
+            self._has_audio = True
         except Exception as exc:
             self._mic = SilentMic(self._loop, self._on_audio_frame)
             mic_kind = f"silent ({exc})"
         self._audio_task = asyncio.create_task(self._audio_loop(), name="aura-audio")
+        self._maintenance_task = asyncio.create_task(self._maintenance_loop(),
+                                                     name="aura-maintenance")
+        self._remember_mtimes()
         self.state = "armed"
         self.bus.publish("state", state=self.state, mic=mic_kind,
                          wake=getattr(self.cfg.wake, "mode", "manual"))
@@ -129,17 +133,123 @@ class Orchestrator:
                                      f"laya={type(self.laya).__name__}")
 
     async def stop(self) -> None:
-        if self._audio_task:
-            self._audio_task.cancel()
-            try:
-                await self._audio_task
-            except (asyncio.CancelledError, RuntimeError):
-                pass
-            self._audio_task = None
+        for task in (self._audio_task, self._maintenance_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, RuntimeError):
+                    pass
+        self._audio_task = None
+        self._maintenance_task = None
         if self._mic:
             self._mic.stop()
         self.state = "disabled"
         self.bus.publish("state", state=self.state)
+
+    # ------------------------------------------------------------------ #
+    # Maintenance: hot-reload + idle unload                               #
+    # ------------------------------------------------------------------ #
+
+    def _remember_mtimes(self) -> None:
+        self._file_mtimes = {}
+        for path in config_mod.watch_paths(self.cfg.data_dir):
+            try:
+                self._file_mtimes[str(path)] = path.stat().st_mtime
+            except OSError:
+                continue
+
+    async def _maintenance_loop(self) -> None:
+        """Every 10 s: apply live config changes, unload idle models."""
+        while True:
+            await asyncio.sleep(10.0)
+            self._poll_config_changes()
+            self._unload_if_idle()
+
+    def _poll_config_changes(self) -> None:
+        current: dict[str, float] = {}
+        for path in config_mod.watch_paths(self.cfg.data_dir):
+            try:
+                current[str(path)] = path.stat().st_mtime
+            except OSError:
+                continue
+        if current == self._file_mtimes:
+            return
+        self._file_mtimes = current
+        try:
+            fresh = config_mod.load_config()
+        except Exception as exc:  # a broken edit must not crash the loop
+            self.bus.publish("log", line=f"config reload failed: {exc}")
+            return
+        self.apply_live_config(fresh)
+
+    def apply_live_config(self, fresh) -> None:  # noqa: ANN001 - Config
+        """Hot-apply only the fields in config.LIVE_FIELDS; report the rest."""
+        changed: list[str] = []
+        for section_name, allowed in config_mod.LIVE_FIELDS.items():
+            old_section = getattr(self.cfg, section_name)
+            new_section = getattr(fresh, section_name)
+            for field_name in allowed:
+                new_value = getattr(new_section, field_name)
+                if getattr(old_section, field_name) != new_value:
+                    setattr(old_section, field_name, new_value)
+                    changed.append(f"{section_name}.{field_name}")
+        if not changed:
+            return
+        if "wake.mode" in changed or "wake.models" in changed or "wake.threshold" in changed:
+            self._wake = self._build_wake()
+        self.bus.publish("config", changed=changed)
+        self.bus.publish("log", line="hot-reloaded: " + ", ".join(changed))
+
+    def _unload_if_idle(self) -> None:
+        idle_for = time.monotonic() - self._last_activity
+        if idle_for < self.cfg.session.idle_unload_seconds:
+            return
+        unload = getattr(self.stt, "unload", None)
+        if unload is not None:
+            try:
+                if unload():
+                    self.bus.publish("log",
+                                     line=f"STT model unloaded after {int(idle_for)}s idle")
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ #
+    # Wake management (live, persisted)                                   #
+    # ------------------------------------------------------------------ #
+
+    def _build_wake(self) -> WakeEngine:
+        from .wakeword import build_wake_engine
+
+        return build_wake_engine(self.cfg)
+
+    async def set_wake_mode(self, mode: str, phrase: str | None = None) -> dict:
+        """Switch manual ↔ always-listening at runtime; persist the choice."""
+        if mode not in ("manual", "openwakeword"):
+            return {"ok": False, "message": f"unknown wake mode {mode!r}"}
+        if self.cfg.profile == "demo":
+            return {"ok": False,
+                    "message": "Demo profile pins manual wake — set profile = \"mac\" "
+                               "in config.toml to enable always-listening."}
+        self.cfg.wake.mode = mode
+        if phrase is not None:
+            self.cfg.wake.phrase = phrase.strip()[:60]
+        try:
+            config_mod.write_overrides(
+                self.cfg.data_dir,
+                {"wake": {"mode": mode, "phrase": self.cfg.wake.phrase}},
+            )
+        except OSError as exc:
+            self.bus.publish("log", line=f"could not persist wake mode: {exc}")
+        self._wake = self._build_wake()
+        self._remember_mtimes()
+        self.bus.publish("config", changed=["wake.mode"], wake_mode=mode,
+                         phrase=self.cfg.wake.phrase)
+        note = (f"Wake mode: {mode}" +
+                (f" (phrase gate: “{self.cfg.wake.phrase}”)" if self.cfg.wake.phrase else ""))
+        self.bus.publish("log", line=note)
+        return {"ok": True, "mode": mode, "phrase": self.cfg.wake.phrase,
+                "engine": type(self._wake).__name__}
 
     # ------------------------------------------------------------------ #
     # Audio path (real mic only)                                          #
@@ -204,13 +314,24 @@ class Orchestrator:
             await self._end_session("I didn't catch anything — say that again?")
             return
         loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(None, self.stt.transcribe, [type("F", (), {"pcm": pcm})()]) \
-            if False else await loop.run_in_executor(None, self.stt.transcribe,
-                                                     [_RawFrame(pcm)])
+        text = await loop.run_in_executor(None, self.stt.transcribe, [_RawFrame(pcm)])
         text = (text or "").strip()
         if not text:
             await self._end_session("I didn't catch that — say it again?")
             return
+
+        # Phrase gate: in always-on mode the utterance must start with the
+        # user's wake phrase — the second factor against false wakes.
+        if (self.cfg.wake.mode == "openwakeword" and self.cfg.wake.phrase
+                and not phrase_gate(text, self.cfg.wake.phrase)):
+            self.bus.publish("log", line=f"phrase gate rejected: {text[:60]!r}")
+            await self._end_session()
+            return
+        text = strip_phrase(text, self.cfg.wake.phrase) if self.cfg.wake.mode == "openwakeword" else text
+        if not text:
+            await self._end_session("Listening.")
+            return
+
         self.bus.publish("transcript", text=text)
         await self._session_text(text, spoken=True)
 
@@ -221,6 +342,7 @@ class Orchestrator:
     async def _session_text(self, transcript: str, spoken: bool = False) -> None:
         session = Session(id=uuid.uuid4().hex[:12], transcript=transcript)
         self.session = session
+        self._last_activity = time.monotonic()
         t0 = time.monotonic()
 
         # 1 — plan
@@ -314,6 +436,11 @@ class Orchestrator:
         reply = plan.reply
         if reply_bits:
             reply = (reply + " " if reply else "") + " ".join(reply_bits)
+        if not reply and session.pending:
+            # No canned reply — speak the grounded result of the first action.
+            first_ok = next((p["result"].message for p in session.pending
+                             if "result" in p and p["result"].ok), None)
+            reply = first_ok or (reply_bits[0] if reply_bits else "")
         for p in session.pending:
             if "result" in p and p["verdict"].decision == "run":
                 self._record_example(transcript, p["action"], "auto")
@@ -331,6 +458,7 @@ class Orchestrator:
             await asyncio.get_running_loop().run_in_executor(None, self.tts.speak, reply)
         except Exception:
             pass
+        self._last_activity = time.monotonic()
         await self._end_session()
 
     async def _end_session(self, message: str | None = None) -> None:
@@ -342,6 +470,7 @@ class Orchestrator:
                 pass
         self.session = None
         self.state = "armed"
+        self._last_activity = time.monotonic()
         self.bus.publish("state", state=self.state)
 
     # ------------------------------------------------------------------ #
@@ -363,6 +492,23 @@ class Orchestrator:
             self.memory.set_preference(key, value, source="user")
         self.bus.publish("feedback", skill=skill, verdict=verdict)
 
+    def metrics(self) -> dict[str, Any]:
+        """Lightweight self-observation — the honest kind of dashboard."""
+        import resource
+        import sys as _sys
+
+        # ru_maxrss: bytes on macOS, KB on Linux → normalize to MB.
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_mb = rss_mb / (1024 * 1024) if _sys.platform == "darwin" else rss_mb / 1024
+        return {
+            "rss_mb": round(rss_mb, 1),
+            "state": self.state,
+            "wake_mode": self.cfg.wake.mode,
+            "wake_engine": type(self._wake).__name__ if self._wake else None,
+            "stt_engine": type(self.stt).__name__,
+            "examples": self.examples.stats(),
+        }
+
     # ------------------------------------------------------------------ #
 
     def _record_example(self, transcript: str, action: Action | "_ShadowAction", outcome: str) -> None:
@@ -382,7 +528,7 @@ class Orchestrator:
 
 
 # --------------------------------------------------------------------------- #
-# Small internal              #
+# Small internal shims (kept boring on purpose)                                #
 # --------------------------------------------------------------------------- #
 
 

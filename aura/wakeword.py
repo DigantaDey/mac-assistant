@@ -115,3 +115,47 @@ def build_wake_engine(cfg) -> WakeEngine:  # noqa: ANN001 - Config is dataclass
         except RuntimeError:
             return ManualTrigger()
     return ManualTrigger()
+
+
+# --------------------------------------------------------------------------- #
+# The phrase gate — second factor for always-listening mode                    #
+# --------------------------------------------------------------------------- #
+
+
+def _normalize(text: str) -> str:
+    return " ".join("".join(ch if ch.isalnum() or ch == " " else " "
+                            for ch in text.lower()).split())
+
+
+def phrase_gate(transcript: str, phrase: str) -> bool:
+    """In always-on mode the transcript must *start with* the user's phrase.
+
+    Deliberately lenient about punctuation and casing ("Hey, Aura!" == "hey
+    aura") and strict about word boundaries — "hey auraa" is not the wake
+    phrase. This is the second factor that kills the false accepts a purely
+    acoustic wake model can produce.
+    """
+    if not phrase.strip():
+        return True
+    said = _normalize(transcript).split()
+    wanted = _normalize(phrase).split()
+    return said[: len(wanted)] == wanted
+
+
+def strip_phrase(transcript: str, phrase: str) -> str:
+    """Remove a leading wake phrase so the planner sees only the command."""
+    if not phrase.strip():
+        return transcript.strip()
+    norm_phrase = _normalize(phrase)
+    norm_text = _normalize(transcript)
+    if norm_text.startswith(norm_phrase):
+        # Cut by position in the normalized string, then carry the remainder
+        # from the original so capitalization/punctuation survive.
+        remaining = norm_text[len(norm_phrase):]
+        words = remaining.split()
+        if not words:
+            return ""
+        original_words = transcript.split()
+        # Heuristic re-join: take the last N words of the original transcript.
+        return " ".join(original_words[-len(words):]) if words else ""
+    return transcript.strip()

@@ -287,6 +287,18 @@ class MockPlanner(Planner):
         elif "sleep" in t:
             actions.append(Action("system.sleep", {}, "confirm", "puts the Mac to sleep"))
             reply = "Putting your Mac to sleep."
+        elif m := re.search(r"click (?:on )?(?:the )?(.+)", t):
+            target = m.group(1).strip(" .!?")
+            actions.append(Action("ax.click", {"target": target}, "safe", "click by label"))
+            reply = ""  # the grounded skill message ("Pressed … 95% sure") is the reply
+        elif m := re.search(r"type (.+?) into (?:the )?(.+)", t):
+            actions.append(Action("ax.type_into",
+                                  {"text": m.group(1).strip(), "target": m.group(2).strip(" .!?")},
+                                  "safe", "type into a named field"))
+            reply = ""
+        elif "on my screen" in t or "read my screen" in t or "what do you see" in t:
+            actions.append(Action("ax.read_screen", {}, "safe", "reading visible controls"))
+            reply = ""
         elif m := re.search(r"search(?: the web)?(?: for)? (.+)", t):
             query = m.group(1).strip("?.!")
             actions.append(Action("browser.search", {"query": query}, "safe", "web search"))

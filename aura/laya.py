@@ -91,9 +91,13 @@ _DESTRUCTIVE_SKILLS = {
     "system.start_recording": 0.6,
     "clipboard.set_text": 0.25,
     "system.toggle_dnd": 0.2,
+    "ax.click": 0.12,          # clicks are usually safe; the label decides
+    "ax.type_into": 0.08,
 }
 _DESTRUCTIVE_ARGS = re.compile(
-    r"(rm\s+-rf|/etc/|/system|diskutil|sudo|format|erase|shutdown|reboot|drop\s+table)",
+    r"(rm\s+-rf|/etc/|/system|diskutil|sudo|format|erase|shutdown|reboot|drop\s+table"
+    r"|\bdelete\b|\bempty\b|\bpurchase\b|\bcheckout\b|\bpay\b|\bsubmit\b|\bpublish\b"
+    r"|\bsend\b|\binvite\b|\bshare\b)",
     re.IGNORECASE,
 )
 _SHARED_ARG_KEYS = {"to", "recipient", "email", "share", "post"}

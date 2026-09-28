@@ -106,6 +106,12 @@ class MacBridge:
     def open_url(self, url: str) -> tuple[bool, str]:
         return self.run(["open", url])
 
+    def ax_tree(self):
+        """The frontmost app's accessibility tree (MacAXTree on a Mac)."""
+        from ..ax import MacAXTree
+
+        return MacAXTree()
+
 
 class DryRunBridge(MacBridge):
     """Logs exactly what would run on a Mac; executes nothing. Demo/CI/first run."""
@@ -114,6 +120,7 @@ class DryRunBridge(MacBridge):
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self._ax = None
 
     def osascript(self, script: str) -> tuple[bool, str]:
         self.calls.append(("osascript", script))
@@ -126,3 +133,11 @@ class DryRunBridge(MacBridge):
     def open_url(self, url: str) -> tuple[bool, str]:
         self.calls.append(("open", url))
         return True, f"[dry-run] open {url}"
+
+    def ax_tree(self):
+        """The deterministic mock window — same interface as the real thing."""
+        from ..ax import MockAXTree
+
+        if self._ax is None:
+            self._ax = MockAXTree()
+        return self._ax

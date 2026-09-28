@@ -20,7 +20,7 @@ paranoid gate, and dumb-but-perfect executors.
 │      │        └────────────────────────┬────────────────────────────────┘ │
 │      │                                 │                                  │
 │  TTS  │        Planner ────────► SafetyGate ────────► SkillRegistry        │
-│ `say` │  OpenAI-compat local    blocklist          17 declared skills      │
+│ `say` │  OpenAI-compat local    blocklist          20 declared skills      │
 │ /Piper│  LLM (Ollama/mlx_lm/    + skill manifest   AppleScript · AX · `open`│
 │       │  llama.cpp/LM Studio)   + Laya gate        · pbcopy/pbpaste        │
 │       │                                 │                                  │
@@ -86,6 +86,18 @@ first runs). Same answers, same interface, one-file swap.
   model from accumulated preferences + procedures learned by demonstration.
 
 ### 5. Skills (`skills/`)
+*A v0.3 addition — the accessibility layer:*
+- **`ax.py`** exposes the frontmost app's real UI tree (pyobjc over
+  AXUIElement) or a deterministic `MockAXTree` — one interface, press /
+  focus / insert.
+- **`picker.py`** chooses the element the user meant: options are chunked
+  (≤16), chunks are coarse-ranked, only the top chunks' options are
+  fine-scored — Laya typed questions when the real backend runs, a
+  deterministic token-overlap heuristic otherwise. Below threshold ⇒
+  "did you mean …", never a guess.
+- **`skills/accessibility.py`** turns that into voice: "click the sign in
+  button", "type aura into the search field", "what's on my screen".
+
 A skill = `SkillSpec` (catalog + risk declaration) + one async `execute()`.
 macOS work goes through **`MacBridge`** (osascript/CLI); **`DryRunBridge`**
 logs the exact same calls without executing — that's how the demo profile and

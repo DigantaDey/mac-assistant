@@ -6,18 +6,37 @@ Resolution order (last wins):
     3. User file:  macOS  ~/Library/Application Support/Aura/config.toml
                    other  ~/.config/aura/config.toml
     4. Environment variables:  AURA_PROFILE, AURA_HOST, AURA_PORT, AURA_DATA_DIR
+    5. Runtime overrides:  <data_dir>/runtime.toml  (written by the UI —
+       the wake-word toggle lives here — so choices survive restarts)
+
+`watch_paths()` lists everything the hot-reloader polls; `write_overrides()`
+persists UI changes atomically.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
 APP_DIR_NAME = "Aura"
+RUNTIME_FILE = "runtime.toml"
+
+# Fields the hot-reloader may apply to a running process. Everything else
+# requires a restart — an honest, explicit list.
+LIVE_FIELDS: dict[str, set[str]] = {
+    "wake": {"enabled", "mode", "models", "threshold", "refractory_seconds", "phrase"},
+    "tts": {"enabled", "voice", "rate"},
+    "laya": {"confidence_threshold", "destructive_threshold"},
+    "safety": {"show_plan_before_run", "confirm_destructive", "blocked_patterns"},
+    "session": {"max_utterance_seconds", "end_of_speech_seconds",
+                "confirmation_timeout_seconds", "idle_unload_seconds"},
+}
+
 
 # --------------------------------------------------------------------------- #
 # Dataclasses — one per config section.                                       #
@@ -27,7 +46,7 @@ APP_DIR_NAME = "Aura"
 @dataclass
 class WakeConfig:
     enabled: bool = True
-    # "manual"    — trigger from UI / hotkey (works everywhere, great for testing)
+    # "manual"       — trigger from UI / hotkey (works everywhere, great for testing)
     # "openwakeword" — always-on on-device wake model(s); a custom phrase model
     #                  trained via scripts/train_wakeword.py can be dropped in.
     mode: str = "manual"
@@ -36,8 +55,8 @@ class WakeConfig:
     models: list[str] = field(default_factory=lambda: ["hey_jarvis"])
     threshold: float = 0.55          # per-frame confidence needed to fire
     refractory_seconds: float = 2.5  # cooldown after a fire
-    # Optional spoken prefix that must appear in the transcript to accept a
-    # wake in always-on mode (e.g. "hey aura"). Empty disables the gate.
+    # Spoken prefix that must appear in the transcript to accept a wake in
+    # always-on mode (e.g. "hey aura"). Empty disables the gate.
     phrase: str = ""
 
 
@@ -134,7 +153,7 @@ class Config:
 
 
 # --------------------------------------------------------------------------- #
-# Loading                                                                     #
+# Paths                                                                       #
 # --------------------------------------------------------------------------- #
 
 
@@ -157,6 +176,23 @@ def repo_default_config() -> Path:
     return Path(__file__).resolve().parent.parent / "config.default.toml"
 
 
+def runtime_overrides_path(data_dir: str | Path) -> Path:
+    return Path(data_dir) / RUNTIME_FILE
+
+
+def watch_paths(data_dir: str | Path | None = None) -> list[Path]:
+    """Files the hot-reloader polls (only existing ones matter)."""
+    paths = [repo_default_config(), user_config_path()]
+    if data_dir:
+        paths.append(runtime_overrides_path(data_dir))
+    return paths
+
+
+# --------------------------------------------------------------------------- #
+# Loading                                                                     #
+# --------------------------------------------------------------------------- #
+
+
 def _apply(dc: Any, raw: dict[str, Any]) -> None:
     """Merge a raw dict into a dataclass instance, ignoring unknown keys."""
     if not isinstance(raw, dict):
@@ -174,24 +210,35 @@ def _apply(dc: Any, raw: dict[str, Any]) -> None:
             setattr(dc, key, value)
 
 
+def _load_toml(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        return tomllib.loads(path.read_text())
+    except tomllib.TOMLDecodeError as exc:  # unreadable file must not kill the app
+        print(f"[config] ignoring malformed {path}: {exc}", file=sys.stderr)
+        return None
+
+
 def load_config(explicit_path: str | None = None) -> Config:
     cfg = Config()
 
-    for path in (repo_default_config(), user_config_path()):
-        if explicit_path and Path(explicit_path) == path:
-            pass
-        if path.is_file():
-            try:
-                raw = tomllib.loads(path.read_text())
-            except tomllib.TOMLDecodeError as exc:  # unreadable file must not kill the app
-                print(f"[config] ignoring malformed {path}: {exc}", file=sys.stderr)
-                continue
+    # Data dir must exist before runtime overrides can be located.
+    if os.environ.get("AURA_DATA_DIR"):
+        cfg.data_dir = os.environ["AURA_DATA_DIR"]
+    if not cfg.data_dir:
+        cfg.data_dir = str(default_data_dir())
+
+    for path in (repo_default_config(), user_config_path(),
+                 runtime_overrides_path(cfg.data_dir)):
+        raw = _load_toml(path)
+        if raw:
             _apply(cfg, raw)
 
     if explicit_path:
-        path = Path(explicit_path).expanduser()
-        if path.is_file():
-            _apply(cfg, tomllib.loads(path.read_text()))
+        raw = _load_toml(Path(explicit_path).expanduser())
+        if raw:
+            _apply(cfg, raw)
 
     # Environment overrides
     if os.environ.get("AURA_PROFILE"):
@@ -200,8 +247,6 @@ def load_config(explicit_path: str | None = None) -> Config:
         cfg.server.host = os.environ["AURA_HOST"]
     if os.environ.get("AURA_PORT"):
         cfg.server.port = int(os.environ["AURA_PORT"])
-    if os.environ.get("AURA_DATA_DIR"):
-        cfg.data_dir = os.environ["AURA_DATA_DIR"]
 
     # Demo profile pinning: predictable providers so the flow works anywhere.
     if cfg.profile == "demo":
@@ -210,6 +255,61 @@ def load_config(explicit_path: str | None = None) -> Config:
         cfg.planner.engine = "mock"
         cfg.tts.engine = "null"
 
-    if not cfg.data_dir:
-        cfg.data_dir = str(default_data_dir())
     return cfg
+
+
+# --------------------------------------------------------------------------- #
+# Writing runtime overrides (the UI's persistence path)                       #
+# --------------------------------------------------------------------------- #
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{text}"'
+
+
+def write_overrides(data_dir: str | Path, updates: dict[str, dict[str, Any]]) -> Path:
+    """Merge updates into <data_dir>/runtime.toml, atomically.
+
+    `updates` is section → {field: value}, e.g.
+        {"wake": {"mode": "openwakeword", "phrase": "hey aura"}}
+    Only LIVE_FIELDS keys are persisted — the UI cannot smuggle in fields
+    that would silently do nothing.
+    """
+    path = runtime_overrides_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    current: dict[str, dict[str, Any]] = {}
+    raw = _load_toml(path) or {}
+    for section, values in raw.items():
+        if isinstance(values, dict):
+            current[section] = dict(values)
+
+    for section, values in updates.items():
+        allowed = LIVE_FIELDS.get(section, set())
+        safe = {k: v for k, v in values.items() if k in allowed}
+        if safe:
+            current.setdefault(section, {}).update(safe)
+
+    lines: list[str] = []
+    for section, values in current.items():
+        if not values:
+            continue
+        lines.append(f"[{section}]")
+        for key, value in values.items():
+            lines.append(f"{key} = {_toml_value(value)}")
+        lines.append("")
+
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(lines))
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return path

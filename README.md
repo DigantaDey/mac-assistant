@@ -104,7 +104,7 @@ never leaving it.
 | **STT** | whisper.cpp (Metal/CoreML) → faster-whisper → typed input, auto-selected |
 | **Plan** | any local OpenAI-compatible server: Ollama, `mlx_lm.server`, llama.cpp, LM Studio |
 | **Gate** | [Laya](docs/RESEARCH.md) (Apache-2.0) — calibrated match/destructive scores in milliseconds; deterministic heuristic fallback |
-| **Act** | 17 declared skills (system, browser, clipboard, memory) via AppleScript/Accessibility — dry-run bridge everywhere else |
+| **Act** | 20 declared skills — system, browser, clipboard, memory + **accessibility element control** (`ax.click`/`ax.type_into` on any app, picked coarse-to-fine and Laya-scored) |
 | **Speak** | macOS `say` (zero RAM) or Piper/Kokoro |
 | **Learn** | SQLite event store → preference memory → Laya fine-tune buffer → `scripts/nightly_laya.py` |
 | **UI** | hand-rolled, zero-dependency, Apple-grade dark interface on `127.0.0.1:7331` — SSE-live |
@@ -127,8 +127,9 @@ that kicked this off.
 
 ## Status
 
-**v0.1 — foundation.** Core engine + UI + demo profile: tested (48 tests),
-running. Mac bring-up (real mic/executors/Laya) is config, not code — see
-ROADMAP for the sequence.
+**v0.3 — see ROADMAP.** Always-on wake with a phrase gate, live config
+hot-reload + idle model unload, native menu-bar shell, permissions wizard,
+and AX element picking (Aura clicks any labeled control in any app). 95
+tests green; everything installs or downloads once, up front.
 
 MIT licensed. Built with care.

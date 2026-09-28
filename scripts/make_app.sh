@@ -29,8 +29,8 @@ cat > "$DEST/Contents/Info.plist" <<'PLIST'
     <key>CFBundleDisplayName</key><string>Aura</string>
     <key>CFBundleIdentifier</key><string>app.aura.menubar</string>
     <key>CFBundleExecutable</key><string>Aura</string>
-    <key>CFBundleShortVersionString</key><string>0.2.0</string>
-    <key>CFBundleVersion</key><string>2</string>
+    <key>CFBundleShortVersionString</key><string>0.3.0</string>
+    <key>CFBundleVersion</key><string>3</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>

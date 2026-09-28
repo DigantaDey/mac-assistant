@@ -13,6 +13,8 @@ Endpoints:
   POST /api/correct       timeline feedback    {transcript, skill, verdict, note}
   GET  /api/skills        the skill catalog
   GET  /api/permissions   honest permission + readiness snapshot
+  POST /api/wake          live wake-mode switch {mode: manual|openwakeword, phrase?}
+  GET  /api/metrics       lightweight self-observation (RSS, engines, examples)
   POST /api/permissions/open            {target: microphone|accessibility|automation}
   POST /api/permissions/test_automation  sends one harmless AppleEvent probe
 
@@ -108,6 +110,8 @@ class AuraServer:
                     self._json({"skills": orch.registry.specs()})
                 elif path == "/api/permissions":
                     self._json(_permissions_snapshot(orch, cfg))
+                elif path == "/api/metrics":
+                    self._json(orch.metrics())
                 elif path == "/api/history":
                     self._json({"events": orch.memory.recent_events(100)})
                 elif path == "/api/events":
@@ -181,6 +185,15 @@ class AuraServer:
                     from . import permissions as perms
                     status, msg = perms.test_automation()
                     self._json({"status": status, "message": msg})
+                elif path == "/api/wake":
+                    mode = str(body.get("mode", ""))
+                    phrase = body.get("phrase")
+                    future = asyncio.run_coroutine_threadsafe(
+                        orch.set_wake_mode(mode, phrase), loop)
+                    try:
+                        self._json(future.result(timeout=5))
+                    except Exception:
+                        self._json({"ok": False, "message": "wake switch timed out"}, 503)
                 else:
                     self._json({"error": "not found"}, 404)
 

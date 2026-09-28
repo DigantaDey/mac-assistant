@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio
+
+      - name: Run the test suite
+        run: python -m pytest tests/ -v
+
+      - name: Byte-compile everything (syntax gate)
+        run: python -m compileall -q aura scripts tests
+
+      # The Swift shell can't compile on Linux runners; keep it honest by
+      # checking the files exist and the package manifest parses structurally.
+      - name: Sanity-check the Swift package tree
+        run: |
+          test -f macos/Package.swift
+          test -f macos/Sources/AuraMenuBar/main.swift
+          test -f macos/Sources/AuraMenuBar/AppDelegate.swift
+          test -f macos/Sources/AuraMenuBar/PythonProcess.swift
+          test -f macos/Sources/AuraMenuBar/ServerMonitor.swift

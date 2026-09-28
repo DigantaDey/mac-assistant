@@ -476,6 +476,37 @@ function connect() {
   }));
 }
 
+/* ── wake word controls (live, persisted) ─────────────────────────────── */
+
+async function setWake(mode, phrase) {
+  try {
+    const res = await api("/api/wake", { mode, phrase });
+    if (res.ok === false) { toast(res.message || "Couldn't switch wake mode"); return false; }
+    toast(res.engine === "OpenWakeWordEngine"
+      ? "Always-listening on" + (res.phrase ? ` — gate: “${res.phrase}”` : "")
+      : "Wake switched (engine fallback active — install openwakeword)");
+    return true;
+  } catch { toast("Couldn't reach Aura"); return false; }
+}
+
+document.querySelectorAll("#wake-mode .seg").forEach((seg) =>
+  seg.addEventListener("click", async () => {
+    const ok = await setWake(seg.dataset.mode, $("wake-phrase").value.trim());
+    if (ok) {
+      document.querySelectorAll("#wake-mode .seg").forEach((s) =>
+        s.classList.toggle("is-active", s === seg));
+      $("wake-mode-help").textContent = seg.dataset.mode === "openwakeword"
+        ? "Always listening: the on-device wake model runs continuously; the phrase gate (below) must start every command."
+        : "Manual: Aura listens only after you press the orb or hold the hotkey.";
+    }
+  }));
+
+let phraseTimer = null;
+$("wake-phrase") && $("wake-phrase").addEventListener("change", async () => {
+  const mode = document.querySelector("#wake-mode .seg.is-active")?.dataset.mode;
+  if (mode === "openwakeword") await setWake(mode, $("wake-phrase").value.trim());
+});
+
 /* ── boot ─────────────────────────────────────────────────────────────── */
 
 (async function boot() {

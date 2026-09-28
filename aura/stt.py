@@ -64,22 +64,41 @@ class WhisperCppSTT(STTEngine):
 
 
 class FasterWhisperSTT(STTEngine):
-    """faster-whisper (CTranslate2 int8) — pure-Python fallback."""
+    """faster-whisper (CTranslate2 int8) — pure-Python fallback.
+
+    The model is loaded on first use, not at startup, and `unload()` drops it
+    again after idle time — the orchestrator's lightweight promise in action.
+    """
 
     def __init__(self, model_size: str = "small", language: str = "en") -> None:
-        try:
-            from faster_whisper import WhisperModel  # type: ignore
-        except Exception as exc:  # pragma: no cover
-            raise RuntimeError(f"faster-whisper unavailable: {exc}") from exc
-        self._model = WhisperModel(model_size, device="auto", compute_type="auto")
+        self.model_size = model_size
         self.language = language
+        self._model = None  # lazy — nothing resident until the first utterance
+
+    def _ensure_model(self):
+        if self._model is None:
+            try:
+                from faster_whisper import WhisperModel  # type: ignore
+            except Exception as exc:  # pragma: no cover
+                raise RuntimeError(f"faster-whisper unavailable: {exc}") from exc
+            self._model = WhisperModel(self.model_size, device="auto",
+                                       compute_type="auto")
+        return self._model
+
+    def unload(self) -> bool:
+        """Drop the resident model. Returns True if something was unloaded."""
+        if self._model is not None:
+            self._model = None
+            return True
+        return False
 
     def transcribe(self, pcm_frames) -> str:  # noqa: ANN001
+        model = self._ensure_model()
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             wav_path = Path(tmp.name)
         try:
             _write_wav(pcm_frames, wav_path)
-            segments, _ = self._model.transcribe(str(wav_path), language=self.language)
+            segments, _ = model.transcribe(str(wav_path), language=self.language)
             return " ".join(s.text for s in segments).strip()
         finally:
             wav_path.unlink(missing_ok=True)

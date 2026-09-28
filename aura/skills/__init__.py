@@ -1,16 +1,17 @@
 from .base import DryRunBridge, MacBridge, Skill, SkillContext, SkillRegistry, SkillResult, SkillSpec
-from . import browser, clipboard, system
+from . import accessibility, browser, clipboard, system
 
 __all__ = [
     "DryRunBridge", "MacBridge", "Skill", "SkillContext", "SkillRegistry",
-    "SkillResult", "SkillSpec", "browser", "clipboard", "system",
+    "SkillResult", "SkillSpec", "accessibility", "browser", "clipboard", "system",
 ]
 
 
 def build_default_registry(bridge: MacBridge | None = None) -> SkillRegistry:
-    """The v0.1 skill set: system control, browser, clipboard, memory."""
+    """The full skill set: system, browser, clipboard, memory, accessibility."""
     reg = SkillRegistry()
     system.register_system_skills(reg)
     browser.register_browser_skills(reg)
     clipboard.register_clipboard_skills(reg)
+    accessibility.register_accessibility_skills(reg)
     return reg
