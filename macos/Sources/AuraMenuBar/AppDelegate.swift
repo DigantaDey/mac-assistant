@@ -5,7 +5,15 @@ import SwiftUI
 
 /// The menu-bar app: one icon, one popover, a few windows, and the engine
 /// behind them. No web view, no Dock icon, no browser anywhere.
+///
+/// Every AppKit callback and every model interaction happens on the main
+/// actor — saying so in the type system is what keeps the compiler (and the
+/// reader) honest about it.
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+
+    /// Created from `main.swift` before the run loop exists, hence nonisolated.
+    nonisolated override init() { super.init() }
 
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
