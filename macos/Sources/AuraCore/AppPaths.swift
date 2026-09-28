@@ -55,13 +55,17 @@ public enum AppPaths {
 
     /// Does this folder look like an Aura engine checkout?
     public static func looksLikeEngine(_ path: String) -> Bool {
+        // The directory flag belongs to the *root*, not to the file inside it —
+        // asking about `aura/__main__.py` made this always return false, which
+        // silently broke engine discovery. (The unit test caught it.)
         var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return false }
         let hasPackage = FileManager.default.fileExists(
-            atPath: (path as NSString).appendingPathComponent("aura/__main__.py"),
-            isDirectory: &isDirectory)
+            atPath: (path as NSString).appendingPathComponent("aura/__main__.py"))
         let hasProject = FileManager.default.fileExists(
             atPath: (path as NSString).appendingPathComponent("pyproject.toml"))
-        return hasPackage && isDirectory.boolValue && hasProject
+        return hasPackage && hasProject
     }
 
     /// A human-readable path for display (abbreviates the home directory).
