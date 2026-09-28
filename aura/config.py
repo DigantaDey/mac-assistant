@@ -114,7 +114,10 @@ class TTSConfig:
 
 @dataclass
 class SafetyConfig:
-    show_plan_before_run: bool = True
+    # Strict mode: when on, even safe, confident actions pause for a yes.
+    # Destructive/risky actions ALWAYS confirm, with this on or off —
+    # the safety gate's "ask" can never be switched off.
+    show_plan_before_run: bool = False
     confirm_destructive: bool = True
     # Skills that always require explicit confirmation regardless of scoring.
     always_confirm: list[str] = field(default_factory=list)
@@ -202,19 +205,53 @@ def watch_paths(data_dir: str | Path | None = None) -> list[Path]:
 # --------------------------------------------------------------------------- #
 
 
+def _warn_bad_value(section: str, key: str, want: str, value: Any) -> None:
+    print(f"[config] ignoring {section}.{key} = {value!r} — expected {want}",
+          file=sys.stderr)
+
+
 def _apply(dc: Any, raw: dict[str, Any]) -> None:
-    """Merge a raw dict into a dataclass instance, ignoring unknown keys."""
+    """Merge a raw dict into a dataclass instance.
+
+    Unknown keys are ignored; a key whose *type* doesn't match is skipped
+    with a warning — a typo in the user's file must not corrupt the running
+    config (e.g. `models = "hey_jarvis"` where a list belongs).
+    """
     if not isinstance(raw, dict):
         return
+    section = type(dc).__name__
     known = {f.name for f in fields(dc)} if is_dataclass(dc) else set()
     for key, value in raw.items():
         if key not in known:
             continue
         current = getattr(dc, key)
-        if is_dataclass(current) and isinstance(value, dict):
-            _apply(current, value)
-        elif isinstance(current, list) and isinstance(value, list) or isinstance(current, bool) or isinstance(value, (str, int, float, bool, type(None))):
-            setattr(dc, key, value)
+        if is_dataclass(current):
+            if isinstance(value, dict):
+                _apply(current, value)
+            else:
+                _warn_bad_value(section, key, "a table", value)
+        elif isinstance(current, bool):
+            if isinstance(value, bool):
+                setattr(dc, key, value)
+            else:
+                _warn_bad_value(section, key, "true/false", value)
+        elif isinstance(current, list):
+            if isinstance(value, list):
+                setattr(dc, key, value)
+            else:
+                _warn_bad_value(section, key, "a list", value)
+        elif isinstance(current, (int, float)):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                setattr(dc, key, value)
+            else:
+                _warn_bad_value(section, key, "a number", value)
+        elif isinstance(current, str):
+            if isinstance(value, str):
+                setattr(dc, key, value)
+            else:
+                _warn_bad_value(section, key, "a string", value)
+        else:
+            _warn_bad_value(section, key, "a supported type", value)
 
 
 def _load_toml(path: Path) -> dict[str, Any] | None:

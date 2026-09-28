@@ -433,7 +433,10 @@ class Orchestrator:
         needs_confirm = any(p["verdict"].decision == "confirm" for p in session.pending)
         blocked = [p for p in session.pending if p["verdict"].decision == "blocked"]
 
-        if self.cfg.safety.show_plan_before_run and needs_confirm:
+        if needs_confirm or self.cfg.safety.show_plan_before_run:
+            # `needs_confirm` is non-negotiable — the safety gate's "ask" can
+            # never be switched off by a setting. `show_plan_before_run` is
+            # the opt-in *strict* mode: even safe actions pause for a yes.
             token = uuid.uuid4().hex[:8]
             session.proposal_token = token
             fut: asyncio.Future[str] = self.loop.create_future()

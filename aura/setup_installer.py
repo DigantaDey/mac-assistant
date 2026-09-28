@@ -194,7 +194,7 @@ def _download_with_progress(orch, key: str, title: str, url: str, target: Path, 
             last = now
             report(now, total)
 
-    req = urllib.request.Request(url, headers={"User-Agent": "Aura/0.5"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Aura/0.5.1"})
     with urllib.request.urlopen(req, timeout=600) as resp, tmp.open("wb") as fh:
         while True:
             chunk = resp.read(1 << 20)

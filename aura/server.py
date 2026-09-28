@@ -87,7 +87,9 @@ class AuraServer:
 
             def _file(self, rel: str) -> None:
                 path = (UI_DIR / rel).resolve()
-                if not str(path).startswith(str(UI_DIR)) or not path.is_file():
+                # is_relative_to, not startswith — a sibling directory
+                # (ui-evil/) must never pass a prefix check.
+                if not path.is_relative_to(UI_DIR) or not path.is_file():
                     self._json({"error": "not found"}, 404)
                     return
                 body = path.read_bytes()
@@ -332,6 +334,7 @@ def _state_snapshot(orch, cfg) -> dict:
         "planner_online": getattr(orch, "planner_online", None),
         "laya": {
             "backend": type(orch.laya).__name__,
+            "confidence": cfg.laya.confidence_threshold,
             "examples": orch.examples.stats(),
         },
         "planner": {"engine": cfg.planner.engine, "model": cfg.planner.model,

@@ -104,7 +104,7 @@ def check_microphone(orch: Any) -> bool | None:
     return bool(getattr(orch, "_has_audio", False))
 
 
-def request_microphone(timeout: float = 4.0) -> tuple[str, str]:
+def request_microphone() -> tuple[str, str]:
     """Actually open the microphone — that's what triggers the consent dialog.
 
     status: "ok" | "denied" | "unavailable"

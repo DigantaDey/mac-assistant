@@ -89,6 +89,16 @@ class SkillRegistry:
 # --------------------------------------------------------------------------- #
 
 
+def applescript_quote(value: str) -> str:
+    """`value` as a safe AppleScript string literal.
+
+    Skill args originate in the LLM (i.e. in the user's words) and must never
+    be able to break out of the literal — a stray `"` in an app name is
+    otherwise an AppleScript injection (`… & (do shell script "…") & …`).
+    """
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 class MacBridge:
     """Runs AppleScript/osascript + small CLI tools on a real Mac."""
 

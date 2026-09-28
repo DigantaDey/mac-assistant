@@ -33,6 +33,21 @@ class TestServer:
         with pytest.raises(urllib.error.HTTPError):
             get(f"http://127.0.0.1:{cfg.server.port}/../aura/config.py")
 
+    def test_port_in_use_raises_ostypes_cleanly(self, server):
+        """A second server on the same port fails with a clean OSError —
+        cmd_serve turns that into a friendly message, not a traceback."""
+        orch, srv, cfg = server
+        from aura.server import AuraServer
+
+        with pytest.raises(OSError):
+            AuraServer(orch, cfg).start()
+
+    def test_state_exposes_laya_confidence(self, server):
+        _, srv, cfg = server
+        _, state = get(f"http://127.0.0.1:{cfg.server.port}/api/state")
+        st = json.loads(state)
+        assert st["laya"]["confidence"] == cfg.laya.confidence_threshold
+
     def test_full_session_over_http(self, server):
         orch, srv, cfg = server
         base = f"http://127.0.0.1:{cfg.server.port}"

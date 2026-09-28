@@ -175,7 +175,8 @@ class ExampleBuffer:
 
     def record(self, transcript: str, skill: str, args: dict, outcome: str,
                match: float, destructive: float, weight: float = 1.0) -> None:
-        assert outcome in self.OUTCOMES
+        if outcome not in self.OUTCOMES:
+            raise ValueError(f"unknown outcome {outcome!r} (expected {self.OUTCOMES})")
         payload = json.dumps(args)
         with self._lock:
             self._record(transcript, skill, payload, outcome, match, destructive, weight)

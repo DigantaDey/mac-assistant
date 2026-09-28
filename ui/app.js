@@ -346,6 +346,7 @@ async function loadHistory() {
     $("timeline").innerHTML = "";
     events.forEach((ev) => timelineItem(ev));
     S.historyCount = events.length;
+    $("tl-empty").hidden = events.length > 0;
     updateActivityBadge();
   } catch { /* server warming up */ }
 }
@@ -431,7 +432,7 @@ function renderSettings(st) {
         plannerRow,
       ])}</div>
       <div class="card"><h2>Decisions</h2>${rows([
-        ["Ask before every action", "Even confident, low-risk actions pause for your yes",
+        ["Ask before every action", "Strict mode — even safe, confident actions wait for your yes. Risky actions always ask, with this on or off.",
           "", t("safety.show_plan_before_run", st.ask_before_run, "Ask before every action")],
         ["Decision engine", st.laya.backend === "RealLayaBackend" ? "Laya decision model" : "Built-in rules (upgradeable)", st.laya.backend],
         ["Confidence floor", "Below this, Aura asks instead of acting", st.laya.confidence ?? "—"],
@@ -968,6 +969,7 @@ function addLiveTimelineItem(d) {
     plan: S.lastPlan || { actions: [] },
   };
   timelineItem(ev, true);
+  $("tl-empty").hidden = true;
   S.historyCount++;
   if (document.body.dataset.view !== "activity") S.activityUnread++;
   updateActivityBadge();

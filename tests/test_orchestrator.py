@@ -51,6 +51,38 @@ async def test_confirmation_flow(orch):
     orch.bus.unsubscribe_async(sid)
 
 
+async def test_strict_mode_asks_even_for_safe_actions(orch):
+    """show_plan_before_run=True pauses even safe, confident actions."""
+    orch.cfg.safety.show_plan_before_run = True
+    sid = orch.bus.subscribe_async()
+    task = asyncio.create_task(orch.submit_text("open spotify"))
+    while True:
+        ev = await asyncio.wait_for(orch.bus.get(sid), timeout=5)
+        if ev.type == "proposal":
+            break
+    assert ev.data["actions"][0]["verdict"] == "run"  # safe, but strict mode says ask
+    orch.resolve_confirmation(ev.data["token"], "cancel")
+    await asyncio.wait_for(task, timeout=5)
+    assert orch.bridge.calls == []
+    orch.bus.unsubscribe_async(sid)
+
+
+async def test_risky_action_asks_with_strict_mode_off(orch):
+    """The safety gate's 'ask' cannot be switched off by a setting."""
+    assert orch.cfg.safety.show_plan_before_run is False  # the default
+    sid = orch.bus.subscribe_async()
+    task = asyncio.create_task(orch.submit_text("empty the trash"))
+    while True:
+        ev = await asyncio.wait_for(orch.bus.get(sid), timeout=5)
+        if ev.type == "proposal":
+            break
+    assert ev.data["actions"][0]["verdict"] == "confirm"
+    orch.resolve_confirmation(ev.data["token"], "cancel")
+    await asyncio.wait_for(task, timeout=5)
+    assert not orch.bridge.calls
+    orch.bus.unsubscribe_async(sid)
+
+
 async def test_cancel_flow(orch):
     sid = orch.bus.subscribe_async()
     task = asyncio.create_task(orch.submit_text("empty the trash"))

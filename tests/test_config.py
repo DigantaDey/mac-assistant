@@ -87,3 +87,27 @@ def test_live_fields_catalog_sane():
     assert "mode" in LIVE_FIELDS["wake"]
     assert "enabled" in LIVE_FIELDS["tts"]
     assert "planner" not in LIVE_FIELDS   # model swaps are restart-only, honestly
+
+
+def test_type_mismatch_is_skipped_with_warning(tmp_path, capsys):
+    """A typo'd value in the user's file must not corrupt the running config."""
+    from aura.config import Config, _apply
+
+    cfg = Config()
+    _apply(cfg.wake, {"models": "hey_jarvis"})        # a string where a list belongs
+    assert cfg.wake.models == ["hey_jarvis"]           # the default, untouched
+    _apply(cfg.laya, {"confidence_threshold": "high"})  # a string where a number belongs
+    assert cfg.laya.confidence_threshold == 0.62
+    _apply(cfg.safety, {"show_plan_before_run": 1})    # a number where a bool belongs
+    assert cfg.safety.show_plan_before_run is False
+    assert "ignoring" in capsys.readouterr().err
+
+
+def test_valid_overrides_still_apply(tmp_path):
+    from aura.config import Config, _apply
+
+    cfg = Config()
+    _apply(cfg.wake, {"models": ["hey_jarvis", "alexa"], "threshold": 0.7, "enabled": False})
+    assert cfg.wake.models == ["hey_jarvis", "alexa"]
+    assert cfg.wake.threshold == 0.7
+    assert cfg.wake.enabled is False

@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../macos"
 
 say() { printf "\033[1;36m▸ %s\033[0m\n" "$1"; }
-VERSION="0.5.0"
+VERSION="0.5.1"
 
 if ! command -v swift >/dev/null 2>&1; then
   echo "swift not found — install the Xcode command line tools first:"
@@ -43,7 +43,7 @@ cat > "$DEST/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key><string>app.aura.menubar</string>
     <key>CFBundleExecutable</key><string>Aura</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
-    <key>CFBundleVersion</key><string>5</string>
+    <key>CFBundleVersion</key><string>6</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>

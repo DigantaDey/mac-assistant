@@ -12,6 +12,12 @@ final class PythonProcess {
     private var process: Process?
     private var restartTimer: Timer?
     private var intentionalStop = false
+    private var processStartedAt = Date.distantPast
+    // Bounded auto-restart: an engine that dies on startup (missing venv,
+    // wrong Python) must not respawn every 3 s forever — back off to 2 min
+    // and stop trying after 8 straight failures. "Restart Engine" always works.
+    private var consecutiveFailures = 0
+    private let maxConsecutiveFailures = 8
 
     static var logURL: URL {
         let logs = FileManager.default
@@ -25,6 +31,7 @@ final class PythonProcess {
 
     func start() {
         intentionalStop = false
+        consecutiveFailures = 0
         spawn()
     }
 
@@ -126,8 +133,22 @@ final class PythonProcess {
             guard let self = self else { return }
             self.onStateChange?()
             guard !self.intentionalStop else { return }
+            // A process that lived a while isn't a startup failure — reset the
+            // backoff so a crash after hours restarts promptly.
+            if Date().timeIntervalSince(self.processStartedAt) > 60 {
+                self.consecutiveFailures = 0
+            }
+            self.consecutiveFailures += 1
+            guard self.consecutiveFailures <= self.maxConsecutiveFailures else {
+                NSLog("Aura: engine has failed \(self.consecutiveFailures) times in a row — " +
+                      "stopping auto-restart. Pick “Restart Engine” from the menu bar " +
+                      "(or check ~/Library/Logs/Aura.log).")
+                return
+            }
+            let delay = min(3.0 * pow(2.0, Double(self.consecutiveFailures - 1)), 120.0)
+            NSLog("Aura: engine exited — restarting in \(Int(delay)) s (failure \(self.consecutiveFailures)/\(self.maxConsecutiveFailures))")
             DispatchQueue.main.async { [weak self] in
-                self?.restartTimer = Timer.scheduledTimer(withTimeInterval: 3.0,
+                self?.restartTimer = Timer.scheduledTimer(withTimeInterval: delay,
                                                           repeats: false) { [weak self] _ in
                     self?.spawn()
                 }
@@ -137,6 +158,7 @@ final class PythonProcess {
         do {
             try child.run()
             process = child
+            processStartedAt = Date()
         } catch {
             NSLog("Aura: could not launch \(python.path): \(error.localizedDescription)")
         }

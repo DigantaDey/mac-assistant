@@ -47,7 +47,7 @@ def cmd_doctor(cfg) -> int:
         # Live capability checks — the same honesty the Setup panel shows.
         from . import permissions as perms
 
-        check("microphone", perms.request_microphone(timeout=5.0)[0] == "ok",
+        check("microphone", perms.request_microphone()[0] == "ok",
               "open it in Aura's Setup panel" if perms.is_mac() else "")
         check("accessibility", perms.check_accessibility() is True,
               "grant in System Settings (Aura's Setup panel opens it)")
@@ -118,7 +118,13 @@ def cmd_serve(cfg) -> int:
 
     async def main() -> None:
         await orch.start()
-        server.start()
+        try:
+            server.start()
+        except OSError as exc:
+            # Port already bound — say what's wrong, don't dump a traceback.
+            print(f"\nPort {cfg.server.port} is already in use — is Aura already running?")
+            print("(Change the port: AURA_PORT=<port> python -m aura serve)\n")
+            raise SystemExit(1) from exc
         url = f"http://{'127.0.0.1' if cfg.server.host == '0.0.0.0' else cfg.server.host}:{cfg.server.port}"
         print(f"Aura v{__import__('aura', fromlist=['__version__']).__version__} "
               f"— profile={_profile_for(cfg)} bridge={bridge.platform}")
