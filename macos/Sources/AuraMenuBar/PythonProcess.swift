@@ -48,6 +48,15 @@ final class PythonProcess {
         start()
     }
 
+    /// Menu → "Choose Aura Folder…": forget the remembered folder, ask for a
+    /// new one, relaunch. Cancelling leaves the standard discovery in place.
+    func chooseRepo() {
+        UserDefaults.standard.removeObject(forKey: "repoPath")
+        guard let picked = Self.pickRepo() else { return }
+        UserDefaults.standard.set(picked, forKey: "repoPath")
+        restart()
+    }
+
     // MARK: internals
 
     private func spawn() {

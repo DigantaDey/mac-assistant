@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // First-launch / Setup window — a real NSWindow, the Apple-standard
     // place to have the consent conversation.
     private var setupWindow: NSWindow?
+    // NSWindow.delegate is weak — keep this alive or the close never lands.
+    private var setupWindowDelegate: SetupWindowDelegate?
 
     private var python = PythonProcess()
     private lazy var monitor = ServerMonitor { [weak self] state in
@@ -176,7 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async {
                     if up {
                         var target = self.baseURL
-                        if onboarding { target.append(fragment: "onboarding") }
+                        if onboarding { target = target.appending(fragment: "onboarding") }
                         web.load(URLRequest(url: target))
                     } else if tries < 40 {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { poll() }
@@ -220,7 +222,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.isReleasedWhenClosed = false
         window.contentView = web
         window.center()
-        window.delegate = SetupWindowDelegate(delegate: self)
+        setupWindowDelegate = SetupWindowDelegate(delegate: self)
+        window.delegate = setupWindowDelegate
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
@@ -289,8 +292,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func chooseFolder() {
-        UserDefaults.standard.removeObject(forKey: "repoPath")
-        python.restart()
+        python.chooseRepo()
     }
 
     @objc private func toggleLogin() {

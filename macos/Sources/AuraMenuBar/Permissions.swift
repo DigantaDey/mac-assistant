@@ -52,7 +52,9 @@ enum Permissions {
     /// app; afterwards the user flips the toggle in System Settings.
     static func requestAccessibility() {
         guard !accessibilityGranted else { return }
-        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        // kCFBooleanTrue, not a Swift Bool: the TCC API wants a CFBoolean.
+        let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        let options = [key: kCFBooleanTrue!] as CFDictionary
         AXIsProcessTrustedWithOptions(options)
     }
 
