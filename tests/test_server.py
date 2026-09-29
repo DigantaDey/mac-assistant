@@ -68,6 +68,72 @@ class TestServer:
         assert any("Spotify" in c[1] for c in orch.bridge.calls)
 
     # ------------------------------------------------------------------ #
+    # "It's been thinking for ten minutes" — the input path must never     #
+    # tear a live session down. The HTTP answer is sent before the session #
+    # runs, so there is nobody left to time out; the orchestrator's        #
+    # watchdog is what bounds the work.                                    #
+    # ------------------------------------------------------------------ #
+
+    def test_slow_command_still_completes(self, server):
+        """A command slower than the old 30 s fire-and-forget cap still runs
+        to the end, and the next command is accepted."""
+        orch, srv, cfg = server
+        base = f"http://127.0.0.1:{cfg.server.port}"
+
+        class SlowPlanner:
+            async def plan(self, transcript, context):
+                await asyncio.sleep(0.4)
+                from aura.planner import Action, Plan
+
+                return Plan(reply="Opened it.",
+                            actions=[Action("system.open_app", {"app": "Spotify"})])
+
+        orch.planner = SlowPlanner()
+        status, resp = post(f"{base}/api/input", {"text": "open spotify"})
+        assert status == 200 and resp["accepted"] is True
+
+        async def wait_idle():
+            for _ in range(300):
+                if orch.state == "armed" and orch.memory.recent_events():
+                    return
+                await asyncio.sleep(0.02)
+            raise AssertionError("a slow command must still complete")
+
+        asyncio.run(wait_idle())
+        assert any("Spotify" in c[1] for c in orch.bridge.calls)
+
+        # and Aura takes the next command straight away
+        status, resp = post(f"{base}/api/input", {"text": "set volume to 30"})
+        assert resp["accepted"] is True
+
+    def test_wedged_session_ends_with_an_answer(self, server):
+        """Whatever goes wrong, the engine comes back to Ready and says so —
+        it never sits in 'thinking' forever."""
+        orch, srv, cfg = server
+        base = f"http://127.0.0.1:{cfg.server.port}"
+        orch.cfg.session.max_session_seconds = 0.3
+        orch.cfg.session.confirmation_timeout_seconds = 0.2
+
+        class HangingPlanner:
+            async def plan(self, transcript, context):
+                await asyncio.sleep(30)
+
+        orch.planner = HangingPlanner()
+        post(f"{base}/api/input", {"text": "open spotify"})
+
+        async def wait_idle():
+            for _ in range(300):
+                if orch.state == "armed" and orch.memory.recent_events():
+                    return
+                await asyncio.sleep(0.02)
+            raise AssertionError("the session never came back")
+
+        asyncio.run(wait_idle())
+        assert orch.memory.recent_events() or True   # ended, one way or another
+        status, resp = post(f"{base}/api/input", {"text": "set volume to 30"})
+        assert resp["accepted"] is True
+
+    # ------------------------------------------------------------------ #
     # Wake Phrase Studio + in-app installer over HTTP                      #
     # ------------------------------------------------------------------ #
 

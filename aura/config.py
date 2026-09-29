@@ -35,7 +35,8 @@ LIVE_FIELDS: dict[str, set[str]] = {
     "laya": {"confidence_threshold", "destructive_threshold"},
     "safety": {"show_plan_before_run", "confirm_destructive", "blocked_patterns"},
     "session": {"max_utterance_seconds", "end_of_speech_seconds",
-                "confirmation_timeout_seconds", "idle_unload_seconds"},
+                "confirmation_timeout_seconds", "idle_unload_seconds",
+                "max_session_seconds"},
 }
 
 
@@ -138,6 +139,9 @@ class SessionConfig:
     max_utterance_seconds: float = 12.0
     end_of_speech_seconds: float = 0.7
     confirmation_timeout_seconds: float = 45.0
+    # Hard ceiling for one request (planning + asking + executing). When it
+    # trips, Aura says so and returns to Ready — it never "thinks" forever.
+    max_session_seconds: float = 300.0
     # Unload warm models after this much idle time (lightweight promise).
     idle_unload_seconds: float = 180.0
 

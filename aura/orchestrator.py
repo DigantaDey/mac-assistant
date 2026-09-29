@@ -99,6 +99,7 @@ class Orchestrator:
         self._has_audio = False
         self._audio_task: asyncio.Task | None = None
         self._maintenance_task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
         self._queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=200)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_activity = time.monotonic()
@@ -139,6 +140,10 @@ class Orchestrator:
                                                      name="aura-maintenance")
         self._remember_mtimes()
         await self._probe_planner()
+        # Warm the local model in the background: loading qwen3:4b takes tens
+        # of seconds, and paying that on the user's *first* command is exactly
+        # what "still thinking" feels like. Best-effort — never fatal.
+        asyncio.create_task(self._warm_planner(), name="aura-warmup")
         self.state = "armed"
         self.bus.publish("state", state=self.state, mic=mic_kind,
                          wake=getattr(self.cfg.wake, "mode", "manual"))
@@ -146,8 +151,22 @@ class Orchestrator:
                                      f"stt={type(self.stt).__name__}, "
                                      f"laya={type(self.laya).__name__}")
 
+    async def _warm_planner(self) -> None:
+        """One tiny request so the local model is resident before it is asked.
+
+        Runs on an executor and never raises: a machine without a model server
+        simply stays in basic mode, exactly as before.
+        """
+        warm = getattr(self.planner, "warmup", None)
+        if warm is None or not callable(warm):
+            return
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, warm)
+        except Exception:
+            pass
+
     async def stop(self) -> None:
-        for task in (self._audio_task, self._maintenance_task):
+        for task in (self._audio_task, self._maintenance_task, self._watchdog_task):
             if task:
                 task.cancel()
                 try:
@@ -156,6 +175,7 @@ class Orchestrator:
                     pass
         self._audio_task = None
         self._maintenance_task = None
+        self._watchdog_task = None
         if self._mic:
             self._mic.stop()
         self.state = "disabled"
@@ -328,8 +348,11 @@ class Orchestrator:
         if not self._has_audio:
             self.bus.publish("hint", text="No microphone here — type your command below.")
             return
-        if self._wake is not None and hasattr(self._wake, "fire"):
-            self._wake.fire()  # ManualTrigger path
+        # No `fire()` here: begin_capture() moves straight to "capturing", so
+        # the audio loop never reaches `wake.feed()` to consume the flag — it
+        # would sit armed and fire a *second*, unwanted capture as soon as the
+        # first session ended (Aura re-listening on its own, then "I didn't
+        # catch anything" 12 s later).
         await self.begin_capture()
 
     async def begin_capture(self) -> None:
@@ -384,10 +407,20 @@ class Orchestrator:
 
     async def _session_text(self, transcript: str, spoken: bool = False) -> None:
         """A session must *always* end — with a result or a polite apology.
-        An unexpected error is a product bug, not a frozen orb."""
+        An unexpected error is a product bug, not a frozen orb.
+
+        `BaseException` on purpose: `asyncio.CancelledError` is not an
+        `Exception` (Python 3.8+), and a session torn down mid-flight used to
+        skip this handler entirely — leaving the state machine stuck in
+        "planning"/"proposing" forever, with every later command refused and
+        the panel saying "Thinking…" for as long as the user cared to wait.
+        """
         try:
             await self._run_session(transcript, spoken)
-        except Exception as exc:
+        except asyncio.CancelledError:
+            self.bus.publish("log", line="session cancelled — back to ready")
+            await self._end_session("I stopped that one — ask me again?")
+        except BaseException as exc:  # the orb must never freeze
             self.bus.publish("log", line=f"session error: {exc!r}")
             import traceback as _tb
 
@@ -395,7 +428,7 @@ class Orchestrator:
             try:
                 await self._end_session(
                     "Something went wrong while thinking — please try again.")
-            except Exception:  # even the apology must not hang the state
+            except BaseException:  # even the apology must not hang the state
                 self.session = None
                 self.state = "armed"
                 self.bus.publish("state", state=self.state)
@@ -405,6 +438,7 @@ class Orchestrator:
         self.session = session
         self._last_activity = time.monotonic()
         t0 = time.monotonic()
+        self._arm_watchdog()
 
         # 1 — plan
         self.state = "planning"
@@ -489,7 +523,15 @@ class Orchestrator:
             self.bus.publish("action_started", index=idx, skill=action.skill,
                              session=session.id)
             try:
-                result = await skill.execute(action.args, _SkillCtx(self))
+                # Skills reach macOS through *blocking* subprocesses, and
+                # `osascript` can sit there for its whole timeout while a TCC
+                # consent dialog waits for the user. Running that on the event
+                # loop froze the whole engine — SSE, health checks, the next
+                # command — for as long as macOS took to answer. A worker
+                # thread keeps Aura responsive (and the orb breathing) while
+                # the skill works.
+                result = await asyncio.to_thread(
+                    _execute_skill, skill, action.args, _SkillCtx(self))
             except Exception as exc:  # a crashing skill must never kill the session
                 result = _skill_result(False, f"{action.skill} failed: {exc}")
             pending["result"] = _SkillOutcome(result.ok, result.message, result.data)
@@ -542,6 +584,8 @@ class Orchestrator:
             self._loop.run_in_executor(None, self.tts.speak, text)
 
     async def _end_session(self, message: str | None = None) -> None:
+        self._disarm_watchdog()
+        self._release_confirmations()
         if message:
             self.bus.publish("reply", text=message, total_ms=0, outcome="ok")
             self._speak_async(message)
@@ -549,6 +593,65 @@ class Orchestrator:
         self.state = "armed"
         self._last_activity = time.monotonic()
         self.bus.publish("state", state=self.state)
+
+    # ------------------------------------------------------------------ #
+    # The session watchdog — the promise that the orb always comes back    #
+    # ------------------------------------------------------------------ #
+
+    def _session_budget_seconds(self) -> float:
+        """Hard ceiling for one request.
+
+        Always at least as long as the confirmation window — the user is
+        allowed to read a plan at their own pace, and that wait ends the
+        session by itself anyway — so a healthy session never trips it, while
+        a wedged one still ends with an honest sentence instead of
+        "Thinking…" forever.
+        """
+        configured = float(getattr(self.cfg.session, "max_session_seconds", 300.0))
+        confirm = float(getattr(self.cfg.session, "confirmation_timeout_seconds", 45.0))
+        # The floor only guards against a nonsensical config (0 or negative)
+        # turning every request into an instant timeout.
+        return max(2.0, configured, confirm)
+
+    def _arm_watchdog(self) -> None:
+        self._disarm_watchdog()
+        try:
+            self._watchdog_task = asyncio.create_task(self._watchdog(),
+                                                      name="aura-watchdog")
+        except RuntimeError:            # no running loop (direct-call tests)
+            self._watchdog_task = None
+
+    def _disarm_watchdog(self) -> None:
+        task, self._watchdog_task = self._watchdog_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _watchdog(self) -> None:
+        try:
+            await asyncio.sleep(self._session_budget_seconds())
+        except asyncio.CancelledError:
+            return
+        if self.session is None and self.state == "armed":
+            return                          # the session already ended
+        self.bus.publish("log", line="session watchdog fired — resetting to ready")
+        apology = "That took too long, so I stopped it — ask me again?"
+        session = self.session
+        if session is not None:             # keep the timeline honest
+            self.memory.record_event(
+                session.transcript,
+                (session.plan.as_dict() if session.plan else {}),
+                apology, "failed", _ms(session.started))
+        await self._end_session(apology)
+
+    def _release_confirmations(self) -> None:
+        """Wake (and forget) any proposal still waiting for an answer."""
+        pending, self._confirmations = self._confirmations, {}
+        for fut in pending.values():
+            if not fut.done():
+                try:
+                    fut.set_result("timeout")
+                except Exception:          # a cancelled future is already done
+                    pass
 
     # ------------------------------------------------------------------ #
     # Wake Phrase Studio — guided, in-app training (no terminal, ever)     #
@@ -911,6 +1014,16 @@ class _RawFrame:
 
     def __init__(self, pcm: bytes) -> None:
         self.pcm = pcm
+
+
+def _execute_skill(skill, args: dict, ctx: _SkillCtx):
+    """Run one skill on a worker thread, off the engine's event loop.
+
+    Skills are coroutines whose bodies are blocking macOS calls; a throwaway
+    event loop per call lets the main loop keep serving SSE, health checks and
+    the next command while a skill waits on the system.
+    """
+    return asyncio.run(skill.execute(args, ctx))
 
 
 class _SkillCtx:

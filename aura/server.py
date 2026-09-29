@@ -75,11 +75,15 @@ class AuraServer:
         )
         self._http: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        # Fire-and-forget coroutines this server started (a running session,
+        # an install). Cancelled on stop() so nothing outlives the engine.
+        self._inflight: set = set()
 
     # ---------------------------------------------------------------- #
 
     def start(self) -> None:
         orch, cfg, token = self.orch, self.cfg, self.token
+        inflight = self._inflight   # captured: `self` in a Handler is the request
         host = cfg.server.host or "127.0.0.1"
         if not localauth.is_loopback_host(host) and not os.environ.get(
             localauth.ALLOW_REMOTE_ENV
@@ -163,22 +167,36 @@ class AuraServer:
                 except json.JSONDecodeError:
                     return {}
 
-            def _run(self, coro, timeout: float = 30.0, label: str = "request") -> None:
-                """Fire an orchestrator coroutine from this server thread."""
+            def _run(self, coro, timeout: float | None = None,
+                     label: str = "request") -> None:
+                """Fire an orchestrator coroutine from this server thread.
+
+                Used only by fire-and-forget endpoints (`/api/input`,
+                `/api/trigger`), where the HTTP answer has *already* been
+                sent — so there is nobody left to time out. Cancelling here
+                tore live sessions apart mid-flight and left the state
+                machine wedged (the "Thinking…" forever bug); the
+                orchestrator's session watchdog is what bounds the work now.
+                """
 
                 async def _wrapped():
-                    return await asyncio.wait_for(coro, timeout=timeout)
-
-                future = asyncio.run_coroutine_threadsafe(_wrapped(), orch.loop)
-
-                def _done(fut) -> None:
                     try:
-                        fut.result()
+                        if timeout is None:
+                            return await coro
+                        return await asyncio.wait_for(coro, timeout=timeout)
                     except Exception as exc:  # never lose a background failure
                         orch.bus.publish(
                             "log", line=f"{label} failed: {exc.__class__.__name__}: {exc}")
 
-                future.add_done_callback(_done)
+                def _spawn() -> None:
+                    task = orch.loop.create_task(_wrapped())
+                    inflight.add(task)
+                    task.add_done_callback(inflight.discard)
+
+                try:
+                    orch.loop.call_soon_threadsafe(_spawn)
+                except RuntimeError:           # the engine is shutting down
+                    coro.close()              # nothing will ever await this
 
             # ---------------- GET ---------------- #
 
@@ -390,10 +408,28 @@ class AuraServer:
         self._thread.start()
 
     def stop(self) -> None:
+        # In-flight sessions and installs go down with the engine — a task
+        # left running would keep a cancelled session's coroutine (and its
+        # skill subprocesses) alive after the user quit.
+        self._cancel_inflight()
         if self._http:
             self._http.shutdown()
             self._http.server_close()
             self._http = None
+
+    def _cancel_inflight(self) -> None:
+        tasks, self._inflight = self._inflight, set()
+        if not tasks:
+            return
+
+        def _cancel() -> None:
+            for task in tasks:
+                task.cancel()
+
+        try:
+            self.orch.loop.call_soon_threadsafe(_cancel)
+        except RuntimeError:
+            pass                      # the loop is already gone — nothing to do
 
 
 # --------------------------------------------------------------------------- #

@@ -46,10 +46,18 @@ class Plan:
     # True when the plan came from the deterministic basic layer because the
     # local LLM was unreachable — the UI shows a subtle "basic mode" note.
     degraded: bool = False
+    # "llm" | "rules" — which layer produced it. The everyday commands are
+    # answered by the rules in microseconds; only what they cannot route is
+    # worth a model round-trip (see HybridPlanner.plan).
+    source: str = "llm"
+    # False when the layer handled only *part* of the request — a chain where
+    # one step didn't route. A partial plan is worth handing to the model.
+    complete: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return {"reply": self.reply, "actions": [a.as_dict() for a in self.actions],
-                "latency_ms": self.latency_ms, "degraded": self.degraded}
+                "latency_ms": self.latency_ms, "degraded": self.degraded,
+                "source": self.source, "complete": self.complete}
 
 
 class Planner:
@@ -307,15 +315,59 @@ class HybridPlanner(Planner):
                 "model": self.llm.model, "base_url": self.llm.base_url,
                 "last_error": self._last_error}
 
+    def warmup(self) -> bool:
+        """Load the local model before the user asks for anything.
+
+        A cold Ollama spends tens of seconds loading qwen3:4b on the first
+        request — which is precisely the "it's still thinking" the user feels.
+        One token of work, in the background at engine start, moves that cost
+        off the first command. Best-effort: returns False and stays silent
+        when there is no model server to warm.
+        """
+        if not self.probe():
+            return False
+        try:
+            client = self._get_probe_client()
+            resp = client.post(
+                f"{self.llm.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.llm.api_key}"},
+                json={"model": self.llm.model,
+                      "messages": [{"role": "user", "content": "hi"}],
+                      "max_tokens": 1, "temperature": 0.0},
+                timeout=httpx.Timeout(300.0, connect=3.0),
+            )
+            return resp.status_code == 200
+        except Exception as exc:
+            self._online = False
+            self._last_error = str(exc).splitlines()[0][:160]
+            return False
+
     async def plan(self, transcript: str, context: dict[str, Any]) -> Plan:
-        # Run the synchronous probe in an executor so it doesn't block the
-        # event loop while waiting for the HTTP health check.
+        """Reflex first: rules, then the model, then rules again.
+
+        The deterministic layer answers the everyday commands ("open youtube",
+        "set volume to 30") in microseconds, and it never needs the model
+        server, RAM or a warm-up. Sending those to a 4B model was pure added
+        latency — the "it's still thinking" feeling — so the model is now
+        consulted only for what the rules genuinely cannot route, or for a
+        request they only half-handled. The Laya gate judges the result either
+        way, so routing faster does not mean acting less carefully.
+        """
         import asyncio as _asyncio
+
+        plan = await self.basic.plan(transcript, context)
+        if plan.actions and plan.complete:
+            plan.degraded = False
+            return plan
+
+        # Not (fully) routable by rules — this is what a local model is for.
+        # The probe is only paid when we actually need the model.
         online = await _asyncio.get_running_loop().run_in_executor(None, self.probe)
         if online:
             try:
                 plan = await self.llm.plan(transcript, context)
                 plan.degraded = False
+                plan.source = "llm"
                 return plan
             except Exception as exc:
                 self._online = False
@@ -332,7 +384,20 @@ class HybridPlanner(Planner):
 
 
 class MockPlanner(Planner):
-    """Keyword table that mimics a well-tuned small model. Deterministic."""
+    """The deterministic layer: reflexes, no model, no network, ~0.01 ms.
+
+    This is what runs when the local LLM is unreachable ("basic mode") *and*
+    the fast path that answers the everyday commands without one. It is a
+    keyword table, so it only understands phrasings it has been taught — the
+    LLM covers the rest. A rule layer fails by *refusing*, which is why the
+    Laya gate still judges every action it produces.
+    """
+
+    # What we say when nothing matches. Hoisted so the chain splitter can tell
+    # "handled the whole request" from "dropped a step".
+    NO_SKILL = ("I don't have a skill for that yet — try “open Spotify”, "
+                "“set volume to 30”, “search for airport lounges”, "
+                "or “remember that …”.")
 
     def __init__(self, catalog_prompt: str, max_actions: int = 3) -> None:
         self.max_actions = max_actions
@@ -354,19 +419,31 @@ class MockPlanner(Planner):
                      if p.strip()] or [transcript.strip()]
         actions: list[Action] = []
         replies: list[str] = []
+        complete = True
         for part in parts[: self.max_actions]:
             sub = await self._plan_one(part)
             actions.extend(sub.actions)
             if sub.reply:
                 replies.append(sub.reply)
+            complete = complete and sub.complete
         actions = actions[: self.max_actions]
         latency = max(1, int((time.monotonic() - started) * 1000))
-        return Plan(reply=" ".join(replies), actions=actions, latency_ms=latency)
+        return Plan(reply=" ".join(replies), actions=actions, latency_ms=latency,
+                    source="rules", complete=complete)
 
     async def _plan_one(self, transcript: str) -> Plan:
         t = transcript.lower().strip()
+        # Everyday politeness: "can you open spotify please" is the same
+        # request as "open spotify". A rule layer that can't see through it
+        # refuses a command it perfectly well understands.
+        t = re.sub(r"^(?:hey aura[,!.]?\s+)?(?:can|could|would|will) you (?:please )?",
+                   "", t)
+        t = re.sub(r"^(?:please|pls|kindly)\s+", "", t)
+        t = re.sub(r"[,!.]?\s*(?:please|thanks|thank you)\s*[.!]?$", "", t)
+        t = t.strip(" ,.!?")
         actions: list[Action] = []
         reply = ""
+        complete = True
 
         m = re.search(r"(?:remember|note) that (.+)", t)
         if m:
@@ -379,12 +456,34 @@ class MockPlanner(Planner):
         elif m := re.search(r"open (?:the )?(?:app )?(.+?)(?: and|$)", t):
             app = self._title_case(m.group(1))
             if "." in app:  # a domain, not an app → browser skill
-                actions.append(Action("browser.open_url", {"url": app}, "safe", "opening site"))
+                actions.append(Action("browser.open_url", {"url": app.lower()},
+                                      "safe", "opening site"))
                 reply = f"Opening {app}."
             else:
                 actions.append(Action("system.open_app", {"app": app}, "safe", "asked to open it"))
                 reply = f"Opening {app}."
-        elif m := re.search(r"(?:quit|close) (.+)", t):
+        elif re.search(r"\b(?:close|shut|dismiss|hide)\b[^.]*\btabs?\b"
+                       r"|\btabs?\b[^.]*\b(?:close|shut|dismiss)\b", t) or \
+                re.search(r"\b(?:next|previous|prev|last|switch(?: to)?|go to|back to)\b"
+                          r"[^.]*\btabs?\b", t):
+            # Aura has no close/switch-tab skill yet. Refusing honestly beats
+            # the old behaviour, where "close this tab" reached the quit-app
+            # rule and became quit_app(app="This Tab") — a confident, wrong
+            # action against an application that does not exist.
+            reply = ("I can't close or switch tabs yet — I can list them, focus one "
+                     "by name, or open a new one.")
+            complete = False
+        elif m := re.search(r"(?:open|launch|fire up|pull up|bring up|switch to|go to) "
+                            r"(?:the )?(?:app )?(.+?)(?: and|$)", t):
+            app = self._title_case(m.group(1))
+            if "." in app:  # a domain, not an app → browser skill
+                actions.append(Action("browser.open_url", {"url": app.lower()},
+                                      "safe", "opening site"))
+                reply = f"Opening {app}."
+            else:
+                actions.append(Action("system.open_app", {"app": app}, "safe", "asked to open it"))
+                reply = f"Opening {app}."
+        elif m := re.search(r"(?:quit|close|kill|force ?quit|terminate|shut down) (.+)", t):
             app = self._title_case(m.group(1))
             actions.append(Action("system.quit_app", {"app": app}, "confirm", "closing an app can lose work"))
             reply = f"Quitting {app}."
@@ -395,12 +494,13 @@ class MockPlanner(Planner):
         elif "mute" in t:
             actions.append(Action("system.mute", {}, "safe", "asked to mute"))
             reply = "Muted."
-        elif "brightness up" in t:
-            actions.append(Action("system.brightness_up", {}, "safe", "asked to brighten"))
-            reply = "Brightening the display."
-        elif "brightness down" in t:
-            actions.append(Action("system.brightness_down", {}, "safe", "asked to dim"))
-            reply = "Dimming the display."
+        elif re.search(r"\b(?:brightness|screen|display)\b", t) and \
+                re.search(r"\b(?:up|down|higher|lower|brighter|dimmer)\b", t):
+            # A nudge, not a level — the skills are nudges too.
+            dim = bool(re.search(r"\b(?:down|lower|dimmer)\b", t))
+            actions.append(Action("system.brightness_down" if dim else "system.brightness_up",
+                                  {}, "safe", "asked to nudge the display"))
+            reply = "Dimming the display." if dim else "Brightening the display."
         elif "do not disturb" in t or "focus mode" in t:
             actions.append(Action("system.toggle_dnd", {}, "safe", "toggling focus"))
             reply = "Toggling Do Not Disturb."
@@ -452,10 +552,16 @@ class MockPlanner(Planner):
         elif "on my screen" in t or "read my screen" in t or "what do you see" in t:
             actions.append(Action("ax.read_screen", {}, "safe", "reading visible controls"))
             reply = ""
-        elif m := re.search(r"search(?: the web)?(?: for)? (.+)", t):
+        elif m := re.search(r"\b(?:search|look ?up|google)\b"
+                            r"(?:\s+(?:the\s+)?(?:web|online|internet))?"
+                            r"(?:\s+for)?\s+(.+)", t):
             query = m.group(1).strip("?.!")
-            actions.append(Action("browser.search", {"query": query}, "safe", "web search"))
-            reply = f"Searching for {query}."
+            # "look up airport lounges online" is a search for the lounges.
+            query = re.sub(r"(?:\s+(?:on|in))?\s+(?:the\s+)?"
+                           r"(?:web|online|internet)\s*$", "", query).strip()
+            if query:
+                actions.append(Action("browser.search", {"query": query}, "safe", "web search"))
+                reply = f"Searching for {query}."
         elif m := re.search(r"(?:open|go to) (\S+\.(?:com|org|net|io|dev|ai)[^ ]*)", t):
             url = m.group(1)
             actions.append(Action("browser.open_url", {"url": f"https://{url}"}, "safe", "opening site"))
@@ -471,14 +577,15 @@ class MockPlanner(Planner):
             text = m2.group(1).strip() if m2 else ""
             actions.append(Action("clipboard.set_text", {"text": text}, "safe", "asked to copy"))
             reply = "Copied to the clipboard."
-        elif "recording" in t and ("start" in t or "begin" in t):
+        elif re.search(r"\b(?:record|recording|screen ?record(?:ing)?)\b", t) and \
+                not re.search(r"\b(?:stop|end|finish|cancel|pause)\b", t):
             actions.append(Action("system.start_recording", {}, "confirm", "captures the screen"))
             reply = "Starting a screen recording."
         else:
-            reply = ("I don't have a skill for that yet — try “open Spotify”, “set volume "
-                     "to 30”, “search for airport lounges”, or “remember that …”.")
+            reply = self.NO_SKILL
+            complete = False
 
-        return Plan(reply=reply, actions=actions)
+        return Plan(reply=reply, actions=actions, complete=complete)
 
 
 def build_planner(cfg, catalog_prompt: str):
