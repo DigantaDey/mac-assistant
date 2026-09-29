@@ -266,6 +266,14 @@ final class AppModel: ObservableObject {
                 toast("\(event.data["title"]?.stringValue ?? "Step"): \(status)", kind: status == "ok" ? .success : .warning)
             }
 
+        case "setup_done":
+            isInstalling = false
+            setupProgress.removeAll()
+            let ok = event.data["ok"]?.boolValue ?? false
+            let summary = event.data["summary"]?.stringValue ?? "Setup complete."
+            toast(summary, kind: ok ? .success : .warning)
+            Task { await refreshAll() }
+
         case "config":
             Task { await refreshConfig() }
 
@@ -514,16 +522,23 @@ final class AppModel: ObservableObject {
     func requestPermission(_ target: String) {
         toast("Asking macOS…", kind: .info)
         Task {
-            let answer = try? await client.requestPermission(target)
-            if let answer {
+            do {
+                let answer = try await client.requestPermission(target)
                 toast(answer.message ?? "Checked.", kind: answer.ok ? .success : .warning)
+            } catch {
+                toast("Couldn't reach Aura's engine. Is it running?", kind: .failure)
             }
             await refreshPermissions()
         }
     }
 
     func openSystemSettings(_ target: String) {
-        Task { _ = try? await client.openSystemSettings(target) }
+        Task {
+            let answer = try? await client.openSystemSettings(target)
+            if let answer = answer, answer.ok == false {
+                toast(answer.message ?? "Couldn't open settings.", kind: .warning)
+            }
+        }
     }
 
     func testAutomation() {
@@ -537,26 +552,42 @@ final class AppModel: ObservableObject {
     }
 
     func runSetupStep(_ step: String) {
+        guard !isInstalling else {
+            toast("Another install step is running — please wait.", kind: .warning)
+            return
+        }
         isInstalling = true
         Task {
             defer { isInstalling = false }
-            let answer = try? await client.runSetupStep(step)
-            if let answer {
+            do {
+                let answer = try await client.runSetupStep(step)
                 toast(answer.detail ?? answer.message ?? "Done.", kind: answer.ok ? .success : .warning)
+            } catch {
+                toast("Couldn't reach Aura's engine.", kind: .failure)
             }
             await refreshPermissions()
         }
     }
 
     func installEverything() {
+        guard !isInstalling else {
+            toast("Install already in progress — check Setup for details.", kind: .warning)
+            return
+        }
         isInstalling = true
         Task {
             defer { isInstalling = false }
-            let installStart = try? await client.startInstall()
-            if let reply = installStart, reply.ok == false {
-                toast(reply.message ?? "Install didn't start.", kind: .warning)
-            } else {
-                toast("Install started — progress follows.", kind: .info)
+            do {
+                let reply = try await client.startInstall()
+                if reply.ok == false {
+                    toast(reply.message ?? "Install didn't start.", kind: .warning)
+                } else {
+                    toast("Install started — follow progress in Setup.", kind: .info)
+                    // Jump to Permissions/Setup so the user can see progress.
+                    requestedSection = "settings/setup"
+                }
+            } catch {
+                toast("Couldn't reach Aura's engine. Is it running?", kind: .failure)
             }
         }
     }
