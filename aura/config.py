@@ -87,7 +87,11 @@ class PlannerConfig:
     model: str = "qwen3:4b"
     api_key: str = "local"           # local servers ignore this; never a cloud key
     temperature: float = 0.2
-    timeout_seconds: float = 20.0
+    # The model is never allowed to hold the interaction hostage. Everyday
+    # commands bypass it entirely; unfamiliar requests get at most four
+    # seconds so there is still time to return an honest fallback inside the
+    # product's five-second response SLO.
+    timeout_seconds: float = 4.0
     max_actions: int = 3
 
 
@@ -139,9 +143,11 @@ class SessionConfig:
     max_utterance_seconds: float = 12.0
     end_of_speech_seconds: float = 0.7
     confirmation_timeout_seconds: float = 45.0
-    # Hard ceiling for one request (planning + asking + executing). When it
-    # trips, Aura says so and returns to Ready — it never "thinks" forever.
-    max_session_seconds: float = 300.0
+    # Hard ceiling for *active work* (planning or executing). Confirmation is
+    # a user wait and has its own timer. The orchestrator also enforces an
+    # absolute five-second cap, even when an old config contains a larger
+    # value, so Aura always answers or fails clearly in near real time.
+    max_session_seconds: float = 5.0
     # Unload warm models after this much idle time (lightweight promise).
     idle_unload_seconds: float = 180.0
 

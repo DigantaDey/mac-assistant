@@ -44,6 +44,12 @@ from .wakeword import WakeEngine, phrase_gate, strip_phrase
 State = Literal["armed", "capturing", "transcribing", "planning",
                 "proposing", "executing", "responding", "disabled"]
 
+# Non-negotiable product SLO: active planning/execution ends with either a
+# result or an honest timeout in at most five seconds. Waiting for the user to
+# approve a risky proposal is deliberately separate.
+MAX_ACTIVE_REQUEST_SECONDS = 5.0
+TRAIN_CAPTURE_TIMEOUT_SECONDS = 5.0
+
 
 @dataclass
 class Session:
@@ -100,6 +106,8 @@ class Orchestrator:
         self._audio_task: asyncio.Task | None = None
         self._maintenance_task: asyncio.Task | None = None
         self._watchdog_task: asyncio.Task | None = None
+        self._active_session_task: asyncio.Task | None = None
+        self._deadline_expired = False
         self._queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=200)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_activity = time.monotonic()
@@ -108,6 +116,8 @@ class Orchestrator:
         self._file_mtimes: dict[str, float] = {}
         self._trainer: TrainingState | None = None
         self._train_capture_armed = False
+        self._train_capture_task: asyncio.Task | None = None
+        self._train_capture_id = 0
         self._train_vad = EnergyVAD(end_silence_seconds=0.6, max_seconds=4.0)
         self._setup_running = False
 
@@ -165,17 +175,51 @@ class Orchestrator:
         except Exception:
             pass
 
+    async def ensure_microphone(self) -> tuple[bool, str]:
+        """Attach the live stream after a permission grant without a restart.
+
+        First launch commonly starts the engine before the user answers the
+        native TCC dialog. The old process permanently kept its SilentMic, so
+        Settings could report a grant while Record Sample still received no
+        frames. This method runs on the engine loop and swaps the stream live.
+        """
+        if self._has_audio and isinstance(self._mic, MicStream):
+            return True, "Microphone is already live."
+        if self.state in ("capturing", "transcribing"):
+            return False, "Finish the current recording, then try again."
+        if self._mic is not None:
+            self._mic.stop()
+        try:
+            mic = MicStream(self.loop, self._on_audio_frame)
+            mic.start()
+        except Exception as exc:
+            self._mic = SilentMic(self.loop, self._on_audio_frame)
+            self._has_audio = False
+            self.bus.publish("log", line=f"microphone reconnect failed: {exc}")
+            return False, f"Microphone permission is set, but the input could not open: {exc}"
+        self._mic = mic
+        self._has_audio = True
+        self.bus.publish("microphone", ready=True)
+        self.bus.publish("log", line="microphone attached after permission grant")
+        return True, "Microphone is ready — recording and wake phrases are live."
+
     async def stop(self) -> None:
-        for task in (self._audio_task, self._maintenance_task, self._watchdog_task):
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, RuntimeError):
-                    pass
+        tasks = {task for task in (
+            self._audio_task, self._maintenance_task, self._watchdog_task,
+            self._train_capture_task, self._active_session_task,
+        ) if task is not None and task is not asyncio.current_task()}
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, RuntimeError):
+                pass
         self._audio_task = None
         self._maintenance_task = None
         self._watchdog_task = None
+        self._train_capture_task = None
+        self._active_session_task = None
         if self._mic:
             self._mic.stop()
         self.state = "disabled"
@@ -380,7 +424,22 @@ class Orchestrator:
             await self._end_session("I didn't catch anything — say that again?")
             return
         loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(None, self.stt.transcribe, [_RawFrame(pcm)])
+        try:
+            text = await asyncio.wait_for(
+                loop.run_in_executor(None, self.stt.transcribe, [_RawFrame(pcm)]),
+                timeout=self._session_budget_seconds(),
+            )
+        except TimeoutError:
+            await self._end_session(
+                "Speech recognition took too long (over five seconds). Please try again.",
+                outcome="failed")
+            return
+        except Exception as exc:
+            self.bus.publish("log", line=f"speech recognition failed: {exc}")
+            await self._end_session(
+                "Speech recognition failed — you can type the command or try again.",
+                outcome="failed")
+            return
         text = (text or "").strip()
         if not text:
             await self._end_session("I didn't catch that — say it again?")
@@ -415,11 +474,29 @@ class Orchestrator:
         "planning"/"proposing" forever, with every later command refused and
         the panel saying "Thinking…" for as long as the user cared to wait.
         """
+        current = asyncio.current_task()
+        self._active_session_task = current
+        self._deadline_expired = False
         try:
             await self._run_session(transcript, spoken)
         except asyncio.CancelledError:
-            self.bus.publish("log", line="session cancelled — back to ready")
-            await self._end_session("I stopped that one — ask me again?")
+            deadline = self._deadline_expired
+            self.bus.publish(
+                "log",
+                line=("active request deadline reached — back to ready" if deadline
+                      else "session cancelled — back to ready"),
+            )
+            message = ("That took too long (over five seconds), so I stopped it. "
+                       "Please try again."
+                       if deadline else "I stopped that one — ask me again?")
+            session = self.session
+            if session is not None:
+                self.memory.record_event(
+                    session.transcript,
+                    (session.plan.as_dict() if session.plan else {}),
+                    message, "failed", _ms(session.started),
+                )
+            await self._end_session(message, outcome="failed")
         except BaseException as exc:  # the orb must never freeze
             self.bus.publish("log", line=f"session error: {exc!r}")
             import traceback as _tb
@@ -427,9 +504,14 @@ class Orchestrator:
             self.bus.publish("log", line=_tb.format_exc(limit=3))
             try:
                 await self._end_session(
-                    "Something went wrong while thinking — please try again.")
+                    "Something went wrong while thinking — please try again.",
+                    outcome="failed")
             except BaseException:  # even the apology must not hang the state
+                self._disarm_watchdog()
+                self._release_confirmations()
                 self.session = None
+                self._active_session_task = None
+                self._deadline_expired = False
                 self.state = "armed"
                 self.bus.publish("state", state=self.state)
 
@@ -486,11 +568,17 @@ class Orchestrator:
                                  "reasons": p["verdict"].reasons,
                              } for p in session.pending])
             self.bus.publish("state", state="proposing")
+            # A proposal is already a response inside the five-second SLO.
+            # Reading it is user time, not active work, so suspend the active
+            # watchdog while the independent confirmation timer runs.
+            self._disarm_watchdog()
             try:
                 answer = await asyncio.wait_for(
                     fut, timeout=self.cfg.session.confirmation_timeout_seconds)
             except TimeoutError:
                 answer = "timeout"
+            finally:
+                self._confirmations.pop(token, None)
             if answer != "confirm":
                 for p in session.pending:
                     self._record_example(transcript, p["action"],
@@ -501,9 +589,11 @@ class Orchestrator:
                 await self._end_session("No problem — cancelled." if answer == "cancel"
                                         else "I didn't hear a yes, so I cancelled it.")
                 return
-            # Confirmed: record positive supervision.
+            # Confirmed: record positive supervision, then give execution its
+            # own five-second active-work window.
             for p in session.pending:
                 self._record_example(transcript, p["action"], "confirmed")
+            self._arm_watchdog()
 
         for p in blocked:
             p["result"] = _SkillOutcome(False, f"Refused: {'; '.join(p['verdict'].reasons)}")
@@ -583,13 +673,16 @@ class Orchestrator:
         if self._loop is not None:
             self._loop.run_in_executor(None, self.tts.speak, text)
 
-    async def _end_session(self, message: str | None = None) -> None:
+    async def _end_session(self, message: str | None = None,
+                           outcome: str = "ok") -> None:
         self._disarm_watchdog()
         self._release_confirmations()
         if message:
-            self.bus.publish("reply", text=message, total_ms=0, outcome="ok")
+            self.bus.publish("reply", text=message, total_ms=0, outcome=outcome)
             self._speak_async(message)
         self.session = None
+        self._active_session_task = None
+        self._deadline_expired = False
         self.state = "armed"
         self._last_activity = time.monotonic()
         self.bus.publish("state", state=self.state)
@@ -599,23 +692,26 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
 
     def _session_budget_seconds(self) -> float:
-        """Hard ceiling for one request.
+        """Hard ceiling for active planning/execution.
 
-        Always at least as long as the confirmation window — the user is
-        allowed to read a plan at their own pace, and that wait ends the
-        session by itself anyway — so a healthy session never trips it, while
-        a wedged one still ends with an honest sentence instead of
-        "Thinking…" forever.
+        The five-second cap is enforced even when an existing runtime.toml
+        still contains the old 300-second default. Confirmation waits are
+        suspended from this budget in `_run_session` and use their own timer.
+        A small floor keeps malformed zero/negative config useful in tests and
+        prevents an accidental immediate cancellation.
         """
-        configured = float(getattr(self.cfg.session, "max_session_seconds", 300.0))
-        confirm = float(getattr(self.cfg.session, "confirmation_timeout_seconds", 45.0))
-        # The floor only guards against a nonsensical config (0 or negative)
-        # turning every request into an instant timeout.
-        return max(2.0, configured, confirm)
+        configured = float(getattr(
+            self.cfg.session, "max_session_seconds", MAX_ACTIVE_REQUEST_SECONDS))
+        return max(0.1, min(configured, MAX_ACTIVE_REQUEST_SECONDS))
 
     def _arm_watchdog(self) -> None:
         self._disarm_watchdog()
         try:
+            # Capture the owner explicitly. Resetting only the public state
+            # while this task kept running caused late actions/replies to leak
+            # into the next session.
+            self._active_session_task = asyncio.current_task()
+            self._deadline_expired = False
             self._watchdog_task = asyncio.create_task(self._watchdog(),
                                                       name="aura-watchdog")
         except RuntimeError:            # no running loop (direct-call tests)
@@ -623,7 +719,8 @@ class Orchestrator:
 
     def _disarm_watchdog(self) -> None:
         task, self._watchdog_task = self._watchdog_task, None
-        if task is not None and not task.done():
+        if (task is not None and not task.done()
+                and task is not asyncio.current_task()):
             task.cancel()
 
     async def _watchdog(self) -> None:
@@ -633,15 +730,19 @@ class Orchestrator:
             return
         if self.session is None and self.state == "armed":
             return                          # the session already ended
-        self.bus.publish("log", line="session watchdog fired — resetting to ready")
-        apology = "That took too long, so I stopped it — ask me again?"
-        session = self.session
-        if session is not None:             # keep the timeline honest
-            self.memory.record_event(
-                session.transcript,
-                (session.plan.as_dict() if session.plan else {}),
-                apology, "failed", _ms(session.started))
-        await self._end_session(apology)
+        self.bus.publish("log", line="active request exceeded five-second deadline")
+        self._deadline_expired = True
+        owner = self._active_session_task
+        if owner is not None and not owner.done() and owner is not asyncio.current_task():
+            # Cancellation unwinds the actual planner/skill coroutine; its
+            # handler records one failure and returns Aura to Ready. Merely
+            # resetting state here would let detached work act on the Mac later.
+            owner.cancel()
+            return
+        # Defensive fallback for direct-call integrations with no owner task.
+        await self._end_session(
+            "That took too long (over five seconds), so I stopped it. Please try again.",
+            outcome="failed")
 
     def _release_confirmations(self) -> None:
         """Wake (and forget) any proposal still waiting for an answer."""
@@ -660,6 +761,69 @@ class Orchestrator:
     TRAIN_SAMPLES_NEEDED = 6
     TRAIN_SAMPLES_MINIMUM = 3
 
+    def _cancel_training_capture_timeout(self) -> None:
+        """Invalidate and cancel the no-speech timer, from any thread."""
+        self._train_capture_id += 1
+
+        def cancel() -> None:
+            task, self._train_capture_task = self._train_capture_task, None
+            if (task is not None and not task.done()
+                    and task is not asyncio.current_task()):
+                task.cancel()
+
+        try:
+            here = asyncio.get_running_loop()
+        except RuntimeError:
+            here = None
+        if self._loop is not None and here is not self._loop:
+            self._loop.call_soon_threadsafe(cancel)
+        else:
+            cancel()
+
+    def _arm_training_capture_timeout(self) -> None:
+        """A record tap always resolves, even when no speech reaches the mic."""
+        self._cancel_training_capture_timeout()
+        capture_id = self._train_capture_id
+
+        async def expire() -> None:
+            try:
+                await asyncio.sleep(TRAIN_CAPTURE_TIMEOUT_SECONDS)
+            except asyncio.CancelledError:
+                return
+            if (capture_id != self._train_capture_id or not self._train_capture_armed
+                    or self._trainer is None):
+                return
+            self._train_capture_armed = False
+            self._train_vad.reset()
+            count = len(self._trainer.samples)
+            message = "I didn't hear a phrase — tap Record and try again."
+            self.bus.publish("train_sample", ok=False, message=message,
+                             count=count, need=self.TRAIN_SAMPLES_NEEDED,
+                             phase="capture", seconds=0.0)
+            self.bus.publish("train_update", phase="capture",
+                             phrase=self._trainer.phrase, count=count,
+                             need=self.TRAIN_SAMPLES_NEEDED, message=message)
+            self._train_capture_task = None
+
+        def create() -> None:
+            if capture_id != self._train_capture_id:
+                return
+            self._train_capture_task = self.loop.create_task(
+                expire(), name="aura-train-capture-timeout")
+
+        try:
+            here = asyncio.get_running_loop()
+        except RuntimeError:
+            here = None
+        if self._loop is not None and here is not self._loop:
+            self._loop.call_soon_threadsafe(create)
+        elif here is not None:
+            if self._loop is None:
+                self._loop = here
+            create()
+        # With no running engine loop (a synchronous unit test), fake samples
+        # are injected directly and there is no wall-clock capture to time out.
+
     def training_start(self, phrase: str) -> dict:
         phrase = " ".join(str(phrase or "").split())
         words = phrase.split()
@@ -677,6 +841,9 @@ class Orchestrator:
         if self.state != "armed" or self.session is not None:
             return {"ok": False, "message": "Finish the current request first."}
 
+        self._cancel_training_capture_timeout()
+        self._train_capture_armed = False
+        self._train_vad.reset()
         self._trainer = TrainingState(phrase=phrase.lower())
         self.bus.publish("train_update", phase="capture", phrase=phrase.lower(),
                          count=0, need=self.TRAIN_SAMPLES_NEEDED)
@@ -688,15 +855,22 @@ class Orchestrator:
             return {"ok": False, "message": "Start training first."}
         if self.state != "armed" or self.session is not None:
             return {"ok": False, "message": "One moment — finish the current request."}
+        if self._train_capture_armed:
+            return {"ok": False, "message": "Already recording — say your phrase now."}
+        if len(self._trainer.samples) >= self.TRAIN_SAMPLES_NEEDED:
+            return {"ok": False, "message": "All samples are ready — train the phrase."}
         self._train_capture_armed = True
         self._train_vad.reset()
+        self._arm_training_capture_timeout()
         self.bus.publish("train_update", phase="listening",
                          phrase=self._trainer.phrase,
                          count=len(self._trainer.samples),
                          need=self.TRAIN_SAMPLES_NEEDED)
-        return {"ok": True}
+        return {"ok": True, "message": "Listening — say your phrase now."}
 
     def _handle_train_sample(self, frames: list[AudioFrame]) -> None:
+        self._cancel_training_capture_timeout()
+        self._train_capture_armed = False
         if self._trainer is None:
             return
         import numpy as np
@@ -731,13 +905,18 @@ class Orchestrator:
                 "listening": self._train_capture_armed}
 
     def training_cancel(self) -> dict:
+        self._cancel_training_capture_timeout()
         self._trainer = None
         self._train_capture_armed = False
+        self._train_vad.reset()
         self.bus.publish("train_update", phase="idle", count=0,
                          need=self.TRAIN_SAMPLES_NEEDED)
         return {"ok": True}
 
     async def training_finish(self) -> dict:
+        if self._train_capture_armed:
+            return {"ok": False,
+                    "message": "Finish this recording first — say the phrase or start over."}
         if self._trainer is None or len(self._trainer.samples) < self.TRAIN_SAMPLES_MINIMUM:
             return {"ok": False,
                     "message": "Record a few more samples first — three at minimum."}
@@ -773,7 +952,9 @@ class Orchestrator:
             self.bus.publish("log", line=f"could not persist wake model: {exc}")
         self._remember_mtimes()
         self._wake = self._build_wake()
+        self._cancel_training_capture_timeout()
         self._trainer = None
+        self._train_capture_armed = False
         self.bus.publish("train_update", phase="done", phrase=phrase,
                          threshold=round(trained.threshold, 3),
                          margin=round(trained.margin, 3))

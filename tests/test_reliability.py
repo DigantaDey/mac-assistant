@@ -67,7 +67,7 @@ class _HangingSkill:
     spec = SkillSpec(name="system.hang", description="never returns")
 
     async def execute(self, args, ctx):
-        await asyncio.sleep(30)          # far longer than the watchdog budget
+        await asyncio.sleep(1)           # far longer than the 0.2 s test budget
         return SkillResult(True, "unreachable")
 
 
@@ -118,6 +118,24 @@ async def test_a_planner_without_warmup_does_not_break_startup(stack: DemoStack)
 # --------------------------------------------------------------------------- #
 # 1 — a session must always end, whatever happens to it                        #
 # --------------------------------------------------------------------------- #
+
+
+def test_active_work_deadline_is_hard_capped_at_five_seconds(stack: DemoStack):
+    """Old runtime files may still say 300 seconds; the product SLO wins."""
+    orch = stack.build_orchestrator()
+    orch.cfg.session.max_session_seconds = 300.0
+    assert orch._session_budget_seconds() == 5.0
+
+
+async def test_open_youtube_uses_the_instant_browser_path(stack: DemoStack):
+    """The exact reported command never invokes AppleScript app resolution."""
+    orch = stack.build_orchestrator()
+    started = time.monotonic()
+    await orch.submit_text("open youtube")
+    assert time.monotonic() - started < 1.0
+    assert orch.state == "armed"
+    assert ("open", "https://www.youtube.com") in orch.bridge.calls
+    assert not any(kind == "osascript" for kind, _ in orch.bridge.calls)
 
 
 async def test_cancelled_session_still_returns_to_armed(stack: DemoStack):
@@ -313,6 +331,24 @@ async def test_no_second_capture_after_a_voice_session(stack: DemoStack):
     await orch.stop()
 
 
+def test_mac_bridge_turns_command_timeouts_into_results(monkeypatch):
+    """An unanswered TCC dialog is a failure result, never a frozen worker."""
+    import subprocess
+
+    from aura.skills.base import COMMAND_TIMEOUT_SECONDS, MacBridge
+
+    def expire(*args, **kwargs):
+        assert kwargs["timeout"] <= COMMAND_TIMEOUT_SECONDS
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", expire)
+    bridge = MacBridge()
+    ok, message = bridge.osascript('tell application "Finder" to activate')
+    assert ok is False and "four seconds" in message
+    ok, message = bridge.run(["open", "https://www.youtube.com"], timeout=99)
+    assert ok is False and "four seconds" in message
+
+
 async def test_event_loop_survives_a_blocking_skill(stack: DemoStack):
     """Skills must not run on the event loop: `osascript` can block for its
     whole timeout while a TCC dialog waits, and that used to freeze the
@@ -359,6 +395,37 @@ async def test_event_loop_survives_a_blocking_skill(stack: DemoStack):
 # --------------------------------------------------------------------------- #
 
 
+async def test_microphone_grant_hot_attaches_stream_without_restart(stack: DemoStack, monkeypatch):
+    """Onboarding grants TCC after engine startup; SilentMic must be replaced."""
+    import aura.orchestrator as orchestrator_module
+    from aura.audio import SilentMic
+
+    started = []
+
+    class FakeMic:
+        def __init__(self, loop, on_frame):
+            self.loop = loop
+            self.on_frame = on_frame
+
+        def start(self):
+            started.append(True)
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(orchestrator_module, "MicStream", FakeMic)
+    orch = stack.build_orchestrator()
+    orch._loop = asyncio.get_running_loop()
+    orch._mic = SilentMic(orch._loop, orch._on_audio_frame)
+    orch._has_audio = False
+
+    ready, message = await orch.ensure_microphone()
+    assert ready is True and "ready" in message.lower()
+    assert started == [True]
+    assert isinstance(orch._mic, FakeMic)
+    assert orch._has_audio is True
+
+
 async def test_wake_studio_records_samples_through_the_audio_loop(stack: DemoStack):
     """"Record a sample" must actually capture audio.
 
@@ -379,6 +446,29 @@ async def test_wake_studio_records_samples_through_the_audio_loop(stack: DemoSta
 
     status = orch.training_status()
     assert status["count"] == 1, f"no sample captured: {status}"
+    await orch.stop()
+
+
+async def test_wake_studio_no_speech_returns_visible_failure(stack: DemoStack, monkeypatch):
+    """A record tap cannot remain silently armed forever."""
+    monkeypatch.setattr("aura.orchestrator.TRAIN_CAPTURE_TIMEOUT_SECONDS", 0.05)
+    orch = stack.build_orchestrator()
+    orch._has_audio = True
+    await orch.start()
+    sid = orch.bus.subscribe_async()
+
+    assert orch.training_start("Hey Aura")["ok"] is True
+    assert orch.training_capture()["ok"] is True
+    assert orch.training_capture()["ok"] is False  # duplicate tap is explicit
+    await asyncio.sleep(0.1)
+
+    status = orch.training_status()
+    assert status["listening"] is False
+    assert status["count"] == 0
+    events = orch.bus.drain(sid)
+    failures = [ev for ev in events if ev.type == "train_sample" and not ev.data["ok"]]
+    assert failures and "didn't hear" in failures[-1].data["message"]
+    orch.bus.unsubscribe_async(sid)
     await orch.stop()
 
 

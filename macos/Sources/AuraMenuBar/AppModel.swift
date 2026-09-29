@@ -106,6 +106,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var activity: [HistoryEntry] = []
     @Published private(set) var metrics: EngineMetrics?
     @Published private(set) var training: WakeTraining?
+    @Published private(set) var isStartingTraining = false
+    @Published private(set) var isFinishingTraining = false
     @Published private(set) var setupProgress: [String: String] = [:]
     @Published private(set) var messages: [PanelMessage] = []
     @Published private(set) var liveActions: [LiveAction] = []
@@ -172,23 +174,33 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// The engine owns the truth about what it is doing. If the panel has
-    /// been "busy" for a long time — a dropped SSE frame, a restarted engine —
-    /// ask the engine what it is actually doing instead of showing a
-    /// "Thinking…" that never resolves.
+    /// UI-side backstop for the engine's five-second active-work deadline.
+    /// One timer spans planning → executing; phase changes must not restart it.
+    /// If SSE drops at exactly the wrong moment, the user still never stares at
+    /// a permanent “Thinking…”.
     private func watchForStall() {
-        stallTask?.cancel()
-        guard isBusy else { return }
+        let activeWork = ["planning", "executing", "responding"].contains(phase)
+        guard activeWork else {
+            stallTask?.cancel()
+            stallTask = nil
+            return
+        }
+        guard stallTask == nil else { return }
         stallTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 90_000_000_000)
-            guard !Task.isCancelled, let self else { return }
-            let snapshot = try? await self.client.state()
-            guard let snapshot, snapshot.state != self.phase else { return }
-            // The engine already moved on — catch up and drop the placeholder.
-            self.phase = snapshot.state
-            if snapshot.state == "armed" {
-                self.proposal = nil
-                self.messages.removeAll { $0.text == "Thinking…" && $0.role == .aura }
+            do { try await Task.sleep(nanoseconds: 5_000_000_000) }
+            catch { return }
+            guard !Task.isCancelled, let self, self.thinkingMessageID != nil else { return }
+
+            // Deliver the deadline locally first; a state refresh must not add
+            // network latency to the product's visible response guarantee.
+            self.stallTask = nil
+            self.appendAura("That took too long (over five seconds), so I stopped waiting. Please try again.",
+                            failed: true)
+            let snapshot = try? await self.client.state(timeout: 1)
+            if let snapshot {
+                self.state = snapshot
+                self.phase = snapshot.state
+                if snapshot.state == "armed" { self.proposal = nil }
             }
         }
     }
@@ -245,7 +257,12 @@ final class AppModel: ObservableObject {
             let text = event.text ?? ""
             if !text.isEmpty {
                 let failed = (event.data["outcome"]?.stringValue ?? "ok") == "failed"
-                appendAura(text, failed: failed)
+                let isDeadline = text.localizedCaseInsensitiveContains("five seconds")
+                let alreadyShowedDeadline = messages.last?.failed == true
+                    && messages.last?.text.localizedCaseInsensitiveContains("five seconds") == true
+                if !isDeadline || !alreadyShowedDeadline {
+                    appendAura(text, failed: failed)
+                }
             }
 
         case "hint":
@@ -258,24 +275,27 @@ final class AppModel: ObservableObject {
             }
 
         case "train_update":
-            training = WakeTraining(active: (event.data["phase"]?.stringValue ?? "idle") != "idle"
-                                    && (event.data["phase"]?.stringValue ?? "") != "done",
-                                    phrase: event.data["phrase"]?.stringValue,
-                                    count: event.data["count"]?.intValue,
-                                    need: event.data["need"]?.intValue,
-                                    listening: nil)
-            if let phase = event.data["phase"]?.stringValue, phase == "done" {
+            let trainingPhase = event.data["phase"]?.stringValue ?? "idle"
+            let prior = training
+            training = WakeTraining(active: trainingPhase != "idle" && trainingPhase != "done",
+                                    phrase: event.data["phrase"]?.stringValue ?? prior?.phrase,
+                                    count: event.data["count"]?.intValue ?? prior?.count,
+                                    need: event.data["need"]?.intValue ?? prior?.need,
+                                    listening: trainingPhase == "listening")
+            if trainingPhase == "done" {
                 let threshold = event.data["threshold"]?.doubleValue
                 toast("Wake phrase trained" + (threshold.map { String(format: " (confidence %.2f)", $0) } ?? ""),
                       kind: .success)
             }
 
         case "train_sample":
-            if let message = event.message { toast(message, kind: (event.data["ok"]?.boolValue ?? true) ? .info : .warning) }
+            if let message = event.message {
+                toast(message, kind: (event.data["ok"]?.boolValue ?? true) ? .success : .warning)
+            }
             training = WakeTraining(active: true,
                                     phrase: training?.phrase,
-                                    count: event.data["count"]?.intValue,
-                                    need: event.data["need"]?.intValue,
+                                    count: event.data["count"]?.intValue ?? training?.count,
+                                    need: event.data["need"]?.intValue ?? training?.need,
                                     listening: false)
 
         case "setup_progress":
@@ -317,6 +337,8 @@ final class AppModel: ObservableObject {
     }
 
     private func appendAura(_ text: String, failed: Bool) {
+        stallTask?.cancel()
+        stallTask = nil
         thinkingMessageID = nil
         messages.removeAll { $0.text == "Thinking…" && $0.role == .aura }
         messages.append(PanelMessage(role: .aura, text: text, failed: failed))
@@ -454,7 +476,7 @@ final class AppModel: ObservableObject {
         metrics = try? await metricsTask
 
         let trainingSnapshot = try? await trainingTask
-        if let trainingSnapshot, trainingSnapshot.active { training = trainingSnapshot }
+        if let trainingSnapshot { training = trainingSnapshot.active ? trainingSnapshot : nil }
     }
 
     private func refreshAfterSession() async {
@@ -479,6 +501,11 @@ final class AppModel: ObservableObject {
         permissions = try? await client.permissions()
         let snapshot = try? await client.state()
         if let snapshot { state = snapshot }
+    }
+
+    private func refreshTraining() async {
+        let snapshot = try? await client.training()
+        if let snapshot { training = snapshot.active ? snapshot : nil }
     }
 
     // MARK: - settings
@@ -545,11 +572,23 @@ final class AppModel: ObservableObject {
     func requestPermission(_ target: String) {
         toast("Asking macOS…", kind: .info)
         Task {
+            if target == "microphone" {
+                let granted = await Permissions.requestMicrophone()
+                if !granted {
+                    toast("Allow Aura under System Settings › Privacy & Security › Microphone.",
+                          kind: .warning)
+                    await refreshPermissions()
+                    return
+                }
+            }
             do {
+                // The engine may have started with SilentMic before the native
+                // TCC answer. This call both verifies the device and hot-attaches
+                // the real stream; no engine restart is required.
                 let answer = try await client.requestPermission(target)
                 toast(answer.message ?? "Checked.", kind: answer.ok ? .success : .warning)
             } catch {
-                toast("Couldn't reach Aura's engine. Is it running?", kind: .failure)
+                toast(error.localizedDescription, kind: .failure)
             }
             await refreshPermissions()
         }
@@ -618,7 +657,10 @@ final class AppModel: ObservableObject {
     // MARK: - wake phrase studio
 
     func beginTraining(_ phrase: String) {
+        guard !isStartingTraining && !isFinishingTraining else { return }
+        isStartingTraining = true
         Task {
+            defer { isStartingTraining = false }
             do {
                 let start = try await client.startTraining(phrase: phrase)
                 if start.ok == false {
@@ -627,56 +669,77 @@ final class AppModel: ObservableObject {
                 }
                 training = WakeTraining(active: true, phrase: phrase.lowercased(),
                                         count: 0, need: start.need ?? 6, listening: false)
-                toast("Say your phrase when you're ready.", kind: .info)
+                toast("Ready — tap Record, then say your phrase.", kind: .info)
             } catch {
-                toast("Couldn't reach Aura's engine — is it running?", kind: .failure)
+                toast(error.localizedDescription, kind: .failure)
             }
         }
     }
 
     func captureTrainingSample() {
+        guard let current = training, current.active, current.listening != true,
+              !isFinishingTraining else { return }
+
+        // Flip the UI synchronously, before even the loopback request. The tap
+        // therefore always has visible feedback and duplicate taps are blocked.
+        training = WakeTraining(active: true, phrase: current.phrase,
+                                count: current.count, need: current.need,
+                                listening: true)
+        toast("Listening… say it now.", kind: .info)
         Task {
             do {
                 let capture = try await client.captureSample()
                 if capture.ok == false {
                     toast(capture.message ?? "Couldn't record that.", kind: .warning)
-                    return
+                    await refreshTraining()
                 }
-                // Show "Recording…" so the tap visibly did something.
-                training = WakeTraining(active: true, phrase: training?.phrase,
-                                        count: training?.count, need: training?.need,
-                                        listening: true)
-                toast("Listening… say it now.", kind: .info)
             } catch {
-                toast("Couldn't reach Aura's engine — is it running?", kind: .failure)
+                toast(error.localizedDescription, kind: .failure)
+                await refreshTraining()
             }
         }
     }
 
     func finishTraining() {
+        guard !isFinishingTraining, training?.listening != true else { return }
+        isFinishingTraining = true
         toast("Training your phrase…", kind: .info)
         Task {
+            defer { isFinishingTraining = false }
             do {
                 let finish = try await client.finishTraining()
                 if finish.ok == false {
+                    // Keep the accepted samples on screen so the user can fix
+                    // the problem or retry; the old UI discarded everything.
                     toast(finish.message ?? "Training didn't take.", kind: .warning)
-                } else {
-                    toast("Trained — Aura now listens for your phrase.", kind: .success)
+                    await refreshTraining()
+                    return
                 }
+                training = nil
+                toast("Trained — Aura now listens for your phrase.", kind: .success)
+                await refreshPermissions()
+                await refreshConfig()
             } catch {
-                toast("Couldn't reach Aura's engine — is it running?", kind: .failure)
+                toast(error.localizedDescription, kind: .failure)
+                await refreshTraining()
             }
-            training = nil
-            await refreshPermissions()
-            await refreshConfig()
         }
     }
 
     func cancelTraining() {
+        guard !isFinishingTraining else { return }
+        training = nil
         Task {
-            do { _ = try await client.cancelTraining() }
-            catch { toast("Couldn't reach Aura's engine.", kind: .warning) }
-            training = nil
+            do {
+                let result = try await client.cancelTraining()
+                if result.ok == false {
+                    toast(result.message ?? "Couldn't start over.", kind: .warning)
+                    await refreshTraining()
+                }
+            } catch {
+                toast(error.localizedDescription, kind: .warning)
+                await refreshTraining()
+            }
             await refreshPermissions()
         }
     }

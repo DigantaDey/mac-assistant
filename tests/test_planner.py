@@ -83,7 +83,7 @@ class TestReflexCoverage:
 
     ROUTES: ClassVar = [
         # the same request, said the way people say it
-        ("can you fire up youtube please", "system.open_app"),
+        ("can you fire up youtube please", "browser.open_url"),
         ("launch notes", "system.open_app"),
         ("pull up calculator", "system.open_app"),
         ("switch to spotify", "system.open_app"),
@@ -125,6 +125,21 @@ class TestReflexCoverage:
         """_ensure_url (and its POPULAR table) expect a lowercase host."""
         plan = await MockPlanner("").plan("open GitHub.com", {})
         assert plan.actions[0].args["url"] == "github.com"
+
+    @pytest.mark.parametrize("text,target", [
+        ("open youtube", "youtube"),
+        ("go to Gmail", "gmail"),
+        ("pull up reddit please", "reddit"),
+    ])
+    async def test_popular_sites_never_route_to_osascript(self, text, target):
+        """A popular site is not assumed to be an installed Mac app.
+
+        AppleScript app resolution can wait on UI/permissions; browser.open_url
+        is deterministic and returns inside the response budget.
+        """
+        plan = await MockPlanner("").plan(text, {})
+        assert plan.actions[0].skill == "browser.open_url"
+        assert plan.actions[0].args == {"url": target}
 
     async def test_a_partly_routable_chain_is_marked_incomplete(self):
         """"open notes and refactor the kernel": placing the first half and

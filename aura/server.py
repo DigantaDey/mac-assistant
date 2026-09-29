@@ -319,6 +319,20 @@ class AuraServer:
                     target = str(body.get("target", ""))
                     if target == "microphone":
                         status, msg = orch.run_blocking(perms.request_microphone)
+                        if status == "ok":
+                            # Permission can be granted after startup, when the
+                            # engine is still holding SilentMic. Attach the real
+                            # stream now so Wake Phrase Studio works immediately.
+                            future = asyncio.run_coroutine_threadsafe(
+                                orch.ensure_microphone(), loop)
+                            try:
+                                ready, live_msg = future.result(timeout=5)
+                                status = "ok" if ready else "denied"
+                                msg = live_msg
+                            except Exception:
+                                future.cancel()
+                                status = "denied"
+                                msg = "Microphone was allowed, but Aura could not attach it."
                     elif target == "accessibility":
                         status, msg = orch.run_blocking(perms.request_accessibility)
                     elif target == "automation":
@@ -388,9 +402,11 @@ class AuraServer:
                     future = asyncio.run_coroutine_threadsafe(
                         orch.training_finish(), loop)
                     try:
-                        self._json(future.result(timeout=120))
+                        self._json(future.result(timeout=4.5))
                     except Exception:
-                        self._json({"ok": False, "message": "training timed out"}, 503)
+                        future.cancel()
+                        self._json({"ok": False,
+                                    "message": "Training exceeded five seconds — try again."}, 503)
                 else:
                     self._json({"ok": False, "error": "not found"}, 404)
 

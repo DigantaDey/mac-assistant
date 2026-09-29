@@ -51,7 +51,7 @@ public final class EngineClient: @unchecked Sendable {
     private let session: URLSession
     private let decoder = JSONDecoder()
 
-    public init(endpoint: EngineEndpoint, timeout: TimeInterval = 8,
+    public init(endpoint: EngineEndpoint, timeout: TimeInterval = 5,
                 sessionConfiguration: URLSessionConfiguration? = nil) {
         self.endpoint = endpoint
         let configuration = sessionConfiguration ?? URLSessionConfiguration.ephemeral
@@ -72,7 +72,9 @@ public final class EngineClient: @unchecked Sendable {
         try await get("/api/health", timeout: timeout)
     }
 
-    public func state() async throws -> EngineState { try await get("/api/state") }
+    public func state(timeout: TimeInterval? = nil) async throws -> EngineState {
+        try await get("/api/state", timeout: timeout)
+    }
     public func permissions() async throws -> PermissionsSnapshot { try await get("/api/permissions") }
     public func config() async throws -> EngineConfig { try await get("/api/config") }
     public func metrics() async throws -> EngineMetrics { try await get("/api/metrics") }
@@ -134,13 +136,15 @@ public final class EngineClient: @unchecked Sendable {
     @discardableResult
     public func captureSample() async throws -> EngineReply { try await post("/api/wake/train/capture") }
     @discardableResult
-    public func finishTraining() async throws -> EngineReply { try await post("/api/wake/train/finish", timeout: 130) }
+    public func finishTraining() async throws -> EngineReply {
+        try await post("/api/wake/train/finish", timeout: 5)
+    }
     @discardableResult
     public func cancelTraining() async throws -> EngineReply { try await post("/api/wake/train/cancel") }
 
     @discardableResult
     public func requestPermission(_ target: String) async throws -> EngineReply {
-        try await post("/api/permissions/request", body: ["target": target], timeout: 120)
+        try await post("/api/permissions/request", body: ["target": target], timeout: 5)
     }
 
     @discardableResult

@@ -540,9 +540,15 @@ private struct WakeSection: View {
                 TextField("e.g. Hey Aura", text: $phrase)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 12))
-                Button("Train", action: beginTraining)
-                    .auraButton(prominent: true)
-                    .disabled(phrase.trimmingCharacters(in: .whitespaces).count < 2)
+                Button(action: beginTraining) {
+                    HStack(spacing: 5) {
+                        if model.isStartingTraining { ProgressView().controlSize(.small) }
+                        Text(model.isStartingTraining ? "Starting…" : "Set up")
+                    }
+                }
+                .auraButton(prominent: true)
+                .disabled(phrase.trimmingCharacters(in: .whitespaces).count < 2
+                          || model.isStartingTraining || model.training?.active == true)
             }
 
             if let training = model.training, training.active {
@@ -559,16 +565,38 @@ private struct WakeSection: View {
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 Text(training.listening == true
-                     ? "Recording…"
-                     : "Record each take, naturally, as you'd really say it.")
+                     ? "Recording… say the phrase now (stops automatically)."
+                     : "Record each take naturally. Every tap finishes or reports a problem within five seconds.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                 HStack(spacing: 8) {
-                    Button("Record a sample") { model.captureTrainingSample() }
-                        .auraButton(prominent: true)
-                    Button("Train phrase") { model.finishTraining() }
+                    Button {
+                        model.captureTrainingSample()
+                    } label: {
+                        HStack(spacing: 5) {
+                            if training.listening == true { ProgressView().controlSize(.small) }
+                            Text(training.listening == true ? "Recording…" : "Record a sample")
+                        }
+                    }
+                    .auraButton(prominent: true)
+                    .disabled(training.listening == true
+                              || (training.count ?? 0) >= (training.need ?? 6)
+                              || model.isFinishingTraining)
+
+                    Button {
+                        model.finishTraining()
+                    } label: {
+                        HStack(spacing: 5) {
+                            if model.isFinishingTraining { ProgressView().controlSize(.small) }
+                            Text(model.isFinishingTraining ? "Training…" : "Train phrase")
+                        }
+                    }
+                    .auraButton()
+                    .disabled((training.count ?? 0) < 3 || training.listening == true
+                              || model.isFinishingTraining)
+
+                    Button("Start over") { model.cancelTraining() }
                         .auraButton()
-                        .disabled((training.count ?? 0) < 3)
-                    Button("Start over") { model.cancelTraining() }.auraButton()
+                        .disabled(model.isFinishingTraining)
                 }
             }
 

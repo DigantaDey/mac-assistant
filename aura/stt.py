@@ -71,21 +71,28 @@ class WhisperCppSTT(STTEngine):
             proc = subprocess.run(
                 [self.bin, "-m", self.model, "-f", "-",
                  "-l", self.language, "-nt", "-np"],
-                input=wav_data, capture_output=True, text=True, timeout=60,
+                input=wav_data, capture_output=True, timeout=4,
             )
-            return " ".join(proc.stdout.split()).strip()
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.decode(errors="replace")[:200])
+            return " ".join(proc.stdout.decode(errors="replace").split()).strip()
+        except subprocess.TimeoutExpired:
+            return ""
         except Exception:
             # Some whisper.cpp builds don't support stdin ("-" as filename).
-            # Fall back to the temp-file approach.
+            # Fall back to the temp-file approach, under the same deadline.
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 wav_path = Path(tmp.name)
             try:
                 _write_wav(pcm_frames, wav_path)
-                proc = subprocess.run(
-                    [self.bin, "-m", self.model, "-f", str(wav_path),
-                     "-l", self.language, "-nt", "-np"],
-                    capture_output=True, text=True, timeout=60,
-                )
+                try:
+                    proc = subprocess.run(
+                        [self.bin, "-m", self.model, "-f", str(wav_path),
+                         "-l", self.language, "-nt", "-np"],
+                        capture_output=True, text=True, timeout=4,
+                    )
+                except subprocess.TimeoutExpired:
+                    return ""
                 return " ".join(proc.stdout.split()).strip()
             finally:
                 wav_path.unlink(missing_ok=True)
