@@ -327,7 +327,7 @@ class TestRouting:
         assert plan.actions[0].args["target"] == "password field"
 
     def test_regular_commands_still_route(self, planner):
-        assert _plan(planner, "open youtube").actions[0].skill == "system.open_app"
+        assert _plan(planner, "open youtube").actions[0].skill == "browser.open_url"
         plan = _plan(planner, "open spotify and set volume to 30")
         assert [a.skill for a in plan.actions] == ["system.open_app",
                                                    "system.set_volume"]

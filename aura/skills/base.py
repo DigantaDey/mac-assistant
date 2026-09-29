@@ -19,6 +19,11 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
+# Skills are subprocess adapters. They must return before the orchestrator's
+# five-second active-work deadline, including when macOS leaves an Automation
+# consent dialog unanswered.
+COMMAND_TIMEOUT_SECONDS = 4.0
+
 
 @dataclass
 class SkillSpec:
@@ -105,12 +110,24 @@ class MacBridge:
     platform = "mac"
 
     def osascript(self, script: str) -> tuple[bool, str]:
-        proc = subprocess.run(["osascript", "-e", script],
-                              capture_output=True, text=True, timeout=30)
+        try:
+            proc = subprocess.run(
+                ["osascript", "-e", script], capture_output=True, text=True,
+                timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return False, ("macOS did not answer within four seconds — check for an "
+                           "Automation permission dialog")
         return proc.returncode == 0, (proc.stdout or proc.stderr).strip()
 
-    def run(self, argv: list[str], timeout: int = 30) -> tuple[bool, str]:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    def run(self, argv: list[str], timeout: float = COMMAND_TIMEOUT_SECONDS) -> tuple[bool, str]:
+        # A caller may ask for a shorter timeout, never a longer one. This is a
+        # product deadline, not a suggestion hidden in configuration.
+        timeout = max(0.1, min(float(timeout), COMMAND_TIMEOUT_SECONDS))
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return False, "the system command did not answer within four seconds"
         return proc.returncode == 0, (proc.stdout or proc.stderr).strip()
 
     def open_url(self, url: str) -> tuple[bool, str]:
@@ -142,7 +159,7 @@ class DryRunBridge(MacBridge):
         self.calls.append(("osascript", script))
         return True, f"[dry-run] osascript: {script[:120]}"
 
-    def run(self, argv: list[str], timeout: int = 30) -> tuple[bool, str]:
+    def run(self, argv: list[str], timeout: float = COMMAND_TIMEOUT_SECONDS) -> tuple[bool, str]:
         self.calls.append(("run", " ".join(argv)))
         return True, f"[dry-run] {' '.join(argv[:4])}"
 

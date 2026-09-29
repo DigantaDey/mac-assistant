@@ -4,7 +4,7 @@ Ship order matters: each stage is usable on its own, and every stage widens
 the moat (offline + personal + fast) before Apple's Siri V2 closes the
 mainstream gap.
 
-**Current release: v0.6.0 — the native macOS app** (✅ shipped; see below).
+**Current release: v0.6.1 — the native macOS app** (✅ shipped; see below).
 
 ## v0.1 — Foundation ✅
 - [x] Orchestrator state machine with confirmation as a real state

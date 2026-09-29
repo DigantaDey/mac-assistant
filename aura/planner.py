@@ -26,6 +26,19 @@ except Exception:  # pragma: no cover - depends on host
 
 RISKS = ("safe", "confirm")
 
+# Product latency contract. The orchestrator owns the five-second end-to-end
+# deadline; the model gets a smaller slice so fallback and UI delivery still
+# fit inside it. This cap deliberately wins over stale user configuration.
+MAX_MODEL_SECONDS = 4.0
+
+# Names people mean as websites, not locally installed applications. Keep the
+# URL resolution itself in the browser skill; the planner only picks the right
+# execution surface. In particular, `tell application "YouTube"` can make
+# macOS wait for an app-selection/Automation dialog when no such app exists.
+POPULAR_SITES = {
+    "youtube", "github", "gmail", "google", "maps", "calendar", "whatsapp", "reddit",
+}
+
 
 @dataclass
 class Action:
@@ -187,7 +200,7 @@ class OpenAICompatPlanner(Planner):
         self.model = cfg.planner.model
         self.api_key = cfg.planner.api_key
         self.temperature = cfg.planner.temperature
-        self.timeout = cfg.planner.timeout_seconds
+        self.timeout = max(0.1, min(float(cfg.planner.timeout_seconds), MAX_MODEL_SECONDS))
         self.max_actions = cfg.planner.max_actions
         self.system = render_system_prompt(catalog_prompt, cfg.planner.max_actions)
         # Few-shot anchors keep tiny models on-format.
@@ -334,7 +347,10 @@ class HybridPlanner(Planner):
                 json={"model": self.llm.model,
                       "messages": [{"role": "user", "content": "hi"}],
                       "max_tokens": 1, "temperature": 0.0},
-                timeout=httpx.Timeout(300.0, connect=3.0),
+                # Warm-up must never monopolise Ollama while a real command
+                # waits behind it. A cold load may continue server-side, but
+                # Aura's own worker is released within the same model budget.
+                timeout=httpx.Timeout(MAX_MODEL_SECONDS, connect=1.0),
             )
             return resp.status_code == 200
         except Exception as exc:
@@ -404,7 +420,10 @@ class MockPlanner(Planner):
 
     @staticmethod
     def _title_case(name: str) -> str:
-        return " ".join(w.capitalize() for w in name.strip().split())
+        clean = " ".join(name.strip().split())
+        brands = {"youtube": "YouTube", "github": "GitHub", "gmail": "Gmail",
+                  "whatsapp": "WhatsApp", "reddit": "Reddit"}
+        return brands.get(clean.lower(), " ".join(w.capitalize() for w in clean.split()))
 
     async def plan(self, transcript: str, context: dict[str, Any]) -> Plan:
         started = time.monotonic()
@@ -455,8 +474,13 @@ class MockPlanner(Planner):
                      "web, manage tabs and clipboard, remember facts, and more — ask away.")
         elif m := re.search(r"open (?:the )?(?:app )?(.+?)(?: and|$)", t):
             app = self._title_case(m.group(1))
-            if "." in app:  # a domain, not an app → browser skill
-                actions.append(Action("browser.open_url", {"url": app.lower()},
+            target = app.lower()
+            if "." in app or target in POPULAR_SITES:
+                # “Open YouTube” means the website for the overwhelming
+                # majority of Mac users. Route it to `open <url>` instead of
+                # AppleScript, which can block while looking for a nonexistent
+                # app or waiting on an Automation dialog.
+                actions.append(Action("browser.open_url", {"url": target},
                                       "safe", "opening site"))
                 reply = f"Opening {app}."
             else:
@@ -476,8 +500,9 @@ class MockPlanner(Planner):
         elif m := re.search(r"(?:open|launch|fire up|pull up|bring up|switch to|go to) "
                             r"(?:the )?(?:app )?(.+?)(?: and|$)", t):
             app = self._title_case(m.group(1))
-            if "." in app:  # a domain, not an app → browser skill
-                actions.append(Action("browser.open_url", {"url": app.lower()},
+            target = app.lower()
+            if "." in app or target in POPULAR_SITES:
+                actions.append(Action("browser.open_url", {"url": target},
                                       "safe", "opening site"))
                 reply = f"Opening {app}."
             else:

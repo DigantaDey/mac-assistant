@@ -212,8 +212,11 @@ class MacAXTree:
             return False
         import subprocess
         script = f'tell application "System Events" to keystroke {text!r}'
-        proc = subprocess.run(["osascript", "-e", script],
-                              capture_output=True, text=True, timeout=15)
+        try:
+            proc = subprocess.run(["osascript", "-e", script],
+                                  capture_output=True, text=True, timeout=4)
+        except subprocess.TimeoutExpired:
+            return False
         return proc.returncode == 0
 
 

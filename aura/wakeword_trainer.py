@@ -11,8 +11,8 @@ flow:
                  only, and the exact same function used at detection time —
                  so what you train on is literally what it listens for.
   3. Separate  — a linear scorer fitted to maximize the margin between the
-                 user's samples and negatives (synthesized noise, sweeps,
-                 and on a Mac, locally spoken distractors via `say`).
+                 user's samples and deterministic synthesized noise, sweeps,
+                 hum and speech-like distractors (no slow subprocesses).
   4. Ship      — the template + scorer threshold export as one small .npz
                  (<100 KB), loaded by TemplateWakeEngine. Nothing leaves
                  the machine; there is nothing to send.
@@ -276,7 +276,12 @@ def train_wake(positives: list, negatives: list | None = None) -> TrainedWake:
 
     negs = list(negatives or [])
     negs += synth_negatives()
-    negs += synth_speech_negatives()
+    # Do not render extra phrases with the macOS `say` subprocess here. That
+    # used to put three serial, potentially 30-second subprocesses behind the
+    # “Train phrase” button (and `say` may emit an AIFF container that Python's
+    # wave reader rejects anyway). User-supplied negatives remain supported,
+    # while deterministic spectral negatives keep this interactive fit below
+    # the product's five-second response budget.
     neg = np.stack([spectral_embedding(normalize_length(n)) for n in negs])
     neg = neg / np.maximum(np.linalg.norm(neg, axis=1, keepdims=True), 1e-9)
 

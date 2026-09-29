@@ -29,7 +29,7 @@ engine = "auto"               # auto | openai_compat | mock
 base_url = "http://127.0.0.1:11434/v1"   # Ollama default; mlx_lm/llama-server/LM Studio also work
 model = "qwen3:4b"
 temperature = 0.2
-timeout_seconds = 20.0
+timeout_seconds = 4.0         # leave one second for fallback + execution (5 s SLO)
 max_actions = 3
 
 [laya]
@@ -57,4 +57,5 @@ blocked_patterns = ["rm -rf /", "diskutil erase", "sudo dd"]
 max_utterance_seconds = 12.0
 end_of_speech_seconds = 0.7
 confirmation_timeout_seconds = 45.0
+max_session_seconds = 5.0     # active work only; confirmation wait is separate
 idle_unload_seconds = 180.0

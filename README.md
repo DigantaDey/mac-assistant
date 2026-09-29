@@ -91,6 +91,13 @@ Every outcome — done, you confirmed, you cancelled, you corrected — is
 recorded locally. That log is what the optional Laya fine-tune loop consumes
 (`scripts/nightly_laya.py`), so Aura's judgement improves from *your* choices.
 
+**Latency is a product contract:** everyday commands take the deterministic
+reflex path (for example, “open YouTube” opens the website directly), while an
+unfamiliar request may use the local model. Active planning and execution are
+hard-capped at five seconds; if macOS or the model does not answer, Aura says so
+and returns to Ready instead of leaving a permanent “Thinking…” message.
+Waiting for you to approve a risky action is the only deliberate exception.
+
 ---
 
 ## What Aura can do today

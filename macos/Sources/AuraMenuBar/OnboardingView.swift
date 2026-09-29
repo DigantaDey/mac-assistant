@@ -223,7 +223,12 @@ struct OnboardingView: View {
         guard !asked else { return }
         asked = true
         Task {
-            _ = await Permissions.requestMicrophone()
+            let microphoneAllowed = await Permissions.requestMicrophone()
+            if microphoneAllowed {
+                // The engine was launched before onboarding and may currently
+                // hold SilentMic. Hot-attach its stream after the native grant.
+                model.requestPermission("microphone")
+            }
             try? await Task.sleep(nanoseconds: 900_000_000)
             Permissions.requestAccessibility()
             refresh()
