@@ -22,7 +22,15 @@ from .audio import AudioFrame
 
 
 class EnergyVAD:
-    """Collect frames until `end_silence` of quiet follows real speech."""
+    """Collect frames until `end_silence` of quiet follows real speech.
+
+    Contract with the caller: `feed()` reports "end"/"timeout" and *then*
+    `pcm_frames()` hands over the utterance. The buffer therefore stays
+    readable after an "end" and is only cleared when the next utterance
+    starts — clearing it inside `feed()` (the old behaviour) gave every
+    caller an empty list, which silently broke both voice commands and the
+    Wake Phrase Studio.
+    """
 
     def __init__(
         self,
@@ -38,12 +46,14 @@ class EnergyVAD:
 
         self._preroll: deque[AudioFrame] = deque(maxlen=64)
         self._active = False
+        self._finished = False   # an utterance was reported; await a new one
         self._collected: list[AudioFrame] = []
         self._silence_run = 0.0
         self._active_seconds = 0.0
 
     def reset(self) -> None:
         self._active = False
+        self._finished = False
         self._collected.clear()
         self._silence_run = 0.0
         self._active_seconds = 0.0
@@ -57,6 +67,10 @@ class EnergyVAD:
 
     def feed(self, frame: AudioFrame) -> str:
         """Consume one frame; return "" | "start" | "end" | "timeout"."""
+        if self._finished:
+            # The previous utterance has been reported (and usually collected
+            # via pcm_frames()); start a fresh one now.
+            self.reset()
         if not self._active:
             self._preroll.append(frame)
             if self._rms(frame) >= self.threshold:
@@ -74,10 +88,13 @@ class EnergyVAD:
         else:
             self._silence_run = 0.0
         if self._silence_run >= self.end_silence:
-            self.reset()
+            # Report the utterance, but keep it readable for pcm_frames().
+            self._finished = True
+            self._active = False
             return "end"
         if self._active_seconds >= self.max_seconds:
-            self.reset()
+            self._finished = True
+            self._active = False
             return "timeout"
         return ""
 

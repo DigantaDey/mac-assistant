@@ -119,6 +119,7 @@ final class AppModel: ObservableObject {
 
     private var eventTask: Task<Void, Never>?
     private var toastTask: Task<Void, Never>?
+    private var stallTask: Task<Void, Never>?
     private var thinkingMessageID: UUID?
 
     init(token: String) {
@@ -171,6 +172,27 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// The engine owns the truth about what it is doing. If the panel has
+    /// been "busy" for a long time — a dropped SSE frame, a restarted engine —
+    /// ask the engine what it is actually doing instead of showing a
+    /// "Thinking…" that never resolves.
+    private func watchForStall() {
+        stallTask?.cancel()
+        guard isBusy else { return }
+        stallTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 90_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            let snapshot = try? await self.client.state()
+            guard let snapshot, snapshot.state != self.phase else { return }
+            // The engine already moved on — catch up and drop the placeholder.
+            self.phase = snapshot.state
+            if snapshot.state == "armed" {
+                self.proposal = nil
+                self.messages.removeAll { $0.text == "Thinking…" && $0.role == .aura }
+            }
+        }
+    }
+
     private func handle(_ event: EngineEvent) {
         switch event.type {
         case "state":
@@ -181,6 +203,7 @@ final class AppModel: ObservableObject {
                     proposal = nil
                     Task { await refreshAfterSession() }
                 }
+                watchForStall()
             }
 
         case "transcript":
@@ -596,26 +619,36 @@ final class AppModel: ObservableObject {
 
     func beginTraining(_ phrase: String) {
         Task {
-            let start = try? await client.startTraining(phrase: phrase)
-            if let reply = start, reply.ok == false {
-                toast(reply.message ?? "Couldn't start training.", kind: .warning)
-                return
-            }
-            if let reply = start, let need = reply.need {
+            do {
+                let start = try await client.startTraining(phrase: phrase)
+                if start.ok == false {
+                    toast(start.message ?? "Couldn't start training.", kind: .warning)
+                    return
+                }
                 training = WakeTraining(active: true, phrase: phrase.lowercased(),
-                                        count: 0, need: need, listening: false)
+                                        count: 0, need: start.need ?? 6, listening: false)
+                toast("Say your phrase when you're ready.", kind: .info)
+            } catch {
+                toast("Couldn't reach Aura's engine — is it running?", kind: .failure)
             }
-            toast("Say your phrase when you're ready.", kind: .info)
         }
     }
 
     func captureTrainingSample() {
         Task {
-            let capture = try? await client.captureSample()
-            if let reply = capture, reply.ok == false {
-                toast(reply.message ?? "Couldn't record that.", kind: .warning)
-            } else {
+            do {
+                let capture = try await client.captureSample()
+                if capture.ok == false {
+                    toast(capture.message ?? "Couldn't record that.", kind: .warning)
+                    return
+                }
+                // Show "Recording…" so the tap visibly did something.
+                training = WakeTraining(active: true, phrase: training?.phrase,
+                                        count: training?.count, need: training?.need,
+                                        listening: true)
                 toast("Listening… say it now.", kind: .info)
+            } catch {
+                toast("Couldn't reach Aura's engine — is it running?", kind: .failure)
             }
         }
     }
@@ -623,11 +656,15 @@ final class AppModel: ObservableObject {
     func finishTraining() {
         toast("Training your phrase…", kind: .info)
         Task {
-            let finish = try? await client.finishTraining()
-            if let reply = finish, reply.ok == false {
-                toast(reply.message ?? "Training didn't take.", kind: .warning)
-            } else {
-                toast("Trained — Aura now listens for your phrase.", kind: .success)
+            do {
+                let finish = try await client.finishTraining()
+                if finish.ok == false {
+                    toast(finish.message ?? "Training didn't take.", kind: .warning)
+                } else {
+                    toast("Trained — Aura now listens for your phrase.", kind: .success)
+                }
+            } catch {
+                toast("Couldn't reach Aura's engine — is it running?", kind: .failure)
             }
             training = nil
             await refreshPermissions()
@@ -637,7 +674,8 @@ final class AppModel: ObservableObject {
 
     func cancelTraining() {
         Task {
-            _ = try? await client.cancelTraining()
+            do { _ = try await client.cancelTraining() }
+            catch { toast("Couldn't reach Aura's engine.", kind: .warning) }
             training = nil
             await refreshPermissions()
         }

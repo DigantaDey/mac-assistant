@@ -307,6 +307,33 @@ class HybridPlanner(Planner):
                 "model": self.llm.model, "base_url": self.llm.base_url,
                 "last_error": self._last_error}
 
+    def warmup(self) -> bool:
+        """Load the local model before the user asks for anything.
+
+        A cold Ollama spends tens of seconds loading qwen3:4b on the first
+        request — which is precisely the "it's still thinking" the user feels.
+        One token of work, in the background at engine start, moves that cost
+        off the first command. Best-effort: returns False and stays silent
+        when there is no model server to warm.
+        """
+        if not self.probe():
+            return False
+        try:
+            client = self._get_probe_client()
+            resp = client.post(
+                f"{self.llm.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.llm.api_key}"},
+                json={"model": self.llm.model,
+                      "messages": [{"role": "user", "content": "hi"}],
+                      "max_tokens": 1, "temperature": 0.0},
+                timeout=httpx.Timeout(300.0, connect=3.0),
+            )
+            return resp.status_code == 200
+        except Exception as exc:
+            self._online = False
+            self._last_error = str(exc).splitlines()[0][:160]
+            return False
+
     async def plan(self, transcript: str, context: dict[str, Any]) -> Plan:
         # Run the synchronous probe in an executor so it doesn't block the
         # event loop while waiting for the HTTP health check.
