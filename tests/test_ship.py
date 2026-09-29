@@ -47,10 +47,83 @@ class TestHybridPlanner:
         planner = build_planner(cfg, reg.catalog_prompt())
 
         assert planner.probe() is False
+        # Routed by the rules without ever needing the model …
         plan = asyncio.run(planner.plan("open spotify", {}))
-        assert plan.degraded is True
         assert plan.actions and plan.actions[0].skill == "system.open_app"
+        assert plan.source == "rules"
+        assert plan.degraded is False        # a reflex is not a degraded answer
+        # … and what the rules cannot route still gets an honest reply.
+        plan = asyncio.run(planner.plan("refactor the kernel", {}))
+        assert not plan.actions
+        assert plan.degraded is True
         assert planner.status["online"] is False
+
+    def test_routed_commands_never_touch_the_model(self, monkeypatch, tmp_path):
+        """The latency promise: an everyday command is answered by the rules,
+        so a slow — or absent — model server cannot slow it down."""
+        from aura.planner import build_planner
+        from aura.skills import build_default_registry
+
+        cfg = self.make_cfg(monkeypatch, tmp_path)
+        reg = build_default_registry()
+        planner = build_planner(cfg, reg.catalog_prompt())
+
+        def exploding_plan(transcript, context):      # pragma: no cover
+            raise AssertionError("the model must not be consulted")
+
+        planner.llm.plan = exploding_plan
+        planner.probe = lambda: True
+
+        for text, skill in [("open spotify", "system.open_app"),
+                            ("set volume to 30", "system.set_volume"),
+                            ("open spotify and set volume to 30", "system.set_volume")]:
+            plan = asyncio.run(planner.plan(text, {}))
+            assert plan.source == "rules", text
+            assert any(a.skill == skill for a in plan.actions), text
+            assert plan.latency_ms < 50, text
+
+    def test_unroutable_commands_reach_the_model(self, monkeypatch, tmp_path):
+        """The model keeps its job: the requests the rules cannot place."""
+        from aura.planner import build_planner
+        from aura.skills import build_default_registry
+
+        cfg = self.make_cfg(monkeypatch, tmp_path)
+        reg = build_default_registry()
+        planner = build_planner(cfg, reg.catalog_prompt())
+
+        class FakeLLM:
+            async def plan(self, transcript, context):
+                from aura.planner import Action, Plan
+                return Plan(reply="Done.", actions=[Action("system.open_app",
+                                                           {"app": "Notes"})])
+
+        planner.llm = FakeLLM()
+        planner.probe = lambda: True
+        plan = asyncio.run(planner.plan("refactor the kernel", {}))
+        assert plan.source == "llm"
+        assert plan.degraded is False
+        assert plan.actions[0].skill == "system.open_app"
+
+    def test_a_partial_rule_match_is_handed_to_the_model(self, monkeypatch, tmp_path):
+        """'open notes and refactor the kernel': the rules can place the first
+        half only, and silently dropping the second half is not an answer."""
+        from aura.planner import build_planner
+        from aura.skills import build_default_registry
+
+        cfg = self.make_cfg(monkeypatch, tmp_path)
+        reg = build_default_registry()
+        planner = build_planner(cfg, reg.catalog_prompt())
+
+        class FakeLLM:
+            async def plan(self, transcript, context):
+                from aura.planner import Plan
+                return Plan(reply="Opened Notes.")
+
+        planner.llm = FakeLLM()
+        planner.probe = lambda: True
+        plan = asyncio.run(planner.plan("open notes and refactor the kernel", {}))
+        assert plan.source == "llm"
+        assert plan.reply == "Opened Notes."
 
     def test_mock_planner_is_never_degraded(self, tmp_path):
         from aura.planner import build_planner

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from aura.planner import MockPlanner, extract_json_object, parse_plan
@@ -69,3 +71,70 @@ class TestMockPlanner:
     async def test_destructive_flagged_confirm(self):
         plan = await MockPlanner("").plan("empty the trash", {})
         assert plan.actions[0].risk == "confirm"
+
+
+class TestReflexCoverage:
+    """The everyday commands people actually say.
+
+    The rules answer these in microseconds so a model round-trip is never on
+    the critical path. Every one of these used to fall through to "I don't
+    have a skill for that yet" — or worse, to a confidently wrong action.
+    """
+
+    ROUTES: ClassVar = [
+        # the same request, said the way people say it
+        ("can you fire up youtube please", "system.open_app"),
+        ("launch notes", "system.open_app"),
+        ("pull up calculator", "system.open_app"),
+        ("switch to spotify", "system.open_app"),
+        ("go to bbc.com", "browser.open_url"),
+        ("kill safari", "system.quit_app"),
+        ("shut down safari", "system.quit_app"),
+        ("force quit safari", "system.quit_app"),
+        ("record my screen", "system.start_recording"),
+        ("look up airport lounges online", "browser.search"),
+        ("google laya", "browser.search"),
+        ("search the web for cats", "browser.search"),
+        ("turn the screen down a notch", "system.brightness_down"),
+        ("make the display brighter", "system.brightness_up"),
+    ]
+
+    @pytest.mark.parametrize("text,skill", ROUTES)
+    async def test_routes(self, text, skill):
+        plan = await MockPlanner("").plan(text, {})
+        assert plan.actions, text
+        assert plan.actions[0].skill == skill, text
+        assert plan.source == "rules"
+        assert plan.complete is True, text
+
+    async def test_a_tab_is_not_an_application(self):
+        """The old bug: "close this tab" reached the quit-app rule and became
+        quit_app(app="This Tab"). A rule layer must fail by refusing."""
+        for text in ["close this tab", "shut this tab", "next tab",
+                     "gimme the next tab", "switch to the last tab"]:
+            plan = await MockPlanner("").plan(text, {})
+            assert not plan.actions, text
+            assert not any(a.skill == "system.quit_app" for a in plan.actions), text
+            assert "tab" in plan.reply.lower(), text
+
+    async def test_search_drops_the_trailing_online(self):
+        plan = await MockPlanner("").plan("look up airport lounges online", {})
+        assert plan.actions[0].args["query"] == "airport lounges"
+
+    async def test_a_url_is_lowercased(self):
+        """_ensure_url (and its POPULAR table) expect a lowercase host."""
+        plan = await MockPlanner("").plan("open GitHub.com", {})
+        assert plan.actions[0].args["url"] == "github.com"
+
+    async def test_a_partly_routable_chain_is_marked_incomplete(self):
+        """"open notes and refactor the kernel": placing the first half and
+        silently dropping the second is not an answer, so the plan says so and
+        HybridPlanner hands the whole request to the model."""
+        plan = await MockPlanner("").plan("open notes and refactor the kernel", {})
+        assert [a.skill for a in plan.actions] == ["system.open_app"]
+        assert plan.complete is False
+
+    async def test_a_fully_routable_chain_is_complete(self):
+        plan = await MockPlanner("").plan("open notes and then close safari", {})
+        assert [a.skill for a in plan.actions] == ["system.open_app", "system.quit_app"]
+        assert plan.complete is True
