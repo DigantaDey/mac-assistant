@@ -189,15 +189,34 @@ class OpenAICompatPlanner(Planner):
             '{"skill":"system.mute","args":{},"risk":"safe","why":"asked to mute"},'
             '{"skill":"system.open_app","args":{"app":"Safari"},"risk":"safe","why":"asked to open Safari"}]}'
         )
+        # Persistent client — reused across all requests (TCP connection keep-alive).
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Lazy-init a long-lived async client with connection pooling."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout, connect=3.0),
+                limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+            )
+        return self._client
+
+    async def close(self) -> None:
+        """Release the persistent client's connection pool."""
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
 
     async def plan(self, transcript: str, context: dict[str, Any]) -> Plan:
         messages: list[dict[str, str]] = [{"role": "system", "content": self.system}]
-        for turn in context.get("recent_turns", [])[-4:]:
-            messages.append({"role": turn["role"], "content": str(turn["content"])[:400]})
+        # Only the 2 most recent turns — reduces prompt tokens and speeds inference.
+        for turn in context.get("recent_turns", [])[-2:]:
+            messages.append({"role": turn["role"], "content": str(turn["content"])[:200]})
         messages.append({"role": "user", "content": transcript})
 
         started = time.monotonic()
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        client = self._get_client()
+        try:
             resp = await client.post(
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.api_key}"},
@@ -211,6 +230,10 @@ class OpenAICompatPlanner(Planner):
             )
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
+        except httpx.ConnectError:
+            # Connection refused → close the stale client so next call retries.
+            await self.close()
+            raise
         latency = int((time.monotonic() - started) * 1000)
         return parse_plan(extract_json_object(content), latency)
 
@@ -238,6 +261,16 @@ class HybridPlanner(Planner):
         self._online: bool = False
         self._last_probe = 0.0
         self._last_error = ""
+        # Persistent sync client for probes — avoids TCP teardown/setup per check.
+        self._probe_client: httpx.Client | None = None
+
+    def _get_probe_client(self) -> httpx.Client:
+        if self._probe_client is None or self._probe_client.is_closed:
+            self._probe_client = httpx.Client(
+                timeout=httpx.Timeout(1.5, connect=1.0),
+                limits=httpx.Limits(max_connections=2, max_keepalive_connections=1),
+            )
+        return self._probe_client
 
     # -- availability ------------------------------------------------------ #
 
@@ -250,14 +283,21 @@ class HybridPlanner(Planner):
             return self._online
         self._last_probe = now
         try:
-            with httpx.Client(timeout=1.5) as client:
-                resp = client.get(f"{self.llm.base_url}/models")
-                self._online = resp.status_code == 200
+            client = self._get_probe_client()
+            resp = client.get(f"{self.llm.base_url}/models")
+            self._online = resp.status_code == 200
             if self._online:
                 self._last_error = ""
         except Exception as exc:
             self._online = False
             self._last_error = str(exc).splitlines()[0][:160]
+            # Close stale probe client so next probe gets a fresh connection.
+            try:
+                if self._probe_client and not self._probe_client.is_closed:
+                    self._probe_client.close()
+                    self._probe_client = None
+            except Exception:
+                pass
         return self._online
 
     @property
@@ -268,7 +308,11 @@ class HybridPlanner(Planner):
                 "last_error": self._last_error}
 
     async def plan(self, transcript: str, context: dict[str, Any]) -> Plan:
-        if self.probe():
+        # Run the synchronous probe in an executor so it doesn't block the
+        # event loop while waiting for the HTTP health check.
+        import asyncio as _asyncio
+        online = await _asyncio.get_running_loop().run_in_executor(None, self.probe)
+        if online:
             try:
                 plan = await self.llm.plan(transcript, context)
                 plan.degraded = False
