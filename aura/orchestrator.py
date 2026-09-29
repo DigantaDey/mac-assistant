@@ -29,9 +29,11 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from . import config as config_mod
+from . import log as log_mod
 from .audio import AudioFrame, MicStream, SilentMic
 from .events import EventBus
-from .laya import ExampleBuffer
+from .laya import ExampleBuffer, HeuristicBackend, LayaBackend
+from .log import get_logger, log_exception
 from .memory import Memory
 from .planner import Action, Planner
 from .safety import SafetyGate
@@ -40,6 +42,8 @@ from .stt import STTEngine
 from .tts import TTS
 from .vad import EnergyVAD
 from .wakeword import WakeEngine, phrase_gate, strip_phrase
+
+log = get_logger("orchestrator")
 
 State = Literal["armed", "capturing", "transcribing", "planning",
                 "proposing", "executing", "responding", "disabled"]
@@ -75,7 +79,7 @@ class Orchestrator:
         registry: SkillRegistry,
         bridge: MacBridge,
         planner: Planner,
-        laya_backend,              # aura.laya.LayaBackend
+        laya_backend: LayaBackend,  # aura.laya.LayaGate (real + offline fallback)
         safety: SafetyGate,
         memory: Memory,
         examples: ExampleBuffer,
@@ -120,6 +124,7 @@ class Orchestrator:
         self._train_capture_id = 0
         self._train_vad = EnergyVAD(end_silence_seconds=0.6, max_seconds=4.0)
         self._setup_running = False
+        self._laya_idle_unloaded = False
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop:
@@ -136,6 +141,9 @@ class Orchestrator:
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
         self.bus.attach_loop(self._loop)
+        # Anything the engine itself failed to catch lands in the log file
+        # instead of a stderr nobody is reading.
+        log_mod.install_exception_hooks(self._loop)
         self._wake = self._build_wake()
         try:
             self._mic = MicStream(self._loop, self._on_audio_frame)
@@ -157,23 +165,35 @@ class Orchestrator:
         self.state = "armed"
         self.bus.publish("state", state=self.state, mic=mic_kind,
                          wake=getattr(self.cfg.wake, "mode", "manual"))
+        log.info("ready — bridge=%s, mic=%s, stt=%s, tts=%s, planner=%s, "
+                 "laya=%s, profile=%s, data=%s",
+                 self.bridge.platform, mic_kind, type(self.stt).__name__,
+                 type(self.tts).__name__, type(self.planner).__name__,
+                 type(self.laya).__name__, config_mod.resolved_profile(self.cfg),
+                 self.cfg.data_dir)
         self.bus.publish("log", line=f"Aura ready — bridge={self.bridge.platform}, "
                                      f"stt={type(self.stt).__name__}, "
-                                     f"laya={type(self.laya).__name__}")
+                                     f"laya={type(self.laya).__name__}, "
+                                     f"planner={type(self.planner).__name__}")
 
     async def _warm_planner(self) -> None:
-        """One tiny request so the local model is resident before it is asked.
+        """Load the decision model before the user asks for anything.
 
-        Runs on an executor and never raises: a machine without a model server
-        simply stays in basic mode, exactly as before.
+        A cold Laya checkpoint download/load costs seconds; paying that on the
+        first command is exactly the "it's still thinking" feeling. Best-effort
+        and off the loop — a machine without the model simply runs the offline
+        scorer, and says so in the log.
         """
         warm = getattr(self.planner, "warmup", None)
         if warm is None or not callable(warm):
+            warm = getattr(self.laya, "warmup", None)
+        if warm is None or not callable(warm):
             return
         try:
-            await asyncio.get_running_loop().run_in_executor(None, warm)
-        except Exception:
-            pass
+            ok = await asyncio.get_running_loop().run_in_executor(None, warm)
+            log.info("warm-up: %s", "ready" if ok else "not available (see the log above)")
+        except Exception as exc:
+            log_exception("warm-up failed", exc, logger=log)
 
     async def ensure_microphone(self) -> tuple[bool, str]:
         """Attach the live stream after a permission grant without a restart.
@@ -249,14 +269,26 @@ class Orchestrator:
     async def _probe_planner(self) -> None:
         probe = getattr(self.planner, "probe", None)
         status = getattr(self.planner, "status", None)
-        if probe is None or status is None:
-            self.planner_online = None            # deterministic planner — nothing to check
+        if probe is None:
+            # The Laya planner has no HTTP endpoint to poll — its status is the
+            # backend's own (ready / loading / the reason it fell back), which
+            # the UI shows next to the "running on basics" badge.
+            if status is not None:
+                try:
+                    self.planner_status = status() if callable(status) else dict(status)
+                    self.planner_online = bool(self.planner_status.get("ready", False))
+                except Exception as exc:
+                    log_exception("planner status check failed", exc, logger=log)
+                    self.planner_online = False
+            else:
+                self.planner_online = None        # deterministic planner — nothing to check
             return
         try:
             self.planner_online = bool(await asyncio.get_running_loop()
                                        .run_in_executor(None, probe))
             self.planner_status = status() if callable(status) else dict(status)
-        except Exception:
+        except Exception as exc:
+            log_exception("planner probe failed", exc, logger=log)
             self.planner_online = False
 
     def _poll_config_changes(self) -> None:
@@ -308,8 +340,24 @@ class Orchestrator:
                 if unload():
                     self.bus.publish("log",
                                      line=f"STT model unloaded after {int(idle_for)}s idle")
-            except Exception:
-                pass
+            except Exception as exc:
+                log_exception("stt unload failed", exc, logger=log)
+
+        # The decision model is the other large resident. Releasing it is
+        # opt-in (laya.idle_unload_seconds > 0) because the next question then
+        # pays the reload — an honest trade, not a default.
+        budget = float(getattr(self.cfg.laya, "idle_unload_seconds", 0.0) or 0.0)
+        if not budget or idle_for < budget or self._laya_idle_unloaded:
+            return
+        release = getattr(self.laya, "unload", None)
+        if not callable(release):
+            return
+        try:
+            if release():
+                self._laya_idle_unloaded = True
+                log.info("laya: checkpoints released after %ds idle", int(idle_for))
+        except Exception as exc:
+            log_exception("laya unload failed", exc, logger=log)
 
     # ------------------------------------------------------------------ #
     # Wake management (live, persisted)                                   #
@@ -481,6 +529,8 @@ class Orchestrator:
             await self._run_session(transcript, spoken)
         except asyncio.CancelledError:
             deadline = self._deadline_expired
+            log.warning("session: %s — %r", "deadline reached" if deadline else "cancelled",
+                        transcript[:60])
             self.bus.publish(
                 "log",
                 line=("active request deadline reached — back to ready" if deadline
@@ -498,14 +548,21 @@ class Orchestrator:
                 )
             await self._end_session(message, outcome="failed")
         except BaseException as exc:  # the orb must never freeze
-            self.bus.publish("log", line=f"session error: {exc!r}")
-            import traceback as _tb
-
-            self.bus.publish("log", line=_tb.format_exc(limit=3))
+            detail = log_exception(f"session failed while handling {transcript[:60]!r}",
+                                   exc, logger=log)
+            self.bus.publish("log", line=f"session error: {detail}")
+            session = self.session
+            if session is not None:
+                self.memory.record_event(
+                    session.transcript,
+                    (session.plan.as_dict() if session.plan else {}),
+                    f"failed: {detail}", "failed", _ms(session.started))
+            # The user gets the *detail*, not just an apology: "something went
+            # wrong" is unfixable, "LayaError: laya predict: …" is a bug report.
             try:
                 await self._end_session(
-                    "Something went wrong while thinking — please try again.",
-                    outcome="failed")
+                    self._failure_message("Something went wrong while thinking.", detail),
+                    outcome="failed", diagnostic=detail)
             except BaseException:  # even the apology must not hang the state
                 self._disarm_watchdog()
                 self._release_confirmations()
@@ -515,12 +572,59 @@ class Orchestrator:
                 self.state = "armed"
                 self.bus.publish("state", state=self.state)
 
+    @staticmethod
+    def _failure_message(headline: str, detail: str) -> str:
+        """A spoken apology that still tells an engineer what broke."""
+        if not detail:
+            return headline
+        short = detail if len(detail) <= 140 else detail[:139] + "…"
+        return f"{headline} ({short})"
+
+    async def _decide_actions(self, transcript: str, actions: list[Action]) -> list[Any]:
+        """Ask the decision layer about every action of this request, once.
+
+        All actions go to Laya in one call (`predict_batch` when the installed
+        version has it), off the event loop, so a two-action command costs one
+        model round-trip rather than two. A gate failure is logged with its
+        traceback and answered by the offline scorer — never raised into the
+        session, because an unjudged action must not run.
+        """
+        cases = [(action.skill, action.args, action.why) for action in actions]
+        started = time.monotonic()
+        try:
+            loop = asyncio.get_running_loop()
+            decisions = list(await loop.run_in_executor(
+                None, self.laya.decide_many, transcript, cases))
+            if len(decisions) != len(cases):
+                raise ValueError(f"gate returned {len(decisions)} decisions for "
+                                 f"{len(cases)} actions")
+        except Exception as exc:
+            detail = log_exception("gate: the Laya decision call failed — every action of "
+                                   "this request is judged by the offline scorer", exc,
+                                   logger=log)
+            fallback = HeuristicBackend()
+            decisions = []
+            for skill, args, why in cases:
+                decision = fallback.decide(transcript, skill, args, why)
+                decision.error = detail
+                decision.source = "fallback"
+                decisions.append(decision)
+        elapsed = (time.monotonic() - started) * 1000.0
+        log.info("gate: %d action(s) in %.1fms — %s", len(cases), elapsed,
+                 ", ".join(f"{d.backend}/{d.source} match={d.match:.2f} "
+                           f"destructive={d.destructive:.2f}"
+                           + (f" error={d.error}" if d.error else "")
+                           for d in decisions))
+        return decisions
+
     async def _run_session(self, transcript: str, spoken: bool = False) -> None:
         session = Session(id=uuid.uuid4().hex[:12], transcript=transcript)
         self.session = session
         self._last_activity = time.monotonic()
         t0 = time.monotonic()
         self._arm_watchdog()
+        self._laya_idle_unloaded = False
+        log.info("session %s: %r (spoken=%s)", session.id, transcript[:120], spoken)
 
         # 1 — plan
         self.state = "planning"
@@ -531,6 +635,11 @@ class Orchestrator:
         }
         plan = await self.planner.plan(transcript, context)
         session.plan = plan
+        log.info("plan: %s via %s in %dms (model %dms, degraded=%s%s) — %s",
+                 [a.skill for a in plan.actions], plan.routed_by or plan.source,
+                 plan.latency_ms, plan.model_ms, plan.degraded,
+                 f", diagnostic={plan.diagnostic}" if plan.diagnostic else "",
+                 plan.reply[:120])
         self.bus.publish("plan", **plan.as_dict(), session=session.id)
 
         if not plan.actions:
@@ -538,14 +647,18 @@ class Orchestrator:
                                 total_ms=_ms(t0))
             return
 
-        # 2 — gate every action (Laya + safety)
+        # 2 — gate every action (Laya + safety). One batched decision call
+        #     covers every action of the request: both questions per action,
+        #     answered off the event loop under the gate's own deadline.
         known = self.registry.names()
-        self.state = "proposing"
-        for action in plan.actions:
-            verdict = self.safety.assess(action, transcript, known)
+        # The gate runs while the plan is still "planning": a proposal that has
+        # no token yet is not something the user could answer, and `/api/state`
+        # must never hand out a `proposing` snapshot the app cannot confirm.
+        decisions = await self._decide_actions(transcript, plan.actions)
+        for action, decision in zip(plan.actions, decisions):
+            verdict = self.safety.assess(action, transcript, known, decision=decision)
             session.pending.append({"action": action, "verdict": verdict,
-                                    "decision": self.laya.decide(transcript, action.skill,
-                                                                 action.args, action.why)})
+                                    "decision": decision})
         needs_confirm = any(p["verdict"].decision == "confirm" for p in session.pending)
         blocked = [p for p in session.pending if p["verdict"].decision == "blocked"]
 
@@ -555,6 +668,7 @@ class Orchestrator:
             # the opt-in *strict* mode: even safe actions pause for a yes.
             token = uuid.uuid4().hex[:8]
             session.proposal_token = token
+            self.state = "proposing"
             fut: asyncio.Future[str] = self.loop.create_future()
             self._confirmations[token] = fut
             self.bus.publish("proposal", token=token, session=session.id,
@@ -582,7 +696,8 @@ class Orchestrator:
             if answer != "confirm":
                 for p in session.pending:
                     self._record_example(transcript, p["action"],
-                                         "cancelled" if answer in ("cancel", "timeout") else "corrected")
+                                         "cancelled" if answer in ("cancel", "timeout") else "corrected",
+                                         p.get("decision"))
                 self.memory.record_event(
                     transcript, plan.as_dict(), plan.reply,
                     outcome="cancelled", total_ms=_ms(t0))
@@ -592,7 +707,7 @@ class Orchestrator:
             # Confirmed: record positive supervision, then give execution its
             # own five-second active-work window.
             for p in session.pending:
-                self._record_example(transcript, p["action"], "confirmed")
+                self._record_example(transcript, p["action"], "confirmed", p.get("decision"))
             self._arm_watchdog()
 
         for p in blocked:
@@ -610,8 +725,10 @@ class Orchestrator:
         async def _run_one(idx: int, pending: dict) -> None:
             action = pending["action"]
             skill = self.registry.get(action.skill)
+            started_at = time.monotonic()
             self.bus.publish("action_started", index=idx, skill=action.skill,
                              session=session.id)
+            log.info("run: %s %s", action.skill, action.args)
             try:
                 # Skills reach macOS through *blocking* subprocesses, and
                 # `osascript` can sit there for its whole timeout while a TCC
@@ -625,6 +742,10 @@ class Orchestrator:
             except Exception as exc:  # a crashing skill must never kill the session
                 result = _skill_result(False, f"{action.skill} failed: {exc}")
             pending["result"] = _SkillOutcome(result.ok, result.message, result.data)
+            (log.info if result.ok else log.warning)(
+                "result: %s %s in %.0fms — %s", action.skill,
+                "ok" if result.ok else "failed", (time.monotonic() - started_at) * 1000.0,
+                result.message)
             self.bus.publish("action_result", index=idx, skill=action.skill,
                              ok=result.ok, message=result.message, session=session.id)
 
@@ -650,15 +771,20 @@ class Orchestrator:
             reply = first_ok or (reply_bits[0] if reply_bits else "")
         for p in session.pending:
             if "result" in p and p["verdict"].decision == "run":
-                self._record_example(transcript, p["action"], "auto")
+                self._record_example(transcript, p["action"], "auto", p.get("decision"))
         await self._respond(session, reply, outcome=outcome, total_ms=_ms(t0))
 
-    async def _respond(self, session: Session, reply: str, outcome: str, total_ms: int) -> None:
+    async def _respond(self, session: Session, reply: str, outcome: str, total_ms: int,
+                       diagnostic: str = "") -> None:
         self.state = "responding"
         self.bus.publish("state", state=self.state, session=session.id)
+        plan = session.plan
+        log.info("reply (%s, %dms, %s): %s", outcome, total_ms,
+                 getattr(plan, "routed_by", "?") or "?", reply[:200])
         self.bus.publish("reply", text=reply, session=session.id,
                          total_ms=total_ms, outcome=outcome,
-                         degraded=bool(getattr(session.plan, "degraded", False)))
+                         diagnostic=diagnostic or getattr(plan, "diagnostic", ""),
+                         degraded=bool(getattr(plan, "degraded", False)))
         self.memory.record_event(session.transcript,
                                  (session.plan.as_dict() if session.plan else {}),
                                  reply, outcome, total_ms)
@@ -674,11 +800,14 @@ class Orchestrator:
             self._loop.run_in_executor(None, self.tts.speak, text)
 
     async def _end_session(self, message: str | None = None,
-                           outcome: str = "ok") -> None:
+                           outcome: str = "ok", diagnostic: str = "") -> None:
         self._disarm_watchdog()
         self._release_confirmations()
         if message:
-            self.bus.publish("reply", text=message, total_ms=0, outcome=outcome)
+            if diagnostic:
+                log.warning("session ended (%s): %s", outcome, diagnostic)
+            self.bus.publish("reply", text=message, total_ms=0, outcome=outcome,
+                             diagnostic=diagnostic)
             self._speak_async(message)
         self.session = None
         self._active_session_task = None
@@ -992,6 +1121,7 @@ class Orchestrator:
                 self.bus.publish("log", line=f"install failed: {exc!r}")
             finally:
                 self._setup_running = False
+        self._laya_idle_unloaded = False
 
         asyncio.run_coroutine_threadsafe(_install(), self.loop)
         return {"ok": True, "started": True,
@@ -1008,6 +1138,7 @@ class Orchestrator:
             await self.loop.run_in_executor(None, self._run_setup_sync)
         finally:
             self._setup_running = False
+        self._laya_idle_unloaded = False
         return {"ok": True}
 
     async def run_setup_step(self, key: str) -> Any:
@@ -1025,6 +1156,7 @@ class Orchestrator:
             return await self.loop.run_in_executor(None, self._run_setup_step_sync, key)
         finally:
             self._setup_running = False
+        self._laya_idle_unloaded = False
 
     def _engine_repo(self):
         """Where the `python` step pip-installs from: the engine folder the
@@ -1169,12 +1301,27 @@ class Orchestrator:
 
     # ------------------------------------------------------------------ #
 
-    def _record_example(self, transcript: str, action: Action | _ShadowAction, outcome: str) -> None:
+    def _record_example(self, transcript: str, action: Action | _ShadowAction, outcome: str,
+                        decision=None) -> None:
+        """Record one supervised example for the Laya fine-tune.
+
+        The decision is passed in whenever the session already computed it —
+        re-asking the model here used to be a second forward pass per action,
+        on the confirmation path, for a number we already had.
+        """
         if isinstance(action, Action):
             skill, args = action.skill, action.args
         else:
             skill, args = action.skill, {}
-        decision = self.laya.decide(transcript, skill, args, "")
+        if decision is None:
+            try:
+                decision = self.laya.decide(transcript, skill, args, "")
+            except Exception as exc:
+                detail = log_exception(f"examples: the gate raised while labelling {skill} — "
+                                       "using the offline scorer", exc, logger=log)
+                decision = HeuristicBackend().decide(transcript, skill, args, "")
+                decision.error = detail
+                decision.source = "fallback"
         if outcome in ("auto", "confirmed"):
             match, destructive = 1.0, decision.destructive
         elif outcome == "corrected":

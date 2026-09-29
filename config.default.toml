@@ -25,19 +25,41 @@ whisper_model = ""            # e.g. "~/models/ggml-small.en.bin" (whisper.cpp)
 faster_whisper_model = "small"
 
 [planner]
-engine = "auto"               # auto | openai_compat | mock
-base_url = "http://127.0.0.1:11434/v1"   # Ollama default; mlx_lm/llama-server/LM Studio also work
-model = "qwen3:4b"
+# laya           — the default brain: deterministic rules parse the request,
+#                  the Laya decision model routes whatever they cannot.
+#                  No model server, no Ollama, nothing to download but Laya.
+# auto           — Laya when installed, otherwise the local LLM, otherwise rules.
+# openai_compat  — the LLM-first planner (Ollama/mlx_lm/llama.cpp/LM Studio).
+# mock           — the rule layer alone (demo profile, tests).
+engine = "laya"
+base_url = "http://127.0.0.1:11434/v1"   # only used by openai_compat/auto
+model = "qwen3:4b"                       # only used by openai_compat/auto
 temperature = 0.2
 timeout_seconds = 4.0         # leave one second for fallback + execution (5 s SLO)
 max_actions = 3
 
 [laya]
 enabled = true
-backend = "auto"              # auto uses the `laya` package when installed
-confidence_threshold = 0.62
-destructive_threshold = 0.55
-adapter_dir = ""              # your fine-tuned Laya adapter (feedback loop output)
+backend = "auto"              # auto uses the `laya` package; "heuristic" never loads it
+confidence_threshold = 0.62   # a proposed action below this match score → ask
+destructive_threshold = 0.55  # above this → ask
+route_threshold = 0.30        # a routing pick below this is "no skill" (never acted on)
+device = ""                   # "" = auto (MPS/CUDA/CPU); or "cpu", "mps", "cuda"
+model = ""                    # "" = let the router choose per language
+preload = false               # true = hold every checkpoint in RAM (fastest)
+max_loaded = 2                # checkpoints allowed to stay resident
+call_budget_seconds = 1.5     # past this, the offline gate answers and the log says why
+idle_unload_seconds = 0.0     # >0 releases the model after idle (reload on next use)
+adapter_dir = ""              # your fine-tuned Laya checkpoint (feedback loop output)
+
+[logging]
+# Everything the engine does is written to stderr (the app captures it into
+# ~/Library/Logs/Aura.log) and to <data dir>/aura.log, and mirrored into the
+# app's Activity feed at event_level. `python -m aura laya-check` proves the
+# decision model end-to-end when something looks wrong.
+level = "info"                # debug | info | warning | error
+event_level = "info"
+file = true
 
 [tts]
 engine = "auto"               # auto → `say` on macOS

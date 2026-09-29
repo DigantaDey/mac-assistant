@@ -4,7 +4,7 @@ Ship order matters: each stage is usable on its own, and every stage widens
 the moat (offline + personal + fast) before Apple's Siri V2 closes the
 mainstream gap.
 
-**Current release: v0.6.1 — the native macOS app** (✅ shipped; see below).
+**Current release: v0.6.2 — the Laya brain** (✅ shipped; see below).
 
 ## v0.1 — Foundation ✅
 - [x] Orchestrator state machine with confirmation as a real state
@@ -48,8 +48,10 @@ mainstream gap.
       act inside any app that exposes accessibility labels, by name
 - [x] Safety integration: destructive labels (delete/purchase/send…) flip
       ax.click into the confirmation flow automatically
-- [ ] Generate skill-routing + safety datasets; wire the `laya` pip backend
-      into daily use; publish accuracy/latency benchmarks
+- [x] **Wire the `laya` pip backend into daily use (v0.6.2)** — `Router.predict`
+      with typed questions is the real adapter, the default planner and the gate
+- [ ] Generate skill-routing + safety datasets; publish accuracy/latency
+      benchmarks for the shipped adapter
 - [ ] Ship `scripts/nightly_laya.py` v1 end-to-end: export → on-device
       fine-tune → adapter hot-swap; measure before/after on a held-out set
 - [ ] Confidence UX upgrade: "I'm only 54% sure — did you mean X?" as an
@@ -171,6 +173,46 @@ server needs.
 - [x] **Verified on every push** — 207 engine tests, ruff clean, Swift
       syntax gate, `swift build` + 16 Swift tests, `Aura.app` assembled and
       its bundle validated (LSUIElement, usage strings, WebKit ban)
+
+## v0.6.2 — The Laya brain, and logs that explain themselves ✅ (this tree)
+The theme: **the fast decision model actually runs the product, and when it
+doesn't the engine says exactly why.** Before this release the adapter called
+an API that does not exist (`router.ask`), so on a Mac with `laya` installed
+every decision raised `AttributeError` and the session died with a bare error —
+while the failure was swallowed and the app quietly fell back.
+
+- [x] **Laya is the planner too** (`planner.engine = "laya"` by default):
+      the rule layer parses the request in microseconds; one `choice` question
+      over a shortlist of the skill catalog picks the skill, a `score` question
+      fills a scale value, and a partial rule plan is *extended*, never
+      replaced. No model server, no Ollama, nothing to download at runtime
+      beyond Laya's own checkpoint
+- [x] **The adapter matches the published API**: `Router.predict(state,
+      questions)` with `noul` / `choice` / `score` questions — both gate
+      questions in one forward pass, `predict_batch` when the backend has it,
+      and a self-test (`python -m aura laya-check`) that proves the installed
+      version end-to-end with timings
+- [x] **A default install without Ollama**: `scripts/install.sh` now installs
+      PortAudio + whisper.cpp + the engine, warms Laya and proves it;
+      `AURA_WITH_OLLAMA=1` still adds the LLM planner, and the code path stays
+      (`planner.engine = "openai_compat" | "auto"`)
+- [x] **Logging that catches any error (`aura/log.py`)**: one setup wires
+      stderr (captured into `~/Library/Logs/Aura.log`), a rotating
+      `<data dir>/aura.log` (2 MB × 3) and a mirror into the app's Activity
+      feed; `log_exception` records the class, the message and the traceback,
+      and returns the short form a reply or `/api/state` can carry
+- [x] **Errors reach the user and the engineer**: an error reply names the
+      cause (“RuntimeError: the model server is unreachable”), the log has the
+      traceback, and `GET /api/log?tail=N` returns the engine's own tail for
+      the app (Activity ▸ Open Log) and a bug report
+- [x] **No silent fallbacks anywhere**: backend/planner selection, gate
+      decisions, routing, skill execution and session lifecycle each log what
+      happened, with the reason — a degraded plan carries `degraded` +
+      `diagnostic`, and a gate that raises is logged and still judged
+- [x] **280+ tests, green**: the adapter against a fake `laya` module that
+      implements the published API, router/intent units, planner degradation,
+      logging (file, bus mirror, tail, `/api/log`), and full sessions over
+      real HTTP
 
 ## v0.7 — Depth
 - [ ] Browser extension (MV3) + CDP: read/act on DOM, multi-tab flows

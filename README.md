@@ -22,19 +22,26 @@ git clone <this repo> mac-assistant && cd mac-assistant
 
 One command, and it is idempotent — re-run it any time to update:
 
-1. installs the native bits with Homebrew (PortAudio, whisper.cpp, Ollama);
-2. pulls the reasoning model (`qwen3:4b`, one-time, cached);
-3. downloads the speech model (`ggml-base.en`, ≈150 MB, one-time);
-4. copies the engine to `~/Library/Application Support/Aura/engine` and builds
-   a Python environment for it;
+1. installs the native bits with Homebrew (PortAudio, whisper.cpp);
+2. downloads the speech model (`ggml-base.en`, ≈150 MB, one-time);
+3. copies the engine to `~/Library/Application Support/Aura/engine` and builds
+   a Python environment for it — the decision model ships with it;
+4. downloads **Laya** once and proves it answers, with
+   `python -m aura laya-check`;
 5. builds **Aura.app** and installs it into **/Applications**;
 6. opens it — and Aura walks you through the two macOS permissions, one click
    each.
+
+There is **no model server to run**: Aura's brain is the rule layer plus Laya,
+both inside the engine's own environment. If you *want* the optional LLM
+planner, `AURA_WITH_OLLAMA=1 ./scripts/install.sh` adds Ollama and
+`qwen3:4b` (~2.5 GB) and then set `planner.engine = "auto"`.
 
 Then:
 
 - click **◉** in the menu bar, or press **⌥Space** anywhere, and say
   “*open YouTube*” — or just type it;
+- say “*quiet the house*” — the words no keyword table knows; Laya routes them;
 - say “*empty the trash*” — Aura **stops and asks** before anything risky;
 - open **Settings** any time: permissions, wake phrase, voice, model, safety,
   data and the log — all in the app, no terminal, no browser.
@@ -48,7 +55,11 @@ head-less anywhere (that is how the test suite and CI use it):
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/python -m aura serve      # → prints the token path and the port
 .venv/bin/python -m aura doctor     # honest capability matrix
+.venv/bin/python -m aura laya-check # prove the decision model, with timings
 ```
+
+(`pip install -e ".[mac]"` adds the `laya` decision model and the speech
+extras; `.[dev]` alone runs the whole engine on the deterministic fallback.)
 
 There is deliberately **no web UI** — the product is the app.
 
@@ -72,10 +83,11 @@ There is deliberately **no web UI** — the product is the app.
 you ── voice / type ──►  STT (whisper.cpp or faster-whisper, on-device)
                               │ transcript
                               ▼
-                        Planner — the local OpenAI-compatible model server
-                          (Ollama `qwen3:4b` by default; mlx_lm, llama.cpp
-                          and LM Studio all work; deterministic built-in
-                          planner when nothing answers)
+                        Planner (aura/planner.py)
+                          rules first — a reflex never waits for a model
+                          then Laya: one closed-set question over the skill
+                          catalog, one score question for a number
+                          (the optional LLM planner plugs in at the same seam)
                               │ plan: which skills, with what arguments
                               ▼
                         The gate (aura/laya.py)
@@ -86,6 +98,12 @@ you ── voice / type ──►  STT (whisper.cpp or faster-whisper, on-device
         safe ▼                               risky ▼
      just do it                    ASK: Run it / Cancel  (native card)
 ```
+
+Laya is the one model Aura needs on the fast path, and it never writes prose:
+it *chooses* a skill from a closed list and *scores* a value on a defined
+scale, so a wrong answer is a wrong choice — never an invented command. When
+it is missing or slow, the rules still answer, the reply says what degraded,
+and the log says why.
 
 Every outcome — done, you confirmed, you cancelled, you corrected — is
 recorded locally. That log is what the optional Laya fine-tune loop consumes
@@ -154,6 +172,28 @@ The icon tells you the state at a glance: **white** ready · **blue** working ·
 
 ---
 
+## Logs — when something breaks
+
+Nothing in Aura fails silently, and nothing is *only* in the terminal:
+
+- the engine writes everything to `<data dir>/aura.log` (rotating) **and** to
+  stderr, which the app captures into `~/Library/Logs/Aura.log`;
+- `GET /api/log?tail=200` returns the engine's own tail — that is what the
+  app's Activity ▸ Open Log reads;
+- every failure carries its cause: the exception class and message, plus the
+  traceback in the log (`aura.log.log_exception`). A session that dies answers
+  the user with the reason ("RuntimeError: the model server is unreachable")
+  instead of "something went wrong";
+- `python -m aura doctor` is the honest capability matrix, and
+  `python -m aura laya-check` proves the decision model end-to-end — import,
+  load, two gate decisions and a routing question, with timings, exiting
+  non-zero and printing the reason when it is broken;
+- log verbosity is a setting (`[logging] level = "debug"`, or
+  `AURA_LOG_LEVEL=debug`), and the app's Activity feed mirrors the engine's
+  own records at `[logging] event_level`.
+
+---
+
 ## Installer layout
 
 ```
@@ -203,7 +243,8 @@ on the next refresh.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m pytest tests/ -q      # engine: 200+ tests
+.venv/bin/python -m pytest tests/ -q      # engine: 280+ tests
+.venv/bin/python -m aura laya-check       # the decision model, end-to-end
 .venv/bin/ruff check .                    # lint, must be clean
 .venv/bin/python scripts/check_swift_syntax.py   # Swift syntax gate (any OS)
 
@@ -221,12 +262,14 @@ covered there on every push.
 
 ## Honest limitations
 
-- The **default** brain is a local model server (Ollama `qwen3:4b`, ≈2.5 GB).
-  Without it Aura still works — she says “running on basics” and uses the
-  built-in planner, which understands a fixed set of phrasings.
-- The **decision gate** ships with a deterministic, explainable backend. The
-  optional `laya` package (non-autoregressive, ~33 ms on MLX) plugs into the
-  same seam when you install it.
+- The **default brain is Laya** (Apache-2.0, non-autoregressive, one ~420 M
+  parameter checkpoint — tens of milliseconds per decision, no server
+  process; the weights are downloaded once and cached by Hugging Face). The deterministic
+  rule layer answers everyday commands without touching it. An LLM planner
+  (Ollama `qwen3:4b`, mlx_lm, llama.cpp, LM Studio) is still in the code at
+  `planner.engine = "openai_compat" | "auto"`, but it is no longer required.
+- Without the `laya` package Aura still works — the rules answer, the reply
+  says "running on basics", and every fallback is logged with its reason.
 - Wake-word recall depends on your mic and your phrase — it's a tuning knob,
   not a science. Train your own phrase in Settings ▸ Wake Phrase and Aura
   learns how *you* say it (recordings never leave the Mac).
