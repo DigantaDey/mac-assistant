@@ -24,15 +24,18 @@ class STTEngine:
 
 
 def _write_wav(pcm_frames, path: Path, sample_rate: int = 16_000) -> None:
+    # Collect all PCM data first, then write in one shot — avoids repeated
+    # small writes that stall on file-system buffering.
+    chunks: list[bytes] = []
+    for frame in pcm_frames:
+        pcm = frame.pcm
+        chunks.append(pcm.tobytes() if hasattr(pcm, "tobytes") else bytes(pcm))
+    pcm_data = b"".join(chunks)
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
-        for frame in pcm_frames:
-            pcm = frame.pcm
-            if hasattr(pcm, "tobytes"):
-                pcm = pcm.tobytes()
-            wf.writeframes(pcm)
+        wf.writeframes(pcm_data)
 
 
 class WhisperCppSTT(STTEngine):
@@ -48,19 +51,44 @@ class WhisperCppSTT(STTEngine):
             raise RuntimeError("whisper.cpp binary not found (looked for whisper-cli, main)")
 
     def transcribe(self, pcm_frames) -> str:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            wav_path = Path(tmp.name)
+        # Build WAV in memory and pipe through stdin — eliminates disk I/O
+        # (no temp file create/write/read/unlink per utterance).
+        import io
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16_000)
+            chunks: list[bytes] = []
+            for frame in pcm_frames:
+                pcm = frame.pcm
+                chunks.append(pcm.tobytes() if hasattr(pcm, "tobytes") else bytes(pcm))
+            wf.writeframes(b"".join(chunks))
+        wav_data = buf.getvalue()
+
         try:
-            _write_wav(pcm_frames, wav_path)
             proc = subprocess.run(
-                [self.bin, "-m", self.model, "-f", str(wav_path),
+                [self.bin, "-m", self.model, "-f", "-",
                  "-l", self.language, "-nt", "-np"],
-                capture_output=True, text=True, timeout=60,
+                input=wav_data, capture_output=True, text=True, timeout=60,
             )
-            text = " ".join(proc.stdout.split()).strip()
-            return text
-        finally:
-            wav_path.unlink(missing_ok=True)
+            return " ".join(proc.stdout.split()).strip()
+        except Exception:
+            # Some whisper.cpp builds don't support stdin ("-" as filename).
+            # Fall back to the temp-file approach.
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                wav_path = Path(tmp.name)
+            try:
+                _write_wav(pcm_frames, wav_path)
+                proc = subprocess.run(
+                    [self.bin, "-m", self.model, "-f", str(wav_path),
+                     "-l", self.language, "-nt", "-np"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                return " ".join(proc.stdout.split()).strip()
+            finally:
+                wav_path.unlink(missing_ok=True)
 
 
 class FasterWhisperSTT(STTEngine):
@@ -94,14 +122,28 @@ class FasterWhisperSTT(STTEngine):
 
     def transcribe(self, pcm_frames) -> str:
         model = self._ensure_model()
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            wav_path = Path(tmp.name)
+        # Fast path: pass the raw float32 numpy array directly — no disk I/O.
         try:
-            _write_wav(pcm_frames, wav_path)
-            segments, _ = model.transcribe(str(wav_path), language=self.language)
+            import numpy as np
+
+            chunks: list[bytes] = []
+            for frame in pcm_frames:
+                pcm = frame.pcm
+                chunks.append(pcm.tobytes() if hasattr(pcm, "tobytes") else bytes(pcm))
+            pcm_data = b"".join(chunks)
+            audio = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+            segments, _ = model.transcribe(audio, language=self.language)
             return " ".join(s.text for s in segments).strip()
-        finally:
-            wav_path.unlink(missing_ok=True)
+        except Exception:
+            # Fallback to WAV-based transcription if numpy path fails.
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                wav_path = Path(tmp.name)
+            try:
+                _write_wav(pcm_frames, wav_path)
+                segments, _ = model.transcribe(str(wav_path), language=self.language)
+                return " ".join(s.text for s in segments).strip()
+            finally:
+                wav_path.unlink(missing_ok=True)
 
 
 class NullSTT(STTEngine):

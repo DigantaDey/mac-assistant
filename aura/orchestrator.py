@@ -474,26 +474,37 @@ class Orchestrator:
         for p in blocked:
             p["result"] = _SkillOutcome(False, f"Refused: {'; '.join(p['verdict'].reasons)}")
 
-        # 3 — execute
+        # 3 — execute (parallel for independent safe actions)
         self.state = "executing"
         self.bus.publish("state", state=self.state, session=session.id)
-        reply_bits: list[str] = []
-        for i, p in enumerate(session.pending):
-            if "result" in p:
-                continue
-            action = p["action"]
+
+        # Gather all actionable (non-blocked) skills with their indices.
+        executable: list[tuple[int, dict]] = [
+            (i, p) for i, p in enumerate(session.pending) if "result" not in p
+        ]
+
+        async def _run_one(idx: int, pending: dict) -> None:
+            action = pending["action"]
             skill = self.registry.get(action.skill)
-            self.bus.publish("action_started", index=i, skill=action.skill,
+            self.bus.publish("action_started", index=idx, skill=action.skill,
                              session=session.id)
             try:
                 result = await skill.execute(action.args, _SkillCtx(self))
             except Exception as exc:  # a crashing skill must never kill the session
                 result = _skill_result(False, f"{action.skill} failed: {exc}")
-            p["result"] = _SkillOutcome(result.ok, result.message, result.data)
-            self.bus.publish("action_result", index=i, skill=action.skill,
+            pending["result"] = _SkillOutcome(result.ok, result.message, result.data)
+            self.bus.publish("action_result", index=idx, skill=action.skill,
                              ok=result.ok, message=result.message, session=session.id)
-            if not result.ok:
-                reply_bits.append(result.message)
+
+        # Run all executable actions concurrently — e.g. "open Spotify and set
+        # volume to 30" fires both at once instead of sequentially.
+        if executable:
+            await asyncio.gather(*[_run_one(i, p) for i, p in executable])
+
+        reply_bits: list[str] = []
+        for p in session.pending:
+            if "result" in p and not p["result"].ok:
+                reply_bits.append(p["result"].message)
 
         outcome = "ok" if all(p["result"].ok for p in session.pending
                               if "result" in p) else "failed"
@@ -519,20 +530,21 @@ class Orchestrator:
         self.memory.record_event(session.transcript,
                                  (session.plan.as_dict() if session.plan else {}),
                                  reply, outcome, total_ms)
-        try:
-            await asyncio.get_running_loop().run_in_executor(None, self.tts.speak, reply)
-        except Exception:
-            pass
+        # Fire TTS in the background — the user can issue their next command
+        # immediately instead of waiting for speech to finish.
+        self._speak_async(reply)
         self._last_activity = time.monotonic()
         await self._end_session()
+
+    def _speak_async(self, text: str) -> None:
+        """Speak text on the default executor without blocking the session flow."""
+        if self._loop is not None:
+            self._loop.run_in_executor(None, self.tts.speak, text)
 
     async def _end_session(self, message: str | None = None) -> None:
         if message:
             self.bus.publish("reply", text=message, total_ms=0, outcome="ok")
-            try:
-                await asyncio.get_running_loop().run_in_executor(None, self.tts.speak, message)
-            except Exception:
-                pass
+            self._speak_async(message)
         self.session = None
         self.state = "armed"
         self._last_activity = time.monotonic()

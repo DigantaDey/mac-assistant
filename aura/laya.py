@@ -170,6 +170,12 @@ class ExampleBuffer:
     def __init__(self, db_path: Path | str) -> None:
         self._lock = threading.RLock()   # written from the loop, read from HTTP
         self._db = sqlite3.connect(str(db_path), check_same_thread=False)
+        # Performance pragmas — WAL mode for concurrent read/write;
+        # NORMAL sync + memory temp store cut disk I/O dramatically.
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.execute("PRAGMA cache_size=-2000")   # 2 MB cache
+        self._db.execute("PRAGMA temp_store=MEMORY")
         self._db.executescript(_SCHEMA)
         self._db.commit()
 

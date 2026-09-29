@@ -46,6 +46,12 @@ class Memory:
         self._lock = threading.RLock()
         self._db = sqlite3.connect(str(db_path), check_same_thread=False)
         self._db.row_factory = sqlite3.Row
+        # Performance pragmas — WAL mode lets readers not block writers;
+        # NORMAL sync + larger cache cut fsync overhead dramatically.
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.execute("PRAGMA cache_size=-4000")   # 4 MB cache
+        self._db.execute("PRAGMA temp_store=MEMORY")
         self._db.executescript(_SCHEMA)
         try:
             self._db.executescript(

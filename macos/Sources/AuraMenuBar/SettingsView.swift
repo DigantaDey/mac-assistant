@@ -222,18 +222,27 @@ private struct VoiceSection: View {
     @State private var ttsEnabled = true
     @State private var voice = ""
     @State private var rate = 178.0
-    @State private var loaded = false
+
+    private var micGranted: Bool { (model.permissions?.microphone ?? model.micReady) == true }
+    private var whisperReady: Bool { model.permissions?.whisperCpp == true }
 
     var body: some View {
         Card {
             SectionTitle(text: "Microphone",
                          subtitle: "Where Aura listens — audio never leaves this Mac.")
             InfoRow(label: "Microphone",
-                    value: (model.permissions?.microphone ?? model.micReady) == true ? "Ready" : "Not granted",
-                    color: (model.permissions?.microphone ?? model.micReady) == true ? Theme.ready : Theme.attention)
+                    value: micGranted ? "Ready" : "Not granted",
+                    color: micGranted ? Theme.ready : Theme.attention)
             HStack(spacing: 8) {
-                Button("Allow microphone") { model.requestPermission("microphone") }.auraButton(prominent: true)
-                Button("Open Microphone settings") { model.openSystemSettings("microphone") }.auraButton()
+                if !micGranted {
+                    Button("Allow microphone") { model.requestPermission("microphone") }
+                        .auraButton(prominent: true)
+                    Button("Open Microphone settings") { model.openSystemSettings("microphone") }
+                        .auraButton()
+                } else {
+                    Button("Re-check") { Task { await model.refreshPermissions() } }
+                        .auraButton()
+                }
             }
         }
 
@@ -267,22 +276,28 @@ private struct VoiceSection: View {
             InfoRow(label: "Engine", value: model.config?.stt?.engine ?? "—")
             InfoRow(label: "Language", value: model.config?.stt?.language ?? "en")
             InfoRow(label: "whisper.cpp",
-                    value: model.permissions?.whisperCpp == true ? "Ready" : "Model not downloaded",
-                    color: model.permissions?.whisperCpp == true ? Theme.ready : Theme.attention)
-            Button("Download speech model") { model.runSetupStep("whisper") }.auraButton(prominent: true)
+                    value: whisperReady ? "Ready" : "Model not downloaded",
+                    color: whisperReady ? Theme.ready : Theme.attention)
+            if !whisperReady {
+                Button("Download speech model") { model.runSetupStep("whisper") }
+                    .auraButton(prominent: true)
+                    .disabled(model.isInstalling)
+            } else {
+                Button("Re-check") { Task { await model.refreshPermissions() } }
+                    .auraButton()
+                    .disabled(model.isInstalling)
+            }
         }
         .onAppear(perform: load)
         .onChange(of: model.config?.live["tts"]?.count) { _ in load() }
     }
 
     private func load() {
-        guard !loaded else { return }
         if let live = model.config?.live["tts"] {
             ttsEnabled = live["enabled"]?.boolValue ?? true
             voice = live["voice"]?.stringValue ?? ""
             rate = live["rate"]?.doubleValue ?? 178
         }
-        loaded = true
     }
 }
 
@@ -309,8 +324,17 @@ private struct BrainSection: View {
                 .font(.system(size: 11)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 8) {
-                Button("Set up components") { model.installEverything() }.auraButton(prominent: true)
-                Button("Open Ollama") { NSWorkspace.shared.open(URL(string: "https://ollama.com")!) }.auraButton()
+                Button("Set up components") { model.installEverything() }
+                    .auraButton(prominent: true)
+                    .disabled(model.isInstalling)
+                    .overlay {
+                        if model.isInstalling {
+                            ProgressView().controlSize(.small)
+                                .offset(x: 60)
+                        }
+                    }
+                Button("Open Ollama") { NSWorkspace.shared.open(URL(string: "https://ollama.com")!) }
+                    .auraButton()
             }
         }
 
@@ -570,12 +594,31 @@ private struct WakeSection: View {
 
 private struct ActivitySection: View {
     @EnvironmentObject var model: AppModel
+    @State private var refreshing = false
+    @State private var reloadingLog = false
 
     var body: some View {
         Card {
             SectionTitle(text: "Recent sessions",
                          subtitle: "Every request, its plan and its outcome — kept on this Mac.")
-            Button("Refresh") { Task { await model.refreshActivity() } }.auraButton()
+            Button {
+                Task {
+                    refreshing = true
+                    await model.refreshActivity()
+                    refreshing = false
+                    model.toast("Activity refreshed.", kind: .success)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    if refreshing {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(refreshing ? "Refreshing…" : "Refresh")
+                }
+            }
+            .auraButton()
+            .disabled(refreshing)
+
             if model.activity.isEmpty {
                 Text("Nothing yet. Ask Aura something and it will land here.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
@@ -588,7 +631,21 @@ private struct ActivitySection: View {
 
         Card {
             SectionTitle(text: "Engine log", subtitle: "The last lines written by the app and the engine.")
-            Button("Reload") { model.loadLog() }.auraButton()
+            Button {
+                reloadingLog = true
+                model.loadLog()
+                reloadingLog = false
+                model.toast("Log reloaded.", kind: .info)
+            } label: {
+                HStack(spacing: 6) {
+                    if reloadingLog {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(reloadingLog ? "Reloading…" : "Reload")
+                }
+            }
+            .auraButton()
+            .disabled(reloadingLog)
             ScrollView {
                 VStack(alignment: .leading, spacing: 1) {
                     ForEach(Array(model.logLines.suffix(120).enumerated()), id: \.offset) { _, line in
