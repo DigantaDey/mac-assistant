@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # tests/fake_laya.py
 
 from aura.config import load_config
 from aura.events import EventBus
@@ -50,6 +51,58 @@ class DemoStack:
 @pytest.fixture()
 def stack(tmp_path: Path) -> DemoStack:
     return DemoStack(tmp_path)
+
+
+# --------------------------------------------------------------------------- #
+# Reading the engine's own log                                                #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture()
+def aura_logs():
+    """Every record the `aura` logger tree emits during a test.
+
+    `aura.log.setup()` sets `propagate = False` (the engine must not double-log
+    into a host app's root logger), so pytest's `caplog` never sees these
+    records. This attaches a handler where they actually go.
+    """
+    import logging
+
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append                     # type: ignore[method-assign]
+    logger = logging.getLogger("aura")
+    previous_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+
+@pytest.fixture()
+def clean_aura_logging():
+    """Undo whatever `aura.log.setup()` added, so tests cannot leak into each other."""
+    import logging
+
+    logger = logging.getLogger("aura")
+    before = list(logger.handlers)
+    previous_level = logger.level
+    previous_propagate = logger.propagate
+    try:
+        yield
+    finally:
+        for handler in list(logger.handlers):
+            if handler not in before:
+                logger.removeHandler(handler)
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
 
 
 # --------------------------------------------------------------------------- #

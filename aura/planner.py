@@ -1,23 +1,38 @@
 """The planner: turns a transcript into a small, inspectable Plan.
 
-Aura deliberately keeps the LLM's job *narrow* — understand, pick skills,
-fill arguments, write one short reply. It never chooses *how* to do things
-safely; that is the Laya gate's job. This is what lets a 4B model run the
-show locally without feeling dumb or acting dangerous.
+Three layers, in the order a request meets them:
 
-Any OpenAI-compatible endpoint works and every recommended one is local:
-Ollama, mlx_lm.server, llama-server, LM Studio. The demo profile uses a
-deterministic MockPlanner so the full product flow can be exercised on any
-machine — and so tests never flake on a model.
+1. **Rules (`MockPlanner`)** — a deterministic keyword table that answers the
+   everyday commands ("open spotify", "set volume to 30") in microseconds and
+   extracts their free-text arguments exactly.
+2. **Laya (`LayaPlanner`)** — everything the rules cannot route goes to the
+   decision model, which *chooses* the skill from a shortlist with a
+   calibrated probability (one forward pass). Laya never writes text, so it
+   cannot invent an argument: the value still comes from the rules' extractor,
+   and a skill whose arguments cannot be read is refused rather than guessed.
+3. **The optional local LLM (`OpenAICompatPlanner` / `HybridPlanner`)** — a
+   fully local OpenAI-compatible endpoint (Ollama, mlx_lm, llama.cpp, LM
+   Studio) for the open-ended remainder, still available behind
+   `planner.engine = "openai_compat"`.
+
+None of them decides *safety*: that is the Laya gate's job (`aura/laya.py`).
 """
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+from . import intent as intent_mod
+from .laya import HeuristicBackend, LayaBackend, laya_available
+from .log import describe_exception, get_logger
+
+log = get_logger("planner")
 
 try:  # optional — the deterministic basic mode works without it
     import httpx
@@ -56,21 +71,31 @@ class Plan:
     reply: str
     actions: list[Action] = field(default_factory=list)
     latency_ms: int = 0
-    # True when the plan came from the deterministic basic layer because the
-    # local LLM was unreachable — the UI shows a subtle "basic mode" note.
+    # True when the plan came from the deterministic layer because the real
+    # brain was unreachable — the UI shows a subtle "basic mode" note.
     degraded: bool = False
-    # "llm" | "rules" — which layer produced it. The everyday commands are
-    # answered by the rules in microseconds; only what they cannot route is
-    # worth a model round-trip (see HybridPlanner.plan).
-    source: str = "llm"
+    # "laya" | "rules" | "llm" — which layer produced it. The everyday commands
+    # are answered by the rules in microseconds; what they cannot route is
+    # Laya's call (see LayaPlanner.plan).
+    source: str = "laya"
     # False when the layer handled only *part* of the request — a chain where
-    # one step didn't route. A partial plan is worth handing to the model.
+    # one step didn't route. A partial plan is worth handing to Laya.
     complete: bool = True
+    # Time spent inside Laya (routing + choice/score questions) in ms — the
+    # number that tells you whether the fast path is actually fast.
+    model_ms: float = 0.0
+    # "rules" | "laya" | "laya+rules" | "llm" | "none"
+    routed_by: str = ""
+    # Engineer-readable reason when degraded/failed. Logged, shown in the UI's
+    # log, and (for failures) short enough to put in front of the user.
+    diagnostic: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {"reply": self.reply, "actions": [a.as_dict() for a in self.actions],
                 "latency_ms": self.latency_ms, "degraded": self.degraded,
-                "source": self.source, "complete": self.complete}
+                "source": self.source, "complete": self.complete,
+                "model_ms": self.model_ms, "routed_by": self.routed_by,
+                "diagnostic": self.diagnostic}
 
 
 class Planner:
@@ -420,10 +445,7 @@ class MockPlanner(Planner):
 
     @staticmethod
     def _title_case(name: str) -> str:
-        clean = " ".join(name.strip().split())
-        brands = {"youtube": "YouTube", "github": "GitHub", "gmail": "Gmail",
-                  "whatsapp": "WhatsApp", "reddit": "Reddit"}
-        return brands.get(clean.lower(), " ".join(w.capitalize() for w in clean.split()))
+        return intent_mod.title_case(name)
 
     async def plan(self, transcript: str, context: dict[str, Any]) -> Plan:
         started = time.monotonic()
@@ -613,18 +635,204 @@ class MockPlanner(Planner):
         return Plan(reply=reply, actions=actions, complete=complete)
 
 
-def build_planner(cfg, catalog_prompt: str):
-    """Choose the planner for this machine.
+# --------------------------------------------------------------------------- #
+# The Laya planner — the decision model IS the brain                          #
+# --------------------------------------------------------------------------- #
 
-    * mock          — demo profile & tests
-    * auto / openai_compat — HybridPlanner (LLM + basic-mode fallback) when
-      httpx is available; otherwise the basic layer alone, honestly labeled.
+
+class LayaPlanner(Planner):
+    """Rules parse, Laya decides.
+
+    Every request first meets the deterministic rule table, because a reflex
+    must not pay for a model: "open spotify" is a complete plan in
+    microseconds, arguments included. Laya — one `choice` question over a
+    shortlist of plausible skills, answered with a calibrated probability in a
+    single forward pass — takes everything the rules cannot route, which is
+    where a keyword table is at its worst:
+
+        "quiet the house"      → system.toggle_dnd
+        "turn it down a bit"   → system.set_volume (a `score` question)
+        "put the machine to bed" → system.sleep
+
+    The division of labour is not a compromise, it is a capability boundary:
+    Laya cannot generate text, so it cannot invent an argument. Arguments come
+    from `aura.intent.extract_args`, and a skill whose arguments cannot be read
+    from the request is **refused**, never guessed.
+
+    When Laya is unavailable (package missing, weights not downloaded, or a
+    call failed) the rules still answer, the plan is flagged `degraded`, and
+    `diagnostic` carries the reason — visible in the log and in the UI. Silence
+    was the old failure mode; it is not one any more.
     """
-    if cfg.planner.engine == "mock":
-        return MockPlanner(catalog_prompt, cfg.planner.max_actions)
-    if cfg.planner.engine in ("auto", "openai_compat") and httpx is not None:
+
+    #: How much of the request's latency budget Laya routing may take.
+    ROUTE_BUDGET_MS = 2500
+
+    def __init__(self, cfg, catalog_prompt: str, backend: LayaBackend | None = None,
+                 specs: list[Any] | None = None) -> None:
+        self.cfg = cfg
+        self.rules = MockPlanner(catalog_prompt, cfg.planner.max_actions)
+        self.backend = backend if backend is not None else HeuristicBackend()
+        self.specs = (intent_mod.coerce_specs(specs) if specs
+                      else intent_mod.specs_from_catalog(catalog_prompt))
+        self.router = intent_mod.LayaRouter(
+            self.backend, self.specs,
+            min_confidence=float(getattr(cfg.laya, "route_threshold", 0.30) or 0.30),
+        )
+        log.info("planner: laya (%d skills, backend=%s, min_confidence=%.2f)",
+                 len(self.specs), type(self.backend).__name__, self.router.min_confidence)
+
+    # The orchestrator's maintenance loop reads this for /api/state.
+    @property
+    def status(self) -> dict[str, Any]:
         try:
-            return HybridPlanner(cfg, catalog_prompt)
-        except Exception:
-            pass
+            return self.backend.status()
+        except Exception as exc:            # pragma: no cover - introspection only
+            return {"backend": type(self.backend).__name__, "error": describe_exception(exc)}
+
+    def warmup(self) -> bool:
+        """Load the model in the background (never blocks a session)."""
+        try:
+            return bool(self.backend.warmup())
+        except Exception as exc:
+            log.error("planner: laya warm-up failed — %s", describe_exception(exc))
+            return False
+
+    async def plan(self, transcript: str, context: dict[str, Any]) -> Plan:
+        started = time.monotonic()
+        rule_plan = await self.rules.plan(transcript, context)
+        rule_plan.routed_by = "rules"
+
+        # 1 — chit-chat and refusals the rules answered in words. There is no
+        #     action to route, and a model call would add nothing.
+        if not rule_plan.actions and rule_plan.complete and rule_plan.reply:
+            return self._finish(rule_plan, started, source="rules")
+
+        # 2 — a complete deterministic plan is already the right answer.
+        #     (Laya still judges the *action* — see the safety gate — but
+        #     routing it again would only add latency to a reflex.)
+        if rule_plan.actions and rule_plan.complete:
+            log.debug("plan: rules handled %r → %s", transcript[:60],
+                      [a.skill for a in rule_plan.actions])
+            return self._finish(rule_plan, started, source="rules")
+
+        # 3 — everything else is Laya's call.
+        must = [action.skill for action in rule_plan.actions]
+        result = await self._route(transcript, must)
+        model_ms = max(0.0, round(result.ms, 1))
+
+        if result.error:
+            # The fallback answered. Say so, with the reason, and keep the
+            # rules' honest reply if there is one.
+            rule_plan.degraded = True
+            rule_plan.diagnostic = result.error
+            log.warning("plan: laya routing fell back to the offline scorer for %r — %s",
+                        transcript[:60], result.error)
+
+        if result.skill and result.skill not in must:
+            action = Action(result.skill, result.args, result.risk or "safe",
+                            f"chosen by {result.backend} (p={result.confidence:.2f})")
+            reply = result.reply or rule_plan.reply
+            actions = ([*rule_plan.actions, action] if rule_plan.actions else [action])
+            plan = Plan(reply=reply, actions=actions[: self.rules.max_actions],
+                        complete=True, degraded=rule_plan.degraded,
+                        source="laya", model_ms=model_ms,
+                        routed_by="laya+rules" if rule_plan.actions else "laya",
+                        diagnostic=rule_plan.diagnostic)
+            log.info("plan: laya routed %r → %s%s (p=%.2f, %.0fms, backend=%s)",
+                     transcript[:60], result.skill, result.args, result.confidence,
+                     result.ms, result.backend)
+            return self._finish(plan, started, source="laya")
+
+        if result.skill and result.skill in must:
+            # Laya agrees with the rules — the partial plan stands as it was.
+            log.info("plan: laya confirmed the rules' choice %s (p=%.2f, %.0fms)",
+                     result.skill, result.confidence, result.ms)
+
+        if not result.skill:
+            rule_plan.diagnostic = rule_plan.diagnostic or result.reason
+            rule_plan.degraded = rule_plan.degraded or bool(result.error)
+            log.info("plan: nothing routed %r — %s", transcript[:60], result.reason)
+
+        return self._finish(rule_plan, started, source="rules", model_ms=model_ms)
+
+    async def _route(self, transcript: str, must: list[str]) -> intent_mod.RouteResult:
+        """Run the routing call off the event loop, under a hard deadline.
+
+        A model call is foreign code: it may download a checkpoint, or wedge.
+        Off-loop + timeout keeps the orb breathing and the SSE stream live even
+        when the model misbehaves, and the watchdog still owns the session.
+        """
+        loop = asyncio.get_running_loop()
+        call = functools.partial(self.router.route, transcript, must_include=must)
+        # `shield` matters: since 3.11 `wait_for` waits for the cancellation it
+        # requested, and a *running* executor job cannot be cancelled — without
+        # it a wedged model would hold the session for its full duration
+        # instead of the budget. The abandoned call finishes on its own thread.
+        running = loop.run_in_executor(None, call)
+        running.add_done_callback(
+            lambda fut: fut.cancelled() or fut.exception() is None)
+        try:
+            return await asyncio.wait_for(asyncio.shield(running),
+                                          timeout=self.ROUTE_BUDGET_MS / 1000.0)
+        except TimeoutError:
+            reason = f"laya routing did not answer within {self.ROUTE_BUDGET_MS} ms"
+            log.error("plan: %s", reason)
+            return intent_mod.RouteResult(error=reason, reason=reason,
+                                          backend=type(self.backend).__name__)
+        except Exception as exc:      # a router bug must not cost the user an answer
+            reason = describe_exception(exc)
+            log.error("plan: laya routing raised — %s", reason)
+            return intent_mod.RouteResult(error=reason, reason=reason,
+                                          backend=type(self.backend).__name__)
+
+    def _finish(self, plan: Plan, started: float, source: str,
+                model_ms: float = 0.0) -> Plan:
+        plan.source = source
+        if not plan.routed_by:
+            plan.routed_by = source
+        if model_ms:
+            plan.model_ms = model_ms
+        plan.latency_ms = max(1, int((time.monotonic() - started) * 1000))
+        return plan
+
+
+def build_planner(cfg, catalog_prompt: str, specs: list[Any] | None = None,
+                  laya_backend: LayaBackend | None = None):
+    """Choose the planner for this machine — and say which one, and why.
+
+    * ``mock``   — demo profile & tests
+    * ``laya``   — LayaPlanner: rules parse, the decision model routes
+                   (default; needs no model server at all)
+    * ``auto``   — Laya when the package is installed, otherwise the local
+                   OpenAI-compatible model if httpx is available, otherwise the
+                   rules alone
+    * ``openai_compat`` — the LLM-first HybridPlanner (kept for people who run
+                   Ollama/mlx_lm and want generated text)
+    """
+    engine = str(getattr(cfg.planner, "engine", "laya") or "laya").lower()
+    if engine == "mock":
+        log.info("planner: mock (demo profile), %d skills", len(specs or []))
+        return MockPlanner(catalog_prompt, cfg.planner.max_actions)
+
+    if engine in ("laya", "auto"):
+        if engine == "laya":
+            if laya_backend is None:
+                log.error("planner: engine=laya but no Laya backend was provided — "
+                          "the rules answer and routing uses the offline scorer")
+                laya_backend = HeuristicBackend()
+            return LayaPlanner(cfg, catalog_prompt, laya_backend, specs)
+        if laya_backend is not None and laya_available():
+            return LayaPlanner(cfg, catalog_prompt, laya_backend, specs)
+
+    if engine in ("auto", "openai_compat") and httpx is not None:
+        try:
+            planner = HybridPlanner(cfg, catalog_prompt)
+            log.info("planner: hybrid local LLM at %s (model=%s)",
+                     cfg.planner.base_url, cfg.planner.model)
+            return planner
+        except Exception as exc:
+            log.error("planner: could not build the local LLM planner — %s",
+                      describe_exception(exc))
+    log.warning("planner: falling back to the deterministic rule layer")
     return MockPlanner(catalog_prompt, cfg.planner.max_actions)

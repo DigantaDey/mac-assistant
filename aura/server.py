@@ -11,6 +11,7 @@ orchestrator, and it is deliberately boring:
   GET  /api/permissions        honest permission + readiness snapshot
   GET  /api/skills             the skill catalog
   GET  /api/metrics            self-observation (RSS, engines, examples)
+  GET  /api/log?tail=200       the engine's own log file (what Activity shows)
   GET  /api/history            recent sessions (Activity timeline)
   GET  /api/wake/train         wake-phrase training session status
   GET  /api/events             SSE stream of the EventBus
@@ -47,9 +48,10 @@ import queue
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from . import localauth
+from . import log as log_mod
 
 TOKEN_HEADER = "X-Aura-Token"
 
@@ -185,8 +187,8 @@ class AuraServer:
                             return await coro
                         return await asyncio.wait_for(coro, timeout=timeout)
                     except Exception as exc:  # never lose a background failure
-                        orch.bus.publish(
-                            "log", line=f"{label} failed: {exc.__class__.__name__}: {exc}")
+                        detail = log_mod.log_exception(f"{label} failed", exc)
+                        orch.bus.publish("log", line=f"{label} failed: {detail}")
 
                 def _spawn() -> None:
                     task = orch.loop.create_task(_wrapped())
@@ -212,13 +214,18 @@ class AuraServer:
                         "version": _version(),
                         "message": ("Aura's engine is running. Use the Aura menu-bar app — "
                                     "there is no browser interface by design."),
-                        "endpoints": ["/api/health", "/api/state", "/api/events"],
+                        "endpoints": ["/api/health", "/api/state", "/api/events",
+                                      "/api/log"],
                     })
                 elif path == "/api/health":
+                    laya = _laya_snapshot(orch, cfg)
                     self._json({"ok": True, "state": orch.state,
                                 "bridge": orch.bridge.platform,
                                 "mic_ready": bool(getattr(orch, "_has_audio", False)),
                                 "planner_online": getattr(orch, "planner_online", None),
+                                "laya_ready": bool(laya.get("ready")),
+                                "laya_backend": laya.get("backend", ""),
+                                "laya_error": laya.get("error", ""),
                                 "auth": bool(token),
                                 "version": _version()})
                 elif path == "/api/state":
@@ -235,6 +242,15 @@ class AuraServer:
                     self._json(orch.training_status())
                 elif path == "/api/history":
                     self._json({"events": orch.memory.recent_events(100)})
+                elif path == "/api/log":
+                    query = parse_qs(urlsplit(self.path).query)
+                    try:
+                        tail = int((query.get("tail") or ["200"])[0])
+                    except ValueError:
+                        tail = 200
+                    self._json({"file": str(_log_file()), "path": str(log_mod.log_path() or ""),
+                                "lines": log_mod.tail(tail),
+                                "status": log_mod.log_status()})
                 elif path == "/api/events":
                     self._sse()
                 else:
@@ -516,9 +532,31 @@ def _permissions_snapshot(orch, cfg) -> dict:
     }
 
 
+def _laya_snapshot(orch, cfg) -> dict:
+    """What the decision layer is actually doing — including why it is not."""
+    from . import log as log_mod
+
+    status: dict[str, Any] = {}
+    try:
+        status = dict(orch.laya.status())
+    except Exception as exc:                       # introspect honestly, never raise
+        status = {"backend": type(orch.laya).__name__, "ready": False,
+                  "error": f"{type(exc).__name__}: {exc}"}
+    if not status.get("error"):
+        status["error"] = log_mod.log_status().get("last_error", "")
+    status.setdefault("backend", type(orch.laya).__name__)
+    status["confidence_threshold"] = cfg.laya.confidence_threshold
+    status["confidence"] = cfg.laya.confidence_threshold   # kept for the app's card
+    status["destructive_threshold"] = cfg.laya.destructive_threshold
+    status["examples"] = orch.examples.stats()
+    status["log_file"] = log_mod.log_status().get("file")
+    return status
+
+
 def _state_snapshot(orch, cfg, auth: bool = True) -> dict:
     session = orch.session
     planner_status = dict(getattr(orch, "planner_status", {}) or {})
+    planner_name = type(getattr(orch, "planner", None)).__name__
     return {
         "state": orch.state,
         "version": _version(),
@@ -532,14 +570,13 @@ def _state_snapshot(orch, cfg, auth: bool = True) -> dict:
         "mic_ready": bool(getattr(orch, "_has_audio", False)),
         "planner_online": getattr(orch, "planner_online", None),
         "auth": auth,
-        "laya": {
-            "backend": type(orch.laya).__name__,
-            "confidence": cfg.laya.confidence_threshold,
-            "examples": orch.examples.stats(),
-        },
-        "planner": {"engine": cfg.planner.engine, "model": cfg.planner.model,
+        "laya": _laya_snapshot(orch, cfg),
+        "planner": {"engine": cfg.planner.engine, "class": planner_name,
+                    "model": cfg.planner.model,
                     "base_url": cfg.planner.base_url,
-                    "last_error": planner_status.get("last_error", "")},
+                    "last_error": planner_status.get("last_error", ""),
+                    "ready": planner_status.get("ready"),
+                    "routed_by": getattr(getattr(session, "plan", None), "routed_by", "")},
         "preferences": orch.memory.all_preferences(),
         "session": None if not session else {
             "id": session.id, "transcript": session.transcript,

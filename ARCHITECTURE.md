@@ -20,9 +20,9 @@ paranoid gate, and dumb-but-perfect executors.
 │      │        └────────────────────────┬────────────────────────────────┘ │
 │      │                                 │                                  │
 │  TTS  │        Planner ────────► SafetyGate ────────► SkillRegistry        │
-│ `say` │  OpenAI-compat local    blocklist          24 declared skills      │
-│ /Piper│  LLM (Ollama/mlx_lm/    + skill manifest   AppleScript · AX · `open`│
-│       │  llama.cpp/LM Studio)   + Laya gate        · pbcopy/pbpaste        │
+│ `say` │  rules, then Laya       blocklist          24 declared skills      │
+│ /Piper│  (LLM optional, same    + skill manifest   AppleScript · AX · `open`│
+│       │  seam)                  + Laya gate        · pbcopy/pbpaste        │
 │       │                                 │                                  │
 │  EventBus ──► SSE ──► UI (127.0.0.1)    ▼                                  │
 │                ▲              Memory (SQLite: events · preferences ·       │
@@ -45,26 +45,39 @@ paranoid gate, and dumb-but-perfect executors.
   offline, instant); Piper/Kokoro are drop-in upgrades.
 
 ### 2. The planner (`planner.py`)
-A deliberately *narrow* LLM contract:
+Three layers behind one contract — and the plan is always a *typed object*
+(`Plan`), never free text:
 
 ```json
 {"reply": "one short spoken sentence",
  "actions": [{"skill": "system.open_app", "args": {"app": "Spotify"},
-              "risk": "safe", "why": "asked to open it"}]}
+              "risk": "safe", "why": "asked to open it"}],
+ "source": "rules|laya|laya+rules|llm|none", "complete": true,
+ "model_ms": 12.4, "degraded": false, "diagnostic": ""}
 ```
 
-- Runs against any local OpenAI-compatible server. 4B-class quantized models
-  hold this format reliably with a tight prompt + one few-shot anchor.
-- Parsing is defensive (fence-stripping, brace-matching, schema coercion):
-  a malformed model output degrades to a clarifying question, never a crash.
-- **`HybridPlanner` (v0.5):** the planner *is* the LLM client plus a
-  built-in-skill fallback behind one interface. A cheap, throttled
-  `GET /api/health` probe decides; offline ⇒ the plan comes from the skill
-  catalog ("open youtube" still opens YouTube) and the reply carries
-  `degraded: true` so the UI can say "running on basics". A planner crash
-  mid-session is caught by the orchestrator's session guard and answered
-  the same way — a slow Mac or a cold-starting Ollama can never make a
-  command vanish.
+- **Rules first (microseconds).** The deterministic table parses everyday
+  commands — verbs, apps, URLs, volume, chains — with arguments, and returns a
+  complete plan. A reflex must never wait for a model, so this layer is
+  untouched by anything below it.
+- **Laya second (`LayaPlanner`, the default, `planner.engine = "laya"`).**
+  Whatever the rules cannot place goes to one `choice` question over a
+  shortlist of the skill catalog (retrieval + an intent lexicon pick the
+  options; the model picks the skill), plus a `score` question when a value
+  lives on a scale (volume). A partial rule plan is *extended*, not replaced;
+  a pick below `laya.route_threshold` means "no skill" and is never acted on.
+- **LLM last (`HybridPlanner`, opt-in).** The same one-method interface over a
+  local OpenAI-compatible server (Ollama/mlx_lm/llama.cpp/LM Studio) with a
+  throttled health probe; parsing is defensive (fence-stripping,
+  brace-matching, schema coercion).
+- **Arguments are never generated.** They come from deterministic extraction
+  (`aura/intent.extract_args`) or a closed set offered to Laya. A skill whose
+  argument cannot be read from the request is *refused*, not guessed — the one
+  hallucination this design makes impossible.
+- **Degradation is visible.** Every plan carries `source`, `routed_by`,
+  `model_ms`, `degraded` and a human-readable `diagnostic`. A planner crash is
+  caught by the session guard; the user gets the reason, the log gets the
+  traceback.
 - The planner never decides *safety*. It proposes; the gate disposes.
 
 ### 3. The Laya gate (`laya.py`) — the signature layer
@@ -78,9 +91,14 @@ probabilities in a single forward pass:
 Anything else ⇒ propose and wait for a human. Below-threshold confidence is
 treated as *risk*, never as permission.
 
-The backend is swappable: the real `laya` package (MLX/CoreML) when installed;
-a deterministic, explainable `HeuristicBackend` otherwise (demo profile, CI,
-first runs). Same answers, same interface, one-file swap.
+The backend is swappable: the real `laya` package when installed — both
+questions are asked in **one `Router.predict()` call**, so a decision costs one
+forward pass — and a deterministic, explainable `HeuristicBackend` otherwise
+(demo profile, CI, first runs). `LayaGate` owns the real backend: it loads
+weights in the background, bounds every call with `laya.call_budget_seconds`,
+degrades for a cooldown after a timeout, and returns an answer *plus the
+reason* instead of an exception. Every fallback is logged with its traceback
+and carried on the `Decision` (`error`, `source`).
 
 ### 4. The learning loop (`memory.py`, `laya.py`, `scripts/nightly_laya.py`)
 - **Tier 1 — memory, always on:** every session lands in SQLite; durable
@@ -197,6 +215,25 @@ icon, one instance):
 - `scripts/make_app.sh` assembles and ad-hoc-signs `Aura.app`; the icon is
   generated by `scripts/make_icon.py`.
 
+### 9. Logging (`log.py`) — the engine explains itself
+One place configures three sinks, so "what happened?" has one answer:
+
+- **stderr** — the app's `EngineSupervisor` pipes it into
+  `~/Library/Logs/Aura.log` (what a bug report needs);
+- **`<data dir>/aura.log`** — a rotating file (2 MB × 3) the engine can read
+  back via `aura.log.tail()`, exposed as `GET /api/log?tail=200`;
+- **the event bus** — each record above `logging.event_level` is mirrored as a
+  `log` event, so the app's Activity feed shows the engine's own log lines.
+
+`log_exception()` is the workhorse: it logs the traceback *and* returns the
+short form (`"AttributeError: 'Router' object has no attribute 'ask'"`) that a
+reply or a status endpoint carries. Unhandled exceptions on the orchestrator's
+loop go through `install_exception_hooks()`. Level is a live setting
+(`[logging] level`, `AURA_LOG_LEVEL`). The rule is enforced, not aspirational:
+no layer below the gate may swallow an exception, and `python -m aura doctor`
+plus `python -m aura laya-check` exist to prove the model path end-to-end from
+a terminal.
+
 ## Configuration
 `config.default.toml` → user `config.toml` → `runtime.toml` (written by the
 app) → `AURA_*` env vars. The `auto` profile resolves to **mac** on macOS
@@ -208,11 +245,14 @@ at runtime (`POST /api/config` validates type + membership, persists to
 refused with a friendly message.
 
 ## Testing
-**Engine (Linux CI, `pytest`):** 200+ tests cover the JSON parser, mock
-planner routing, the **hybrid planner's fallbacks** (dead endpoint ⇒ degraded
-plan that still acts), the **session guard** (planner crash ⇒ session still
-answers), wake fallback honesty, safety verdicts, the Laya heuristic +
-example buffer, memory/FTS/preferences, **access control** (token required,
+**Engine (Linux CI, `pytest`):** 280+ tests cover the JSON parser, the rule
+layer, the **Laya adapter against the published API** (a fake `laya` module
+implements `Router.predict`/`predict_batch`, so the real code path runs
+off-Mac), routing/degradation, the **planner's fallbacks** (dead endpoint ⇒
+degraded plan that still acts), the **session guard** (planner crash ⇒ session
+still answers, with the error named), logging (file/bus/tail/`/api/log`), wake
+fallback honesty, safety verdicts, the Laya heuristic + example buffer,
+memory/FTS/preferences, **access control** (token required,
 browser `Origin` and foreign `Host` refused, no HTML surface), live config
 round-trips and refusals, and **full orchestration over real HTTP** (typed
 session, confirmation flow, cancel flow, busy-state hints, feedback

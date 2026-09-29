@@ -32,7 +32,8 @@ LIVE_FIELDS: dict[str, set[str]] = {
     "wake": {"enabled", "mode", "models", "threshold", "refractory_seconds", "phrase"},
     "stt": {"whisper_model"},   # the orchestrator rebuilds the STT engine live
     "tts": {"enabled", "voice", "rate"},
-    "laya": {"confidence_threshold", "destructive_threshold"},
+    "laya": {"confidence_threshold", "destructive_threshold", "route_threshold"},
+    "logging": {"level", "event_level"},
     "safety": {"show_plan_before_run", "confirm_destructive", "blocked_patterns"},
     "session": {"max_utterance_seconds", "end_of_speech_seconds",
                 "confirmation_timeout_seconds", "idle_unload_seconds",
@@ -75,9 +76,12 @@ class STTConfig:
 
 @dataclass
 class PlannerConfig:
-    # "auto" — first healthy OpenAI-compatible endpoint; "mock" — deterministic
-    # planner used by the demo profile and tests.
-    engine: str = "auto"
+    # "laya"          — the default: the rules parse, the Laya decision model
+    #                   routes whatever they cannot (no LLM server needed).
+    # "auto"          — Laya when installed, else the local LLM, else rules.
+    # "openai_compat" — the LLM-first planner (Ollama/mlx_lm/llama.cpp/LM Studio).
+    # "mock"          — the deterministic rule layer alone (demo profile, tests).
+    engine: str = "laya"
     # Any OpenAI-compatible server works, all fully local:
     #   Ollama:   http://127.0.0.1:11434/v1        (model e.g. qwen3:4b)
     #   mlx_lm:   http://127.0.0.1:8080/v1         (mlx_lm.server)
@@ -98,14 +102,32 @@ class PlannerConfig:
 @dataclass
 class LayaConfig:
     enabled: bool = True
-    # "auto" — use the `laya` package (MLX/CoreML backends) when importable,
-    #          otherwise the deterministic heuristic gate (used in demo/tests).
+    # "auto"      — use the `laya` package when importable, otherwise the
+    #               deterministic heuristic gate (demo profile, CI, first run).
+    # "heuristic" — never load the package; the offline gate answers.
     backend: str = "auto"
     # A proposed action is auto-approved only when the gate is at least this
     # confident that it matches the request and is safe. Below it → ask.
     confidence_threshold: float = 0.62
     destructive_threshold: float = 0.55  # score above this ⇒ require confirmation
-    adapter_dir: str = ""            # fine-tuned adapter loaded at runtime
+    # Routing (which skill a request means) is a `choice` question; a pick
+    # below this probability is treated as "no skill" rather than acted on.
+    route_threshold: float = 0.30
+    # "" → let the package choose (MPS/CUDA/CPU); or "cpu", "mps", "cuda"…
+    device: str = ""
+    # "" → the router picks per language ("english", "multilingual", …)
+    model: str = ""
+    # True keeps *every* checkpoint resident (fastest, ~GBs of RAM). False
+    # warms just the one the router routes to — the shipped default.
+    preload: bool = False
+    max_loaded: int = 2              # how many checkpoints may stay in memory
+    # 0 = keep the model resident forever. A positive value releases it after
+    # that many idle seconds; the next question pays the reload.
+    idle_unload_seconds: float = 0.0
+    # A single question may not hold the session hostage: past this, the
+    # offline gate answers and the reason is logged.
+    call_budget_seconds: float = 1.5
+    adapter_dir: str = ""            # fine-tuned checkpoint directory
 
 
 @dataclass
@@ -130,6 +152,14 @@ class SafetyConfig:
     blocked_patterns: list[str] = field(
         default_factory=lambda: ["rm -rf /", "diskutil erase", "sudo dd"]
     )
+
+
+@dataclass
+class LoggingConfig:
+    """Two levels: what the file/stderr get, and what the app's feed shows."""
+    level: str = "info"              # debug | info | warning | error
+    event_level: str = "info"        # what is mirrored into the UI Activity feed
+    file: bool = True                # also write <data_dir>/aura.log (rotating)
 
 
 @dataclass
@@ -162,6 +192,7 @@ class Config:
     laya: LayaConfig = field(default_factory=LayaConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
 
@@ -330,6 +361,14 @@ def load_config(explicit_path: str | None = None,
         cfg.stt.engine = "null"
         cfg.planner.engine = "mock"
         cfg.tts.engine = "null"
+        cfg.laya.backend = "heuristic"
+
+    # Environment overrides for logging (the app sets none of these; a
+    # developer debugging a Mac install sets all of them).
+    if os.environ.get("AURA_LOG_LEVEL"):
+        cfg.logging.level = os.environ["AURA_LOG_LEVEL"]
+    if os.environ.get("AURA_LOG_EVENT_LEVEL"):
+        cfg.logging.event_level = os.environ["AURA_LOG_EVENT_LEVEL"]
 
     return cfg
 
