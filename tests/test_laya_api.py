@@ -86,6 +86,10 @@ class TestRealBackendContract:
         router = fake_laya.FakeRouter.instances[0]
         assert len(router.batches) == 1, "two actions must cost one batched pass"
         assert router.calls == []
+        requests = router.batches[0]
+        assert len(requests) == 2
+        assert all(set(request) == {"state", "questions"} for request in requests)
+        assert all(request["questions"] == GATE_QUESTIONS for request in requests)
         assert len(decisions) == 2
         assert decisions[0].match > 0.5 and decisions[1].match > 0.5
 

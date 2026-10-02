@@ -61,6 +61,10 @@ public final class EngineSupervisor {
     private var restartAttempts = 0
     private var launchedAt = Date.distantPast
     private var intentionalStop = false
+    /// Serialises asynchronous boot requests. A termination callback, app
+    /// activation and a manual restart can otherwise all pass the health probe
+    /// before any child binds the port, spawning two engines.
+    private var bootInProgress = false
     private let maxRestartAttempts = 8
 
     public init(client: EngineClient, token: String, log: AuraLog = .shared) {
@@ -118,16 +122,36 @@ public final class EngineSupervisor {
     // MARK: - boot sequence
 
     private func boot() async {
+        guard !bootInProgress else {
+            log.write("Aura.app: ignored duplicate engine start while boot is in progress")
+            return
+        }
+        bootInProgress = true
+        defer { bootInProgress = false }
+
         status = .starting
         AppPaths.ensureSupportDirectory()
 
         // 1 — an engine may already be running (app relaunch, or a second copy
-        //     of the app): adopt it instead of starting a fight over the port.
+        //     of the app). Adopt only the same engine version. Attaching v0.6.2
+        //     UI to a months-old v0.6.0 process leaves the newly installed code
+        //     unused and was the reason upgrades appeared to do nothing.
         if let health = await probe() {
-            status = .running(external: true)
-            log.write("Aura.app: attached to a running engine (v\(health.version ?? "?"))")
-            startWatchdog()
-            return
+            if health.version == AuraVersion.semantic {
+                status = .running(external: true)
+                log.write("Aura.app: attached to a running engine (v\(health.version ?? "?"))")
+                startWatchdog()
+                return
+            }
+            let found = health.version ?? "unknown"
+            log.write("Aura.app: running engine v\(found) does not match app v\(AuraVersion.semantic); replacing it")
+            if let occupant = await portOccupant(), occupant.isAuraEngine {
+                occupant.terminate()
+                try? await Task.sleep(nanoseconds: 900_000_000)
+            } else {
+                status = .failed("Aura engine v\(found) is still using port \(Prefs.port). Quit it and restart Aura.")
+                return
+            }
         }
 
         // 2 — something else holds the port. If it's an old Aura engine with a

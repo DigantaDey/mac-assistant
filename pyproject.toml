@@ -32,7 +32,7 @@ mac = [
   "laya>=0.3.20,<0.4",       # the System-1 decision model — the brain (Apache-2.0)
   "piper-tts>=1.2",          # optional local TTS
 ]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4",
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4", "numpy>=1.26",
   # Swift syntax gate that runs anywhere (see scripts/check_swift_syntax.py)
   "tree-sitter>=0.23", "tree-sitter-swift>=0.6"]
 
