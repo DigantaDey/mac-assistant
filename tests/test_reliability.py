@@ -120,11 +120,13 @@ async def test_a_planner_without_warmup_does_not_break_startup(stack: DemoStack)
 # --------------------------------------------------------------------------- #
 
 
-def test_active_work_deadline_is_hard_capped_at_five_seconds(stack: DemoStack):
+def test_active_work_deadline_is_hard_capped(stack: DemoStack):
     """Old runtime files may still say 300 seconds; the product SLO wins."""
+    from aura.orchestrator import MAX_ACTIVE_REQUEST_SECONDS
+
     orch = stack.build_orchestrator()
     orch.cfg.session.max_session_seconds = 300.0
-    assert orch._session_budget_seconds() == 5.0
+    assert orch._session_budget_seconds() == MAX_ACTIVE_REQUEST_SECONDS
 
 
 async def test_open_youtube_uses_the_instant_browser_path(stack: DemoStack):

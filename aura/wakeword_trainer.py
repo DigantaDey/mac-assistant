@@ -280,8 +280,8 @@ def train_wake(positives: list, negatives: list | None = None) -> TrainedWake:
     # used to put three serial, potentially 30-second subprocesses behind the
     # “Train phrase” button (and `say` may emit an AIFF container that Python's
     # wave reader rejects anyway). User-supplied negatives remain supported,
-    # while deterministic spectral negatives keep this interactive fit below
-    # the product's five-second response budget.
+    # while deterministic spectral negatives keep this interactive fit
+    # snappy enough to feel instant behind the "Train phrase" button.
     neg = np.stack([spectral_embedding(normalize_length(n)) for n in negs])
     neg = neg / np.maximum(np.linalg.norm(neg, axis=1, keepdims=True), 1e-9)
 

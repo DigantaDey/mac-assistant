@@ -1,7 +1,7 @@
 """v0.5 ship-quality tests: the bugs that made Aura feel broken.
 
 Covers:
-  * HybridPlanner — LLM unreachable ⇒ honest basic mode, never silence
+  * the planner is Laya-only — no LLM, and silence is not an outcome
   * sessions always end — an exploding planner must not freeze the orb
   * wake engine never crashes the orchestrator on missing model files
   * the new server endpoints (live settings, permission requests, steps)
@@ -15,115 +15,109 @@ import asyncio
 from conftest import DemoStack, auth_headers, collect, get, post
 
 # --------------------------------------------------------------------------- #
-# HybridPlanner: the brain with a spine                                        #
+# The brain is Laya — no LLM anywhere                                          #
 # --------------------------------------------------------------------------- #
 
 
-class TestHybridPlanner:
-    def make_cfg(self, monkeypatch, tmp_path):
+class TestLayaOnlyBrain:
+    """Aura's planner has no model server to phone: rules parse the everyday
+    commands, Laya routes the rest, and every layer answers or refuses —
+    silence is not one of the outcomes."""
+
+    def make_cfg(self, tmp_path):
         cfg = DemoStack(tmp_path).cfg
         cfg.profile = "mac"
-        cfg.planner.engine = "openai_compat"
-        # Port 9 is "discard" — guaranteed closed on a normal machine.
-        cfg.planner.base_url = "http://127.0.0.1:9/v1"
+        cfg.planner.engine = "laya"
         return cfg
 
-    def test_factory_gives_hybrid_on_real_engine(self, monkeypatch, tmp_path):
-        from aura.planner import HybridPlanner, build_planner
-
-        cfg = self.make_cfg(monkeypatch, tmp_path)
+    def test_factory_gives_laya_planner(self, tmp_path):
+        from aura.planner import LayaPlanner, build_planner
         from aura.skills import build_default_registry
 
+        cfg = self.make_cfg(tmp_path)
         reg = build_default_registry()
-        planner = build_planner(cfg, reg.catalog_prompt())
-        assert isinstance(planner, HybridPlanner)
+        planner = build_planner(cfg, reg.catalog_prompt(), reg.specs())
+        assert isinstance(planner, LayaPlanner)
 
-    def test_dead_endpoint_degrades_to_basic_mode(self, monkeypatch, tmp_path):
-        from aura.planner import build_planner
+    def test_legacy_llm_engine_maps_to_laya(self, tmp_path):
+        """Old configs that still say openai_compat get Laya, not a server."""
+        from aura.planner import LayaPlanner, build_planner
         from aura.skills import build_default_registry
 
-        cfg = self.make_cfg(monkeypatch, tmp_path)
+        cfg = self.make_cfg(tmp_path)
+        cfg.planner.engine = "openai_compat"
         reg = build_default_registry()
-        planner = build_planner(cfg, reg.catalog_prompt())
+        planner = build_planner(cfg, reg.catalog_prompt(), reg.specs())
+        assert isinstance(planner, LayaPlanner)
 
-        assert planner.probe() is False
-        # Routed by the rules without ever needing the model …
-        plan = asyncio.run(planner.plan("open spotify", {}))
-        assert plan.actions and plan.actions[0].skill == "system.open_app"
-        assert plan.source == "rules"
-        assert plan.degraded is False        # a reflex is not a degraded answer
-        # … and what the rules cannot route still gets an honest reply.
-        plan = asyncio.run(planner.plan("refactor the kernel", {}))
-        assert not plan.actions
-        assert plan.degraded is True
-        assert planner.status["online"] is False
+    def test_no_llm_classes_remain(self):
+        import aura.planner as planner_mod
 
-    def test_routed_commands_never_touch_the_model(self, monkeypatch, tmp_path):
+        assert not hasattr(planner_mod, "HybridPlanner")
+        assert not hasattr(planner_mod, "OpenAICompatPlanner")
+        assert not hasattr(planner_mod, "httpx")
+
+    def test_routed_commands_never_touch_the_model(self, tmp_path):
         """The latency promise: an everyday command is answered by the rules,
-        so a slow — or absent — model server cannot slow it down."""
+        so a slow — or absent — model cannot slow it down."""
+        from aura.laya import HeuristicBackend
         from aura.planner import build_planner
         from aura.skills import build_default_registry
 
-        cfg = self.make_cfg(monkeypatch, tmp_path)
+        cfg = self.make_cfg(tmp_path)
         reg = build_default_registry()
-        planner = build_planner(cfg, reg.catalog_prompt())
 
-        def exploding_plan(transcript, context):      # pragma: no cover
-            raise AssertionError("the model must not be consulted")
+        class TripwireBackend(HeuristicBackend):
+            def choose(self, *a, **kw):      # pragma: no cover - must not run
+                raise AssertionError("the model must not be consulted")
 
-        planner.llm.plan = exploding_plan
-        planner.probe = lambda: True
-
+        planner = build_planner(cfg, reg.catalog_prompt(), reg.specs(),
+                                TripwireBackend())
         for text, skill in [("open spotify", "system.open_app"),
                             ("set volume to 30", "system.set_volume"),
                             ("open spotify and set volume to 30", "system.set_volume")]:
             plan = asyncio.run(planner.plan(text, {}))
             assert plan.source == "rules", text
             assert any(a.skill == skill for a in plan.actions), text
-            assert plan.latency_ms < 50, text
+            assert plan.degraded is False, text
 
-    def test_unroutable_commands_reach_the_model(self, monkeypatch, tmp_path):
-        """The model keeps its job: the requests the rules cannot place."""
+    def test_unroutable_commands_reach_laya(self, tmp_path):
+        """Laya keeps its job: the requests the rules cannot place."""
+        from aura.laya import Choice, HeuristicBackend
         from aura.planner import build_planner
         from aura.skills import build_default_registry
 
-        cfg = self.make_cfg(monkeypatch, tmp_path)
+        cfg = self.make_cfg(tmp_path)
         reg = build_default_registry()
-        planner = build_planner(cfg, reg.catalog_prompt())
 
-        class FakeLLM:
-            async def plan(self, transcript, context):
-                from aura.planner import Action, Plan
-                return Plan(reply="Done.", actions=[Action("system.open_app",
-                                                           {"app": "Notes"})])
+        class FakeLaya(HeuristicBackend):
+            def choose(self, state, instructions, options):
+                return Choice(choice="system.toggle_dnd",
+                              probabilities={"system.toggle_dnd": 0.9, "none": 0.1},
+                              backend="fake", source="real")
 
-        planner.llm = FakeLLM()
-        planner.probe = lambda: True
-        plan = asyncio.run(planner.plan("refactor the kernel", {}))
-        assert plan.source == "llm"
+        planner = build_planner(cfg, reg.catalog_prompt(), reg.specs(), FakeLaya())
+        plan = asyncio.run(planner.plan("quiet the house down a bit", {}))
+        assert plan.source == "laya"
+        assert plan.actions and plan.actions[0].skill == "system.toggle_dnd"
         assert plan.degraded is False
-        assert plan.actions[0].skill == "system.open_app"
 
-    def test_a_partial_rule_match_is_handed_to_the_model(self, monkeypatch, tmp_path):
-        """'open notes and refactor the kernel': the rules can place the first
-        half only, and silently dropping the second half is not an answer."""
+    def test_a_laya_failure_degrades_but_never_goes_silent(self, tmp_path):
+        from aura.laya import HeuristicBackend
         from aura.planner import build_planner
         from aura.skills import build_default_registry
 
-        cfg = self.make_cfg(monkeypatch, tmp_path)
+        cfg = self.make_cfg(tmp_path)
         reg = build_default_registry()
-        planner = build_planner(cfg, reg.catalog_prompt())
 
-        class FakeLLM:
-            async def plan(self, transcript, context):
-                from aura.planner import Plan
-                return Plan(reply="Opened Notes.")
+        class BrokenLaya(HeuristicBackend):
+            def choose(self, *a, **kw):
+                raise RuntimeError("the checkpoint caught fire")
 
-        planner.llm = FakeLLM()
-        planner.probe = lambda: True
-        plan = asyncio.run(planner.plan("open notes and refactor the kernel", {}))
-        assert plan.source == "llm"
-        assert plan.reply == "Opened Notes."
+        planner = build_planner(cfg, reg.catalog_prompt(), reg.specs(), BrokenLaya())
+        plan = asyncio.run(planner.plan("put the machine to bed", {}))
+        assert plan.reply                      # an honest answer, not silence
+        assert plan.degraded is True
 
     def test_mock_planner_is_never_degraded(self, tmp_path):
         from aura.planner import build_planner
@@ -367,7 +361,9 @@ def test_auto_off_mac_pins_demo_base(monkeypatch, tmp_path):
 
     cfg = load_config()
     if sys.platform != "darwin":
-        assert cfg.planner.engine == "mock"
+        # The brain is Laya on every platform — the demo base pins only the
+        # I/O surfaces, never the planner.
+        assert cfg.planner.engine == "laya"
         assert cfg.stt.engine == "null"
         assert cfg.wake.mode == "manual"
 

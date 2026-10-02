@@ -4,7 +4,35 @@ Ship order matters: each stage is usable on its own, and every stage widens
 the moat (offline + personal + fast) before Apple's Siri V2 closes the
 mainstream gap.
 
-**Current release: v0.6.2 — the Laya brain** (✅ shipped; see below).
+**Current release: v0.7.0 — the keyboardless Laya navigator** (see below).
+
+## v0.7 — No LLM, Laya is the brain ✅
+The core feature (getting an answer out of the assistant) was rebuilt around
+one rule: **no large language model, anywhere.** Local LLMs take seconds to
+minutes per request; Laya answers a typed question in one forward pass.
+
+- [x] LLM planner deleted — `HybridPlanner` and the OpenAI-compatible client
+      are gone from `aura/planner.py`; `build_planner` yields rules or Laya,
+      legacy `planner.engine` values map to Laya with a warning
+- [x] A navigation checkpoint **in the repo** (`assets/models/aura-nav-laya`,
+      8 MB, trained by `scripts/train_navigation_laya.py`) — Laya works on
+      first boot with no hub download; `python -m aura laya-check` proves it
+- [x] Routing rebuilt as one closed-set Laya question over a retrieval
+      shortlist of the 24-skill catalog (`aura/intent.py`); arguments stay
+      deterministic (`extract_args`) — never generated
+- [x] Voice front door: `python -m aura talk` (mic-or-type REPL) and
+      `python -m aura hear file.wav` run the full pipeline without the app
+- [x] Budgets sized for a decision model: planning capped, each Laya call
+      ≤6 s, any request active for 20 s is closed with a real answer
+- [x] Learning loop made real: `ExampleBuffer` verdicts → JSONL →
+      `train_navigation_laya.py --feedback-jsonl` rebuilds the checkpoint
+      (`scripts/nightly_laya.py` gates the swap on the ≥85 % bar)
+- [x] Live integration test (`tests/test_laya_live.py`) runs the real `laya`
+      package against the bundled checkpoint whenever it is importable
+- [x] Installer drops Ollama entirely; it trains a checkpoint on the spot if
+      the bundled one is ever missing
+- [ ] Field-test on Apple Silicon: mic → whisper.cpp → Laya → executor,
+      end-to-end, keyboardless (the only item that needs your Mac)
 
 ## v0.1 — Foundation ✅
 - [x] Orchestrator state machine with confirmation as a real state

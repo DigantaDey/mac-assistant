@@ -17,7 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from aura.ax import AXNode
-from aura.formfill import llm_parse, plan_fill, scan_form
+from aura.formfill import plan_fill, scan_form
 from aura.planner import MockPlanner
 from aura.skills import build_default_registry
 from aura.skills.base import SkillContext
@@ -177,34 +177,6 @@ class TestPlanFill:
 # --------------------------------------------------------------------------- #
 # The LLM pass — free paraphrase, but grounded                                 #
 # --------------------------------------------------------------------------- #
-
-class TestLlmParse:
-    def _scan(self):
-        return scan_form(FormTree().root(), "Safari")
-
-    def test_valid_labels_accepted(self):
-        def ask(prompt: str) -> str:
-            return '{"fields": [{"label": "Email", "value": "x@y.z"},' \
-                   ' {"label": "City", "value": "Reno"}]}'
-        out = llm_parse("the mail is x at y dot z, city Reno", self._scan(), ask)
-        assert {a.field.label: a.value for a in out} == {
-            "Email": "x@y.z", "City": "Reno"}
-
-    def test_hallucinated_labels_dropped(self):
-        def ask(prompt: str) -> str:
-            return '{"fields": [{"label": "Wizard Name", "value": "X"},' \
-                   ' {"label": "City", "value": "Reno"}]}'
-        out = llm_parse("whatever", self._scan(), ask)
-        assert {a.field.label for a in out} == {"City"}
-
-    def test_client_failure_is_none(self):
-        def ask(prompt: str) -> str:
-            raise RuntimeError("ollama down")
-        assert llm_parse("fill it", self._scan(), ask) is None
-
-    def test_garbage_output_is_none(self):
-        assert llm_parse("fill it", self._scan(), lambda p: "no json here") is None
-
 
 # --------------------------------------------------------------------------- #
 # The skills                                                                   #

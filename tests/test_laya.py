@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from aura.laya import HeuristicBackend, build_backend
+from aura.laya import HeuristicBackend
 
 
 class TestHeuristicBackend:
@@ -30,19 +30,15 @@ class TestHeuristicBackend:
 
 class TestBackendSelection:
     def test_falls_back_to_heuristic_without_laya(self, monkeypatch):
+        import aura.laya as laya_mod
+
         class Cfg:
             class laya:
                 backend = "auto"
                 adapter_dir = ""
-        # force the real import to fail
-        import builtins
-        real_import = builtins.__import__
+                checkpoint_dir = ""
 
-        def fake_import(name, *a, **k):
-            if name == "laya":
-                raise ImportError("not installed")
-            return real_import(name, *a, **k)
-
-        monkeypatch.setattr(builtins, "__import__", fake_import)
-        backend = build_backend(Cfg())
+        # The package being unavailable is exactly what laya_available() says.
+        monkeypatch.setattr(laya_mod, "laya_available", lambda: False)
+        backend = laya_mod.build_backend(Cfg())
         assert isinstance(backend, HeuristicBackend)

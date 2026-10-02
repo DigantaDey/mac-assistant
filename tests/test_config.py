@@ -61,9 +61,9 @@ class TestLiveApply:
         stack = self.build(tmp_path, monkeypatch)
         orch = stack.build_orchestrator()
         fresh = load_config()
-        fresh.planner.model = "should-not-apply"
+        fresh.planner.max_actions = 9          # planner fields are restart-only
         orch.apply_live_config(fresh)
-        assert orch.cfg.planner.model != "should-not-apply"
+        assert orch.cfg.planner.max_actions != 9
 
     def test_poll_detects_file_change(self, tmp_path, monkeypatch):
         stack = self.build(tmp_path, monkeypatch)

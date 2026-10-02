@@ -308,19 +308,18 @@ private struct BrainSection: View {
 
     var body: some View {
         Card {
-            SectionTitle(text: "Your local model",
-                         subtitle: "Aura thinks with a model that runs on this Mac — Ollama, llama.cpp, LM Studio or MLX.")
+            SectionTitle(text: "Your decision model",
+                         subtitle: "Aura thinks with Laya, a small decision model that runs entirely on this Mac — no text generation, no model server.")
             InfoRow(label: "Status",
-                    value: model.brainOnline ? "Answering" : "Not answering",
+                    value: model.brainOnline ? "Loaded" : "Not loaded",
                     color: model.brainOnline ? Theme.ready : Theme.attention)
-            InfoRow(label: "Endpoint", value: model.config?.planner?.baseURL ?? model.state?.planner?.baseURL ?? "—", mono: true)
-            InfoRow(label: "Model", value: model.config?.planner?.model ?? model.state?.planner?.model ?? "—")
+            InfoRow(label: "Checkpoint", value: model.config?.planner?.model ?? model.state?.planner?.model ?? "—", mono: true)
             if let error = model.state?.planner?.lastError, !error.isEmpty {
                 Text(error).font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Text(model.brainOnline
                  ? "Full understanding is on: Aura can plan multi-step requests in your own words."
-                 : "Until a model answers, Aura uses her built-in commands — everything still works, just more literally.")
+                 : "Until Laya loads, Aura uses her built-in commands — everything still works, just more literally.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 8) {
@@ -333,8 +332,6 @@ private struct BrainSection: View {
                                 .offset(x: 60)
                         }
                     }
-                Button("Open Ollama") { NSWorkspace.shared.open(URL(string: "https://ollama.com")!) }
-                    .auraButton()
             }
         }
 
