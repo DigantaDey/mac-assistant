@@ -15,7 +15,7 @@ The adapter in `aura/laya.py` is only correct if it matches the API that
     result["answers"]["pick"]["probabilities"]  # every label's probability
     result["answers"]["level"]["score"]       # expected index on the scale
     result["routing"]["model"]                # which checkpoint answered
-    router.predict_batch([state, state], questions) → one result per state
+    router.predict_batch([{"state": state, "questions": questions}, ...]) → results
     router.loaded()                           # names of resident checkpoints
 
 Tests install this in `sys.modules` so the real code path runs — no torch, no
@@ -86,7 +86,7 @@ class FakeRouter:
         self.models = models or {}
         self.kwargs = kwargs
         self.calls: list[tuple[Any, dict]] = []
-        self.batches: list[tuple[list[Any], dict]] = []
+        self.batches: list[list[dict[str, Any]]] = []
         FakeRouter.instances.append(self)
 
     # -- the API ------------------------------------------------------------ #
@@ -102,11 +102,13 @@ class FakeRouter:
         self.calls.append((state, questions))
         return self._answer(state, questions)
 
-    def predict_batch(self, states: list[Any], questions: dict, **kwargs: Any) -> list[dict]:
+    def predict_batch(self, requests: list[dict[str, Any]], **kwargs: Any) -> list[dict]:
+        """Match Laya 0.3's heterogeneous request-batch API."""
         if FakeRouter.raise_on_predict:
             raise RuntimeError(FakeRouter.raise_on_predict)
-        self.batches.append((list(states), questions))
-        return [self._answer(state, questions) for state in states]
+        self.batches.append(list(requests))
+        return [self._answer(request["state"], request["questions"])
+                for request in requests]
 
     def loaded(self) -> list[str]:
         return ["english"]

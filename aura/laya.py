@@ -407,7 +407,12 @@ class RealLayaBackend(LayaBackend):
         batch = getattr(router, "predict_batch", None)
         if callable(batch) and len(states) > 1:
             try:
-                results = batch(states, questions)
+                # Router.predict_batch takes heterogeneous request dictionaries,
+                # not ``(states, questions)``.  The latter happened to work with
+                # our fake router but raises in every released Laya 0.3 version,
+                # silently turning each compound command into N forward passes.
+                requests = [{"state": state, "questions": questions} for state in states]
+                results = batch(requests)
                 if isinstance(results, list) and len(results) == len(states):
                     return results
                 raise LayaError("predict_batch", f"got {type(results).__name__} of length "

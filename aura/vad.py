@@ -62,6 +62,10 @@ class EnergyVAD:
     @staticmethod
     def _rms(frame: AudioFrame) -> float:
         if HAS_NUMPY and isinstance(frame.pcm, np.ndarray):
+            # Device reconfiguration can produce a zero-sample callback. NumPy
+            # warns and returns NaN for its mean, which then poisons VAD state.
+            if frame.pcm.size == 0:
+                return 0.0
             return float(np.sqrt(np.mean(frame.pcm.astype("float32") ** 2)))
         return 0.0
 
