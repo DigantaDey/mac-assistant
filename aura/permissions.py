@@ -6,7 +6,7 @@ work around it; it *guides the user through it*. Every check here is honest:
   accessibility  AXIsProcessTrusted() — the real API, no guessing
   microphone     whether Aura's own audio bridge opened the mic
   automation     a harmless AppleEvent actually sent; result observed
-  whisper/llm    local readiness checks (binaries + endpoints)
+  whisper/laya   local readiness checks (binaries + checkpoint load)
 
 On non-Mac platforms everything degrades to None/"unavailable" so the Setup
 wizard can show itself anywhere without lying about anything.
@@ -17,7 +17,6 @@ from __future__ import annotations
 import ctypes
 import platform
 import subprocess
-import urllib.request
 from typing import Any
 
 # Deep links into System Settings → Privacy & Security. Apple keeps moving
@@ -233,12 +232,15 @@ def check_whisper_cpp(cfg: Any) -> bool:
 
 
 def check_planner_server(cfg: Any, timeout: float = 0.8) -> bool:
-    """Is the local LLM endpoint (Ollama / mlx_lm / llama-server / LM Studio) alive?"""
-    if cfg.planner.engine == "mock":
+    """Is the brain available? (Name kept for the app's existing contract.)
+
+    Aura has no model server any more — the planner is Laya, in-process.
+    This reports what the Setup panel needs to know: whether the decision
+    model can run here (`mock`/`rules` engines are the deterministic layer
+    alone, so they report False exactly like before).
+    """
+    if cfg.planner.engine in ("mock", "rules"):
         return False
-    url = cfg.planner.base_url.rstrip("/") + "/models"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return resp.status == 200
-    except Exception:
-        return False
+    from .laya import laya_available
+
+    return laya_available()

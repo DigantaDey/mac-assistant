@@ -76,26 +76,16 @@ class STTConfig:
 
 @dataclass
 class PlannerConfig:
-    # "laya"          — the default: the rules parse, the Laya decision model
-    #                   routes whatever they cannot (no LLM server needed).
-    # "auto"          — Laya when installed, else the local LLM, else rules.
-    # "openai_compat" — the LLM-first planner (Ollama/mlx_lm/llama.cpp/LM Studio).
-    # "mock"          — the deterministic rule layer alone (demo profile, tests).
+    # Aura's brain is Laya — a non-autoregressive decision model that answers
+    # typed questions (which skill? does it match? is it destructive?) in one
+    # forward pass. There is no LLM anywhere in the product: Laya is fast
+    # enough to sit on the voice path and it cannot generate text, so it can
+    # never invent an action or an argument.
+    #   "laya"  — rules parse the everyday commands, Laya routes the rest
+    #             (the default, and the only brain the product ships).
+    #   "rules" — the deterministic rule layer alone.
+    #   "mock"  — alias of "rules" (demo profile, tests).
     engine: str = "laya"
-    # Any OpenAI-compatible server works, all fully local:
-    #   Ollama:   http://127.0.0.1:11434/v1        (model e.g. qwen3:4b)
-    #   mlx_lm:   http://127.0.0.1:8080/v1         (mlx_lm.server)
-    #   llama.cpp: http://127.0.0.1:8080/v1        (llama-server)
-    #   LM Studio: http://127.0.0.1:1234/v1
-    base_url: str = "http://127.0.0.1:11434/v1"
-    model: str = "qwen3:4b"
-    api_key: str = "local"           # local servers ignore this; never a cloud key
-    temperature: float = 0.2
-    # The model is never allowed to hold the interaction hostage. Everyday
-    # commands bypass it entirely; unfamiliar requests get at most four
-    # seconds so there is still time to return an honest fallback inside the
-    # product's five-second response SLO.
-    timeout_seconds: float = 4.0
     max_actions: int = 3
 
 
@@ -117,6 +107,14 @@ class LayaConfig:
     device: str = ""
     # "" → the router picks per language ("english", "multilingual", …)
     model: str = ""
+    # The checkpoint to load. Resolution order (first found wins):
+    #   1. adapter_dir      — your fine-tuned checkpoint (see scripts/nightly_laya.py)
+    #   2. checkpoint_dir   — any native Laya checkpoint directory
+    #   3. $AURA_LAYA_CHECKPOINT
+    #   4. the bundled navigation checkpoint (assets/models/aura-nav-laya)
+    #   5. the official ~421M checkpoint from the Hugging Face hub
+    # "" on every one of them means "use the bundled checkpoint, else the hub".
+    checkpoint_dir: str = ""
     # True keeps *every* checkpoint resident (fastest, ~GBs of RAM). False
     # warms just the one the router routes to — the shipped default.
     preload: bool = False
@@ -125,8 +123,10 @@ class LayaConfig:
     # that many idle seconds; the next question pays the reload.
     idle_unload_seconds: float = 0.0
     # A single question may not hold the session hostage: past this, the
-    # offline gate answers and the reason is logged.
-    call_budget_seconds: float = 1.5
+    # offline gate answers and the reason is logged. Laya is not an LLM —
+    # tens of milliseconds on a warm model — but a cold load or a slow CPU
+    # gets honest headroom instead of a silent fallback.
+    call_budget_seconds: float = 6.0
     adapter_dir: str = ""            # fine-tuned checkpoint directory
 
 
@@ -174,10 +174,11 @@ class SessionConfig:
     end_of_speech_seconds: float = 0.7
     confirmation_timeout_seconds: float = 45.0
     # Hard ceiling for *active work* (planning or executing). Confirmation is
-    # a user wait and has its own timer. The orchestrator also enforces an
-    # absolute five-second cap, even when an old config contains a larger
-    # value, so Aura always answers or fails clearly in near real time.
-    max_session_seconds: float = 5.0
+    # a user wait and has its own timer. Laya is fast (tens of ms warm), but
+    # a cold checkpoint load or a slow machine gets real headroom — the
+    # orchestrator still enforces MAX_ACTIVE_REQUEST_SECONDS as the absolute
+    # cap, so Aura always answers or fails clearly instead of hanging.
+    max_session_seconds: float = 20.0
     # Unload warm models after this much idle time (lightweight promise).
     idle_unload_seconds: float = 180.0
 
@@ -321,14 +322,15 @@ def load_config(explicit_path: str | None = None,
     if demo_base:
         cfg.wake.mode = "manual"
         cfg.stt.engine = "null"
-        cfg.planner.engine = "mock"
         cfg.tts.engine = "null"
+        # The planner is deliberately NOT pinned: the brain is Laya on every
+        # platform. Off-Mac the dry-run bridge executes safely, so the whole
+        # decision path (rules → Laya routing → gate) runs for real.
 
     # Keys the demo base pins. The shipped config.default.toml describes the
     # real (mac) install, so its pinned keys must not leak into demo mode —
     # user files (explicit intent) still win over the demo base.
-    demo_pins = {"wake": {"mode"}, "stt": {"engine"},
-                 "planner": {"engine"}, "tts": {"engine"}}
+    demo_pins = {"wake": {"mode"}, "stt": {"engine"}, "tts": {"engine"}}
     for path in (repo_default_config(), user_config_path(),
                  runtime_overrides_path(cfg.data_dir)):
         raw = _load_toml(path)

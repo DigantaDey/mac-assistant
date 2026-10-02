@@ -52,9 +52,12 @@ class TestPermissionsEndpoints:
         for key in ("platform", "bridge", "microphone", "accessibility",
                     "whisper_cpp", "planner_server", "planner_engine", "model"):
             assert key in data
-        # demo stack: dry-run bridge, mock planner
+        # demo stack: dry-run bridge; "planner server" now means "can the
+        # Laya decision model run here" — true wherever the package exists.
+        from aura.laya import laya_available
+
         assert data["bridge"] == "dry-run"
-        assert data["planner_server"] is False
+        assert data["planner_server"] is laya_available()
 
     def test_open_settings_endpoint(self, server):
         _, srv, cfg = server

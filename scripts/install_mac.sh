@@ -13,10 +13,10 @@
 #   5. wake-word models     openWakeWord pretrained set, cached
 #   6. Aura.app             built and installed into /Applications, then opened
 #
-# No model server, no Ollama: Aura's default brain is Laya + the deterministic
-# rule layer, both of which live in the engine's own venv. If you *want* the
-# optional LLM planner (planner.engine = "auto"/"openai_compat"), run:
-#   AURA_WITH_OLLAMA=1 ./scripts/install.sh
+# No model server, no Ollama, no LLM: Aura's brain is Laya, a non-autoregressive
+# decision model that answers typed questions in one forward pass. A navigation
+# checkpoint ships with the repo (assets/models/aura-nav-laya); if it is ever
+# missing this script rebuilds it on the spot — no hub download required.
 #
 # After this, the terminal never appears again: everything (permissions,
 # wake phrase, settings, installs) lives inside Aura.
@@ -81,13 +81,19 @@ fi
 .venv/bin/python -m pip install --quiet --upgrade pip
 .venv/bin/python -m pip install --quiet ".[mac]"
 
-say_step "4/6  Decision model (Laya) — download once, prove it works"
+say_step "4/6  Decision model (Laya) — the bundled checkpoint, proven end-to-end"
+CKPT="$ENGINE_DIR/assets/models/aura-nav-laya"
+if [ ! -f "$CKPT/model.safetensors" ]; then
+  note "Navigation checkpoint missing — training it now (a few minutes, once)…"
+  .venv/bin/python scripts/train_navigation_laya.py --out "$CKPT" \
+    || note "training failed — Aura will run on the offline gate (see the log)"
+fi
 if .venv/bin/python -m aura laya-check; then
   note "Laya is answering — Aura's brain is on this Mac."
 else
   note "Laya isn't answering yet. Aura still works (the offline gate answers"
   note "every decision), and the reason is in: $SUPPORT/aura.log"
-  note "Re-run this script to retry; a slow first download is the usual cause."
+  note "Re-run this script to retry."
 fi
 
 say_step "5/6  Wake-word models (cached on this Mac)"
@@ -113,24 +119,6 @@ else
   note "Keeping your existing config."
 fi
 "$REPO/scripts/make_app.sh" --install
-
-if [ "${AURA_WITH_OLLAMA:-0}" = "1" ]; then
-  say_step "Optional — the LLM planner (Ollama + qwen3:4b, ~2.5 GB)"
-  brew install ollama 2>/dev/null || brew install ollama
-  brew services start ollama 2>/dev/null || true
-  for _ in $(seq 1 15); do
-    if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then break; fi
-    sleep 1
-  done
-  if ! curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-    note "Ollama isn't answering yet — start it later with: brew services start ollama"
-  elif curl -sf http://127.0.0.1:11434/api/tags | grep -q 'qwen3:4b'; then
-    note "qwen3:4b already pulled."
-  else
-    ollama pull qwen3:4b || note "Pull didn't finish — re-run with AURA_WITH_OLLAMA=1."
-  fi
-  note "Then set planner.engine = \"auto\" in $CONFIG to use it."
-fi
 
 say_step "Done — opening Aura"
 open /Applications/Aura.app

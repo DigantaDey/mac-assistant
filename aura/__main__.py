@@ -1,12 +1,17 @@
-"""Aura CLI.
+"""Aura CLI — a keyboardless, voice-first navigator for your Mac.
 
     python -m aura serve        start the engine (the app talks to it over loopback)
+    python -m aura talk         talk to Aura right now (mic if present, text otherwise)
+    python -m aura hear F.wav   run one spoken utterance (a WAV file) through the
+                                whole pipeline and print what Aura does
     python -m aura doctor       capability matrix (what will run on this machine)
     python -m aura laya-check   prove the decision model works, with timings
 
-There is no browser UI: the product is the native macOS app. `serve` exists so
-the engine can run head-less on any machine — for the test suite, for CI, and
-for developers poking at the API with a token.
+Aura's brain is Laya — a non-autoregressive decision model that answers typed
+questions in one forward pass. There is no LLM anywhere: nothing to serve,
+nothing to download gigabytes for, no "still thinking". `talk` and `hear`
+exist so the product can be *proven* end-to-end on any machine — voice in,
+navigation out, spoken reply — without a menu-bar app in the loop.
 
 Every command configures the same logging tree (`aura/log.py`), so running the
 engine by hand produces the same lines the app's Activity feed shows — and when
@@ -27,6 +32,262 @@ def _profile_for(cfg) -> str:
     return resolved_profile(cfg)
 
 
+# --------------------------------------------------------------------------- #
+# Shared headless stack — one wiring, used by serve/talk/hear                  #
+# --------------------------------------------------------------------------- #
+
+
+def _build_stack(cfg):
+    """The exact wiring `serve` uses, minus the HTTP server.
+
+    Returns (orchestrator, extras-dict). Everything is real: the Laya gate,
+    the skill registry, memory — only the I/O surfaces (mic, STT, TTS) depend
+    on what this machine actually has.
+    """
+    from pathlib import Path
+
+    from . import log as log_mod
+    from .events import EventBus
+    from .laya import ExampleBuffer, build_backend
+    from .memory import Memory
+    from .orchestrator import Orchestrator
+    from .planner import build_planner
+    from .safety import SafetyGate
+    from .skills import build_default_registry
+    from .stt import build_stt
+    from .tts import build_tts
+
+    data_dir = Path(cfg.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    bus = EventBus()
+    log_mod.setup(data_dir, level=cfg.logging.level, event_level=cfg.logging.event_level,
+                  file=cfg.logging.file)
+    log_mod.attach_bus(bus, cfg.logging.event_level)
+
+    bridge = _build_bridge(cfg)
+    registry = build_default_registry(bridge)
+    # The decision backend comes first: the planner routes *through* it.
+    laya_backend = build_backend(cfg, bus)
+    planner = build_planner(cfg, registry.catalog_prompt(), registry.specs(), laya_backend)
+    safety = SafetyGate(cfg, laya_backend)
+    memory = Memory(data_dir / "aura.sqlite3")
+    examples = ExampleBuffer(data_dir / "aura.sqlite3")
+    stt = build_stt(cfg)
+    tts = build_tts(cfg)
+
+    orch = Orchestrator(cfg=cfg, bus=bus, registry=registry, bridge=bridge,
+                        planner=planner, laya_backend=laya_backend, safety=safety,
+                        memory=memory, examples=examples, stt=stt, tts=tts)
+    return orch, {"bus": bus, "laya": laya_backend, "planner": planner}
+
+
+def _build_bridge(cfg):
+    from .skills import DryRunBridge, MacBridge
+
+    if cfg.profile == "demo":
+        return DryRunBridge()
+    if sys.platform == "darwin":
+        return MacBridge()
+    return DryRunBridge()
+
+
+async def _wait_for_reply(bus, sid: int, timeout: float = 60.0) -> str:
+    """Drain an existing bus subscription until the session answers.
+
+    The caller must subscribe *before* submitting the request — a session
+    answers synchronously, so a subscription created afterwards misses the
+    reply event entirely (the original "never got a response" bug). Aura's
+    contract is that she always answers; the timeout only guards against a
+    bug hanging the CLI.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "(no reply — the engine broke its always-answer contract)"
+        try:
+            ev = await asyncio.wait_for(bus.get(sid), timeout=remaining)
+        except TimeoutError:
+            return "(no reply — the engine broke its always-answer contract)"
+        if ev.type == "reply":
+            return str(ev.data.get("text") or "")
+        if ev.type == "transcript":
+            print(f"  heard: “{ev.data.get('text', '')}”")
+        elif ev.type == "proposal":
+            print(f"  → Aura asks permission (token {ev.data.get('token')}): "
+                  + ", ".join(a.get("skill", "?") for a in ev.data.get("actions", [])))
+
+
+# --------------------------------------------------------------------------- #
+# talk — the keyboardless loop, right here in the terminal                     #
+# --------------------------------------------------------------------------- #
+
+
+def cmd_talk(cfg) -> int:
+    """Talk to Aura. With a microphone this is the real voice loop (wake →
+    listen → transcribe → Laya → act → speak). Without one, typed lines go
+    through the identical session path — every stage after the ear is the same.
+    """
+    from . import log as log_mod
+
+    orch, extras = _build_stack(cfg)
+    bus = extras["bus"]
+    log = log_mod.get_logger("talk")
+
+    async def main() -> None:
+        await orch.start()
+        has_mic = orch._has_audio
+        laya_status = orch.laya.status() if hasattr(orch.laya, "status") else {}
+        print(f"Aura — profile={_profile_for(cfg)} bridge={orch.bridge.platform} "
+              f"planner={type(orch.planner).__name__} "
+              f"laya={'ready' if laya_status.get('ready') else 'loading/offline'}")
+        if has_mic:
+            mode = getattr(cfg.wake, "mode", "manual")
+            print("Microphone live — say your command." if mode != "manual"
+                  else "Microphone live — trigger with POST /api/trigger or ⌥Space, "
+                       "or type below.")
+        else:
+            print("No microphone here — type your commands; Ctrl-D or 'exit' to quit.")
+        print("Try: “open safari” · “set volume to 30” · “quiet the house” · "
+              "“search for airport lounges”\n")
+        try:
+            while True:
+                try:
+                    line = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: input("aura> "))
+                except EOFError:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                if line.lower() in ("exit", "quit"):
+                    break
+                # Subscribe FIRST: the session answers synchronously, so the
+                # reply event is gone by the time submit_text returns.
+                sid = bus.subscribe_async()
+                try:
+                    await orch.submit_text(line)
+                    reply = await _wait_for_reply(bus, sid)
+                finally:
+                    bus.unsubscribe_async(sid)
+                print(f"Aura: {reply}\n")
+        finally:
+            await orch.stop()
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nBye.")
+    log.debug("talk: session ended")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# hear — one WAV file through the whole voice pipeline                         #
+# --------------------------------------------------------------------------- #
+
+
+def cmd_hear(cfg, wav_path: str) -> int:
+    """Voice in, navigation out, without a microphone.
+
+    Reads a WAV file (any sample rate — it is resampled to 16 kHz mono),
+    pushes it through the same VAD → STT → Laya → skills path the microphone
+    uses, and prints the transcript, the plan, and the spoken reply. This is
+    the end-to-end proof that the voice pipeline works, on any machine.
+    """
+    import wave as wave_mod
+
+    from . import log as log_mod
+
+    orch, extras = _build_stack(cfg)
+    bus = extras["bus"]
+    log = log_mod.get_logger("hear")
+
+    try:
+        with wave_mod.open(wav_path, "rb") as wf:
+            channels = wf.getnchannels()
+            width = wf.getsampwidth()
+            rate = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+    except Exception as exc:
+        print(f"Cannot read {wav_path}: {exc}")
+        return 2
+    if width != 2:
+        print(f"{wav_path} is {width * 8}-bit — Aura expects 16-bit PCM.")
+        return 2
+
+    try:
+        import numpy as np
+
+        pcm = np.frombuffer(raw, dtype=np.int16)
+        if channels > 1:
+            pcm = pcm.reshape(-1, channels).mean(axis=1).astype(np.int16)
+        if rate != 16_000:
+            n_out = int(len(pcm) * 16_000 / rate)
+            pcm = np.interp(np.linspace(0, len(pcm) - 1, n_out),
+                            np.arange(len(pcm)), pcm).astype(np.int16)
+    except ImportError:
+        if channels != 1 or rate != 16_000:
+            print("Resampling needs numpy — pip install numpy (or pass a "
+                  "16 kHz mono WAV).")
+            return 2
+        pcm = None
+
+    from .audio import AudioFrame
+
+    # Build one frame per ~32 ms chunk, the way the microphone stream does.
+    frames = []
+    if pcm is not None:
+        import numpy as np
+
+        chunk_samples = 512
+        for i in range(0, len(pcm), chunk_samples):
+            part = pcm[i:i + chunk_samples]
+            if part.size == 0:
+                break
+            frames.append(AudioFrame(pcm=part.astype("<i2"), ts=i / 16_000.0))
+    else:
+        chunk = 16_000 * 2 * 32 // 1000       # bytes per 32 ms at 16 kHz mono
+        for i in range(0, len(raw), chunk):
+            part = raw[i:i + chunk]
+            if len(part) < 2:
+                break
+            frames.append(AudioFrame(pcm=_i16(part), ts=i / (16_000 * 2)))
+
+    async def main() -> None:
+        await orch.start()
+        sid = bus.subscribe_async()  # before the session: it answers synchronously
+        try:
+            print(f"hearing {wav_path} ({len(frames) * 0.03:.1f}s of audio)…")
+            await orch.run_session_frames(frames)
+            reply = await _wait_for_reply(bus, sid)
+            print(f"Aura: {reply}")
+        finally:
+            bus.unsubscribe_async(sid)
+            await orch.stop()
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    log.debug("hear: done")
+    return 0
+
+
+def _i16(data: bytes):
+    import array
+
+    out = array.array("h")
+    out.frombytes(data[: len(data) // 2 * 2])
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# doctor                                                                       #
+# --------------------------------------------------------------------------- #
+
+
 def cmd_doctor(cfg) -> int:
     checks: list[tuple[str, bool, str]] = []
 
@@ -36,7 +297,7 @@ def cmd_doctor(cfg) -> int:
     check("profile", True, _profile_for(cfg))
     check("data dir", True, cfg.data_dir)
 
-    for mod in ("numpy", "sounddevice", "openwakeword", "faster_whisper", "httpx", "laya"):
+    for mod in ("numpy", "sounddevice", "openwakeword", "faster_whisper", "laya"):
         try:
             __import__(mod)
             check(f"python: {mod}", True)
@@ -44,31 +305,34 @@ def cmd_doctor(cfg) -> int:
             check(f"python: {mod}", False, str(exc)[:60])
 
     import shutil
-    import urllib.request
 
-    for binary in ("say", "osascript", "pbcopy", "whisper-cli", "ollama"):
+    for binary in ("say", "osascript", "pbcopy", "whisper-cli"):
         check(f"binary: {binary}", shutil.which(binary) is not None,
               shutil.which(binary) or "not on PATH")
 
     check("platform is macOS", sys.platform == "darwin",
           "demo profile elsewhere" if sys.platform != "darwin" else "")
 
-    # The decision model is the brain now: report what it can actually do,
-    # not merely whether a package name imports.
+    # The decision model is the brain: report what it can actually do, not
+    # merely whether a package name imports.
     try:
         from . import log as log_mod
-        from .laya import build_backend, laya_available
+        from .laya import build_backend, laya_available, resolve_checkpoint_dir
 
-        backend = build_backend(cfg)
-        status = backend.status() if hasattr(backend, "status") else {}
+        checkpoint, source = resolve_checkpoint_dir(cfg)
         check("laya package", laya_available(),
               "install with `pip install laya`" if not laya_available() else "importable")
+        check("laya checkpoint", bool(checkpoint),
+              f"{checkpoint} ({source})" if checkpoint
+              else f"{source} — train one: python scripts/train_navigation_laya.py")
+        backend = build_backend(cfg)
+        status = backend.status() if hasattr(backend, "status") else {}
         check("laya backend", bool(status.get("ready")),
               f"{status.get('backend', '?')}"
               + (f" — {status.get('error')}" if status.get("error") else "")
               + ("  (run `python -m aura laya-check`)" if not status.get("ready") else ""))
-        check("laya planner", cfg.planner.engine in ("laya", "auto"),
-              f"planner.engine={cfg.planner.engine}")
+        check("planner", cfg.planner.engine,
+              f"planner.engine={cfg.planner.engine} (the brain is Laya)")
         check("engine log", True, str(log_mod.log_status().get("file") or "stderr only"))
     except Exception as exc:
         check("laya backend", False, f"{exc.__class__.__name__}: {exc}")
@@ -85,18 +349,6 @@ def cmd_doctor(cfg) -> int:
               perms.check_wake_models(cfg)[1])
         check("whisper model", perms.check_whisper_cpp(cfg),
               cfg.stt.whisper_model or "no model path configured")
-        if cfg.planner.engine != "mock":
-            try:
-                url = cfg.planner.base_url.rstrip("/") + "/models"
-                with urllib.request.urlopen(url, timeout=2) as resp:
-                    live = resp.status == 200
-            except Exception:
-                live = False
-            check("planner server", live,
-                  f"{cfg.planner.base_url} ({cfg.planner.model})" +
-                  (" — is Ollama running?" if not live else ""))
-        else:
-            check("planner server", True, "mock (basic mode)")
         check("engine token", True, str(__import__("aura.localauth", fromlist=["localauth"])
               .token_path(cfg.data_dir)))
         check("Aura.app installed",
@@ -111,7 +363,7 @@ def cmd_doctor(cfg) -> int:
         mark = "✔" if ok else "✘"
         print(f"  {mark}  {name:20s} {note}")
     print("=" * 52)
-    print("Run `python -m aura serve` to start the engine (or open Aura from /Applications).")
+    print("Run `python -m aura talk` to speak with Aura right now.")
     print("Brain not working? `python -m aura laya-check` proves it end-to-end.")
     return 0
 
@@ -140,7 +392,13 @@ LAYA_SMOKE_ROUTES: list[tuple[str, str]] = [
 def cmd_laya_check(cfg) -> int:
     """Prove the Laya install end-to-end: import → load → decide → route."""
     from . import log as log_mod
-    from .laya import LayaGate, RealLayaBackend, build_backend, laya_available
+    from .laya import (
+        LayaGate,
+        RealLayaBackend,
+        build_backend,
+        laya_available,
+        resolve_checkpoint_dir,
+    )
 
     log_mod.setup(cfg.data_dir, level=cfg.logging.level or "info",
                   event_level="error", file=cfg.logging.file)
@@ -155,6 +413,9 @@ def cmd_laya_check(cfg) -> int:
         print("  log               : " + str(log_mod.log_path() or "stderr"))
         return 2
 
+    checkpoint, source = resolve_checkpoint_dir(cfg)
+    print(f"  checkpoint        : {checkpoint or 'hub default'}  [{source}]")
+
     backend = build_backend(cfg)
     if isinstance(backend, LayaGate):
         inner = backend.real
@@ -165,8 +426,7 @@ def cmd_laya_check(cfg) -> int:
               f"(laya.backend={cfg.laya.backend})")
         return 0
 
-    print(f"  device            : {inner.device or 'auto'}   model: {inner.model or 'auto'}")
-    print(f"  adapter           : {inner.adapter_dir or 'built-in checkpoints'}")
+    print(f"  device            : {inner.device or 'auto'}")
     print("  loading           : this may download weights on the first run…", flush=True)
     started = time.perf_counter()
     try:
@@ -241,47 +501,20 @@ def cmd_laya_check(cfg) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# serve                                                                        #
+# --------------------------------------------------------------------------- #
+
+
 def cmd_serve(cfg) -> int:
-    from pathlib import Path
-
     from . import log as log_mod
-    from .events import EventBus
-    from .laya import ExampleBuffer, build_backend
-    from .memory import Memory
-    from .orchestrator import Orchestrator
-    from .planner import build_planner
-    from .safety import SafetyGate
     from .server import TOKEN_HEADER, AuraServer
-    from .skills import build_default_registry
-    from .stt import build_stt
-    from .tts import build_tts
 
-    data_dir = Path(cfg.data_dir)
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    bus = EventBus()
-    log_mod.setup(data_dir, level=cfg.logging.level, event_level=cfg.logging.event_level,
-                  file=cfg.logging.file)
-    log_mod.attach_bus(bus, cfg.logging.event_level)
+    orch, extras = _build_stack(cfg)
     log = log_mod.get_logger()
-
-    bridge = _build_bridge(cfg)
-    registry = build_default_registry(bridge)
-    # The decision backend comes first: the planner routes *through* it.
-    laya_backend = build_backend(cfg, bus)
-    planner = build_planner(cfg, registry.catalog_prompt(), registry.specs(), laya_backend)
-    safety = SafetyGate(cfg, laya_backend)
-    log.info("engine starting — profile=%s bridge=%s planner=%s laya=%s log=%s",
-             _profile_for(cfg), bridge.platform, type(planner).__name__,
-             type(laya_backend).__name__, log_mod.log_path() or "stderr only")
-    memory = Memory(data_dir / "aura.sqlite3")
-    examples = ExampleBuffer(data_dir / "aura.sqlite3")
-    stt = build_stt(cfg)
-    tts = build_tts(cfg)
-
-    orch = Orchestrator(cfg=cfg, bus=bus, registry=registry, bridge=bridge,
-                        planner=planner, laya_backend=laya_backend, safety=safety,
-                        memory=memory, examples=examples, stt=stt, tts=tts)
+    log.info("engine starting — profile=%s bridge=%s planner=%s laya=%s",
+             _profile_for(cfg), orch.bridge.platform, type(orch.planner).__name__,
+             type(orch.laya).__name__)
     server = AuraServer(orch, cfg)
 
     async def main() -> None:
@@ -300,11 +533,11 @@ def cmd_serve(cfg) -> int:
 
         host = "127.0.0.1" if cfg.server.host == "0.0.0.0" else cfg.server.host
         print(f"Aura v{__import__('aura', fromlist=['__version__']).__version__} "
-              f"— profile={_profile_for(cfg)} bridge={bridge.platform}")
+              f"— profile={_profile_for(cfg)} bridge={orch.bridge.platform}")
         print(f"Engine:  http://{host}:{cfg.server.port}  (JSON API — the app is the UI)")
-        print(f"Data:    {data_dir}")
+        print(f"Data:    {cfg.data_dir}")
         if server.token:
-            print(f"Token:   {localauth.token_path(data_dir)}  (send it as {TOKEN_HEADER} = X-Aura-Token)")
+            print(f"Token:   {localauth.token_path(cfg.data_dir)}  (send it as {TOKEN_HEADER} = X-Aura-Token)")
         else:
             print("Token:   DISABLED — anyone on this Mac can drive Aura (AURA_NO_AUTH=1).")
         if not localauth.is_loopback_host(cfg.server.host):
@@ -323,23 +556,17 @@ def cmd_serve(cfg) -> int:
         print("\nBye.")
     return 0
 
-def _build_bridge(cfg):
-    from .skills import DryRunBridge, MacBridge
-
-    if cfg.profile == "demo":
-        return DryRunBridge()
-    if sys.platform == "darwin":
-        return MacBridge()
-    return DryRunBridge()
-
 
 def main(argv: list[str] | None = None) -> int:
     from . import __version__
     from .config import load_config
 
-    parser = argparse.ArgumentParser(prog="aura", description="Aura — your Mac, at your command.")
+    parser = argparse.ArgumentParser(prog="aura",
+                                     description="Aura — keyboardless voice navigation for your Mac.")
     parser.add_argument("command", nargs="?", default="serve",
-                        choices=["serve", "doctor", "laya-check"])
+                        choices=["serve", "talk", "hear", "doctor", "laya-check"])
+    parser.add_argument("target", nargs="?", default="",
+                        help="the WAV file for `hear`")
     parser.add_argument("--config", help="path to a config.toml")
     parser.add_argument("--version", action="version", version=f"aura {__version__}")
     args = parser.parse_args(argv)
@@ -349,6 +576,13 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(cfg)
     if args.command == "laya-check":
         return cmd_laya_check(cfg)
+    if args.command == "talk":
+        return cmd_talk(cfg)
+    if args.command == "hear":
+        if not args.target:
+            print("usage: python -m aura hear <utterance.wav>")
+            return 2
+        return cmd_hear(cfg, args.target)
     return cmd_serve(cfg)
 
 

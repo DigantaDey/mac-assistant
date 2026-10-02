@@ -191,7 +191,9 @@ class TestConfigEndpoint:
         assert snap["resolved_profile"] == "demo"
         assert set(snap["live"]) >= {"wake", "tts", "safety", "session"}
         assert snap["live"]["wake"]["mode"] == cfg.wake.mode
-        assert snap["planner"]["model"] == cfg.planner.model
+        # The brain is a local Laya checkpoint — no model server exists any more.
+        assert snap["planner"]["model"] == "laya"
+        assert snap["planner"]["base_url"] == ""
         assert snap["files"]["runtime"].endswith("runtime.toml")
 
     def test_it_reflects_a_saved_change(self, server):

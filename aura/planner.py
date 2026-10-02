@@ -1,50 +1,36 @@
 """The planner: turns a transcript into a small, inspectable Plan.
 
-Three layers, in the order a request meets them:
+Aura's brain is Laya — there is no LLM anywhere in the product. Two layers,
+in the order a request meets them:
 
-1. **Rules (`MockPlanner`)** — a deterministic keyword table that answers the
+1. **Rules (`MockPlanner`)** — a deterministic reflex table that answers the
    everyday commands ("open spotify", "set volume to 30") in microseconds and
    extracts their free-text arguments exactly.
 2. **Laya (`LayaPlanner`)** — everything the rules cannot route goes to the
    decision model, which *chooses* the skill from a shortlist with a
    calibrated probability (one forward pass). Laya never writes text, so it
-   cannot invent an argument: the value still comes from the rules' extractor,
-   and a skill whose arguments cannot be read is refused rather than guessed.
-3. **The optional local LLM (`OpenAICompatPlanner` / `HybridPlanner`)** — a
-   fully local OpenAI-compatible endpoint (Ollama, mlx_lm, llama.cpp, LM
-   Studio) for the open-ended remainder, still available behind
-   `planner.engine = "openai_compat"`.
+   cannot invent an argument: the value comes from the rules' extractor, and
+   a skill whose arguments cannot be read is refused rather than guessed.
 
-None of them decides *safety*: that is the Laya gate's job (`aura/laya.py`).
+Neither layer decides *safety*: that is the Laya gate's job (`aura/laya.py`).
 """
 
 from __future__ import annotations
 
 import asyncio
 import functools
-import json
 import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from . import intent as intent_mod
-from .laya import HeuristicBackend, LayaBackend, laya_available
+from .laya import HeuristicBackend, LayaBackend
 from .log import describe_exception, get_logger
 
 log = get_logger("planner")
 
-try:  # optional — the deterministic basic mode works without it
-    import httpx
-except Exception:  # pragma: no cover - depends on host
-    httpx = None  # type: ignore[assignment]
-
 RISKS = ("safe", "confirm")
-
-# Product latency contract. The orchestrator owns the five-second end-to-end
-# deadline; the model gets a smaller slice so fallback and UI delivery still
-# fit inside it. This cap deliberately wins over stale user configuration.
-MAX_MODEL_SECONDS = 4.0
 
 # Names people mean as websites, not locally installed applications. Keep the
 # URL resolution itself in the browser skill; the planner only picks the right
@@ -74,9 +60,9 @@ class Plan:
     # True when the plan came from the deterministic layer because the real
     # brain was unreachable — the UI shows a subtle "basic mode" note.
     degraded: bool = False
-    # "laya" | "rules" | "llm" — which layer produced it. The everyday commands
-    # are answered by the rules in microseconds; what they cannot route is
-    # Laya's call (see LayaPlanner.plan).
+    # "laya" | "rules" — which layer produced it. The everyday commands are
+    # answered by the rules in microseconds; what they cannot route is Laya's
+    # call (see LayaPlanner.plan). There is no LLM layer — by design.
     source: str = "laya"
     # False when the layer handled only *part* of the request — a chain where
     # one step didn't route. A partial plan is worth handing to Laya.
@@ -84,7 +70,7 @@ class Plan:
     # Time spent inside Laya (routing + choice/score questions) in ms — the
     # number that tells you whether the fast path is actually fast.
     model_ms: float = 0.0
-    # "rules" | "laya" | "laya+rules" | "llm" | "none"
+    # "rules" | "laya" | "laya+rules" | "none"
     routed_by: str = ""
     # Engineer-readable reason when degraded/failed. Logged, shown in the UI's
     # log, and (for failures) short enough to put in front of the user.
@@ -104,322 +90,6 @@ class Planner:
 
 
 # --------------------------------------------------------------------------- #
-# Prompt construction                                                          #
-# --------------------------------------------------------------------------- #
-
-SYSTEM_PROMPT = """You are Aura, a private voice assistant running entirely on the user's Mac.
-Turn the user's request into JSON. Never invent skills. Never output prose outside JSON.
-
-Schema:
-{{
-  "reply": "<one short spoken sentence — what you are doing or asking>",
-  "actions": [
-    {{"skill": "<name from the catalog>", "args": {{}}, "risk": "safe"|"confirm", "why": "<short reason>"}}
-  ]
-}}
-
-Rules:
-- At most {max_actions} actions, executed in order.
-- risk "confirm" for anything destructive, irreversible, or that sends/creates/shares something on the user's behalf.
-- If the request is ambiguous, reply with a short question and no actions.
-- If nothing matches the catalog, say so honestly and suggest the closest skill.
-- Skill catalog:
-{catalog}
-"""
-
-
-def render_system_prompt(catalog_prompt: str, max_actions: int) -> str:
-    return SYSTEM_PROMPT.format(catalog=catalog_prompt, max_actions=max_actions)
-
-
-# --------------------------------------------------------------------------- #
-# Response parsing — small local models need a tolerant reader                 #
-# --------------------------------------------------------------------------- #
-
-
-def extract_json_object(text: str) -> dict[str, Any] | None:
-    """Pull the first balanced JSON object out of arbitrary model output."""
-    text = text.strip()
-    # Fast path
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except json.JSONDecodeError:
-        pass
-    # Strip markdown fences if present
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fence:
-        try:
-            obj = json.loads(fence.group(1))
-            if isinstance(obj, dict):
-                return obj
-        except json.JSONDecodeError:
-            pass
-    # Brace matching scan
-    start = text.find("{")
-    while start != -1:
-        depth = 0
-        in_str = False
-        esc = False
-        for i in range(start, len(text)):
-            ch = text[i]
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
-                continue
-            if ch == '"':
-                in_str = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        obj = json.loads(text[start : i + 1])
-                        if isinstance(obj, dict):
-                            return obj
-                    except json.JSONDecodeError:
-                        break
-        start = text.find("{", start + 1)
-    return None
-
-
-def parse_plan(raw: dict[str, Any] | None, latency_ms: int = 0) -> Plan:
-    """Validate loose model JSON into a strict Plan; drop anything malformed."""
-    if raw is None:
-        return Plan(reply="I couldn't work out a plan for that — could you rephrase?",
-                    latency_ms=latency_ms)
-    reply = str(raw.get("reply", "")).strip()[:500]
-    actions: list[Action] = []
-    for item in raw.get("actions", []) or []:
-        if not isinstance(item, dict):
-            continue
-        skill = str(item.get("skill", "")).strip()
-        if not skill:
-            continue
-        args = item.get("args") if isinstance(item.get("args"), dict) else {}
-        risk = str(item.get("risk", "safe")).lower()
-        actions.append(Action(skill=skill, args=args,
-                              risk=risk if risk in RISKS else "safe",
-                              why=str(item.get("why", "")).strip()[:200]))
-    if not reply and not actions:
-        reply = "I'm not sure how to help with that yet."
-    return Plan(reply=reply, actions=actions, latency_ms=latency_ms)
-
-
-# --------------------------------------------------------------------------- #
-# OpenAI-compatible planner (Ollama / mlx_lm / llama-server / LM Studio)      #
-# --------------------------------------------------------------------------- #
-
-
-class OpenAICompatPlanner(Planner):
-    def __init__(self, cfg, catalog_prompt: str) -> None:
-        if httpx is None:
-            raise RuntimeError("httpx is not installed — pip install -e '.[mac]'")
-        self.base_url = cfg.planner.base_url.rstrip("/")
-        self.model = cfg.planner.model
-        self.api_key = cfg.planner.api_key
-        self.temperature = cfg.planner.temperature
-        self.timeout = max(0.1, min(float(cfg.planner.timeout_seconds), MAX_MODEL_SECONDS))
-        self.max_actions = cfg.planner.max_actions
-        self.system = render_system_prompt(catalog_prompt, cfg.planner.max_actions)
-        # Few-shot anchors keep tiny models on-format.
-        self.system += (
-            '\nExample — user: "mute the sound and open safari" → '
-            '{"reply":"Muting and opening Safari.","actions":['
-            '{"skill":"system.mute","args":{},"risk":"safe","why":"asked to mute"},'
-            '{"skill":"system.open_app","args":{"app":"Safari"},"risk":"safe","why":"asked to open Safari"}]}'
-        )
-        # Persistent client — reused across all requests (TCP connection keep-alive).
-        self._client: httpx.AsyncClient | None = None
-
-    def _get_client(self) -> httpx.AsyncClient:
-        """Lazy-init a long-lived async client with connection pooling."""
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self.timeout, connect=3.0),
-                limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
-            )
-        return self._client
-
-    async def close(self) -> None:
-        """Release the persistent client's connection pool."""
-        if self._client is not None and not self._client.is_closed:
-            await self._client.aclose()
-            self._client = None
-
-    async def plan(self, transcript: str, context: dict[str, Any]) -> Plan:
-        messages: list[dict[str, str]] = [{"role": "system", "content": self.system}]
-        # Only the 2 most recent turns — reduces prompt tokens and speeds inference.
-        for turn in context.get("recent_turns", [])[-2:]:
-            messages.append({"role": turn["role"], "content": str(turn["content"])[:200]})
-        messages.append({"role": "user", "content": transcript})
-
-        started = time.monotonic()
-        client = self._get_client()
-        try:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": self.temperature,
-                    "max_tokens": 400,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-        except httpx.ConnectError:
-            # Connection refused → close the stale client so next call retries.
-            await self.close()
-            raise
-        latency = int((time.monotonic() - started) * 1000)
-        return parse_plan(extract_json_object(content), latency)
-
-
-# --------------------------------------------------------------------------- #
-# Hybrid planner — the real brain, with an honest basic mode                   #
-# --------------------------------------------------------------------------- #
-
-
-class HybridPlanner(Planner):
-    """LLM-first planning with a deterministic fallback for core intents.
-
-    The local LLM (Ollama, mlx_lm, …) is the brain; when it is unreachable —
-    not installed, model not pulled, or the machine just booted — Aura does
-    not go silent. It degrades to the built-in basic intents ("open X",
-    "set volume to N", "search for Y", …) and flags the plan `degraded` so
-    the UI can say so. A fast /models probe with a short-TTL cache decides
-    which path to take, and failed requests re-probe on the next attempt.
-    """
-
-    def __init__(self, cfg, catalog_prompt: str) -> None:
-        self.cfg = cfg
-        self.llm = OpenAICompatPlanner(cfg, catalog_prompt)
-        self.basic = MockPlanner(catalog_prompt, cfg.planner.max_actions)
-        self._online: bool = False
-        self._last_probe = 0.0
-        self._last_error = ""
-        # Persistent sync client for probes — avoids TCP teardown/setup per check.
-        self._probe_client: httpx.Client | None = None
-
-    def _get_probe_client(self) -> httpx.Client:
-        if self._probe_client is None or self._probe_client.is_closed:
-            self._probe_client = httpx.Client(
-                timeout=httpx.Timeout(1.5, connect=1.0),
-                limits=httpx.Limits(max_connections=2, max_keepalive_connections=1),
-            )
-        return self._probe_client
-
-    # -- availability ------------------------------------------------------ #
-
-    def probe(self) -> bool:
-        """Is the local LLM endpoint answering? Cached: ≤1 check / 15 s."""
-        now = time.monotonic()
-        if self._online and now - self._last_probe < 15.0:
-            return True
-        if now - self._last_probe < 3.0:
-            return self._online
-        self._last_probe = now
-        try:
-            client = self._get_probe_client()
-            resp = client.get(f"{self.llm.base_url}/models")
-            self._online = resp.status_code == 200
-            if self._online:
-                self._last_error = ""
-        except Exception as exc:
-            self._online = False
-            self._last_error = str(exc).splitlines()[0][:160]
-            # Close stale probe client so next probe gets a fresh connection.
-            try:
-                if self._probe_client and not self._probe_client.is_closed:
-                    self._probe_client.close()
-                    self._probe_client = None
-            except Exception:
-                pass
-        return self._online
-
-    @property
-    def status(self) -> dict[str, Any]:
-        """For /api/state: engine, live status, and the last error, if any."""
-        return {"engine": "openai_compat", "online": self._online,
-                "model": self.llm.model, "base_url": self.llm.base_url,
-                "last_error": self._last_error}
-
-    def warmup(self) -> bool:
-        """Load the local model before the user asks for anything.
-
-        A cold Ollama spends tens of seconds loading qwen3:4b on the first
-        request — which is precisely the "it's still thinking" the user feels.
-        One token of work, in the background at engine start, moves that cost
-        off the first command. Best-effort: returns False and stays silent
-        when there is no model server to warm.
-        """
-        if not self.probe():
-            return False
-        try:
-            client = self._get_probe_client()
-            resp = client.post(
-                f"{self.llm.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.llm.api_key}"},
-                json={"model": self.llm.model,
-                      "messages": [{"role": "user", "content": "hi"}],
-                      "max_tokens": 1, "temperature": 0.0},
-                # Warm-up must never monopolise Ollama while a real command
-                # waits behind it. A cold load may continue server-side, but
-                # Aura's own worker is released within the same model budget.
-                timeout=httpx.Timeout(MAX_MODEL_SECONDS, connect=1.0),
-            )
-            return resp.status_code == 200
-        except Exception as exc:
-            self._online = False
-            self._last_error = str(exc).splitlines()[0][:160]
-            return False
-
-    async def plan(self, transcript: str, context: dict[str, Any]) -> Plan:
-        """Reflex first: rules, then the model, then rules again.
-
-        The deterministic layer answers the everyday commands ("open youtube",
-        "set volume to 30") in microseconds, and it never needs the model
-        server, RAM or a warm-up. Sending those to a 4B model was pure added
-        latency — the "it's still thinking" feeling — so the model is now
-        consulted only for what the rules genuinely cannot route, or for a
-        request they only half-handled. The Laya gate judges the result either
-        way, so routing faster does not mean acting less carefully.
-        """
-        import asyncio as _asyncio
-
-        plan = await self.basic.plan(transcript, context)
-        if plan.actions and plan.complete:
-            plan.degraded = False
-            return plan
-
-        # Not (fully) routable by rules — this is what a local model is for.
-        # The probe is only paid when we actually need the model.
-        online = await _asyncio.get_running_loop().run_in_executor(None, self.probe)
-        if online:
-            try:
-                plan = await self.llm.plan(transcript, context)
-                plan.degraded = False
-                plan.source = "llm"
-                return plan
-            except Exception as exc:
-                self._online = False
-                self._last_error = str(exc).splitlines()[0][:160]
-                # fall through — the user still gets an answer
-        plan = await self.basic.plan(transcript, context)
-        plan.degraded = True
-        return plan
-
-
-# --------------------------------------------------------------------------- #
 # Deterministic mock planner — demo profile, basic mode & tests                #
 # --------------------------------------------------------------------------- #
 
@@ -427,11 +97,11 @@ class HybridPlanner(Planner):
 class MockPlanner(Planner):
     """The deterministic layer: reflexes, no model, no network, ~0.01 ms.
 
-    This is what runs when the local LLM is unreachable ("basic mode") *and*
-    the fast path that answers the everyday commands without one. It is a
-    keyword table, so it only understands phrasings it has been taught — the
-    LLM covers the rest. A rule layer fails by *refusing*, which is why the
-    Laya gate still judges every action it produces.
+    This is the reflex layer: the fast path that answers the everyday
+    commands with no model at all. It is a keyword table, so it only
+    understands phrasings it has been taught — Laya routes everything it
+    cannot. A rule layer fails by *refusing*, which is why the Laya gate
+    still judges every action it produces.
     """
 
     # What we say when nothing matches. Hoisted so the chain splitter can tell
@@ -450,7 +120,6 @@ class MockPlanner(Planner):
     async def plan(self, transcript: str, context: dict[str, Any]) -> Plan:
         started = time.monotonic()
         # Chain support: "open spotify and set volume to 30" → two actions.
-        # (The real local LLM does this natively; the mock mirrors it.)
         # A dictated form fill is atomic — its "and submit" belongs to the
         # fill, not to a second step, so it stays one part.
         if re.search(r"\b(?:fill|complete)\b.*\b(?:form|fields)\b", transcript, re.IGNORECASE):
@@ -665,8 +334,11 @@ class LayaPlanner(Planner):
     was the old failure mode; it is not one any more.
     """
 
-    #: How much of the request's latency budget Laya routing may take.
-    ROUTE_BUDGET_MS = 2500
+    #: How much of the request's latency budget Laya routing may take. Warm,
+    #: routing is tens of milliseconds; this bound is for a cold checkpoint
+    #: load landing inside a session. When it trips, the rules' answer (or an
+    #: honest "no skill") is returned — the session never hangs on the model.
+    ROUTE_BUDGET_MS = 10_000
 
     def __init__(self, cfg, catalog_prompt: str, backend: LayaBackend | None = None,
                  specs: list[Any] | None = None) -> None:
@@ -801,38 +473,25 @@ def build_planner(cfg, catalog_prompt: str, specs: list[Any] | None = None,
                   laya_backend: LayaBackend | None = None):
     """Choose the planner for this machine — and say which one, and why.
 
-    * ``mock``   — demo profile & tests
-    * ``laya``   — LayaPlanner: rules parse, the decision model routes
-                   (default; needs no model server at all)
-    * ``auto``   — Laya when the package is installed, otherwise the local
-                   OpenAI-compatible model if httpx is available, otherwise the
-                   rules alone
-    * ``openai_compat`` — the LLM-first HybridPlanner (kept for people who run
-                   Ollama/mlx_lm and want generated text)
+    * ``laya``        — LayaPlanner: rules parse the everyday commands, the
+                        decision model routes the rest. The default, and the
+                        only brain the product ships — no model server, no LLM.
+    * ``rules``/``mock`` — the deterministic rule layer alone (demo profile,
+                        tests, or a deliberate minimal install).
+
+    Any legacy value (`auto`, `openai_compat`, …) maps to `laya`: the LLM
+    planners were removed when Laya became the brain — Aura never phones out
+    to a model server any more.
     """
     engine = str(getattr(cfg.planner, "engine", "laya") or "laya").lower()
-    if engine == "mock":
-        log.info("planner: mock (demo profile), %d skills", len(specs or []))
+    if engine in ("mock", "rules"):
+        log.info("planner: rules only (engine=%s), %d skills", engine, len(specs or []))
         return MockPlanner(catalog_prompt, cfg.planner.max_actions)
 
-    if engine in ("laya", "auto"):
-        if engine == "laya":
-            if laya_backend is None:
-                log.error("planner: engine=laya but no Laya backend was provided — "
-                          "the rules answer and routing uses the offline scorer")
-                laya_backend = HeuristicBackend()
-            return LayaPlanner(cfg, catalog_prompt, laya_backend, specs)
-        if laya_backend is not None and laya_available():
-            return LayaPlanner(cfg, catalog_prompt, laya_backend, specs)
-
-    if engine in ("auto", "openai_compat") and httpx is not None:
-        try:
-            planner = HybridPlanner(cfg, catalog_prompt)
-            log.info("planner: hybrid local LLM at %s (model=%s)",
-                     cfg.planner.base_url, cfg.planner.model)
-            return planner
-        except Exception as exc:
-            log.error("planner: could not build the local LLM planner — %s",
-                      describe_exception(exc))
-    log.warning("planner: falling back to the deterministic rule layer")
-    return MockPlanner(catalog_prompt, cfg.planner.max_actions)
+    if engine != "laya":
+        log.warning("planner: unknown engine %r — Aura's brain is Laya; using it", engine)
+    if laya_backend is None:
+        log.error("planner: engine=laya but no Laya backend was provided — "
+                  "the rules answer and routing uses the offline scorer")
+        laya_backend = HeuristicBackend()
+    return LayaPlanner(cfg, catalog_prompt, laya_backend, specs)

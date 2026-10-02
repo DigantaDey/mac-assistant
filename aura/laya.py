@@ -74,10 +74,11 @@ GATE_QUESTIONS: dict[str, dict[str, str]] = {
 }
 
 #: How long a single Laya call may take before the offline gate answers
-#: instead. Laya measures ~33 ms on a CPU and ~4 ms on the Neural Engine; 1.5 s
-#: is a freeze detector, not a performance target, and it keeps the gate inside
-#: the product's five-second active-request budget.
-DEFAULT_CALL_BUDGET_SECONDS = 1.5
+#: instead. A warm Laya answers in tens of milliseconds; this budget exists
+#: for cold checkpoint loads and slow CPUs. Laya is not an LLM — the budget
+#: is a freeze detector with honest headroom, not a performance target — and
+#: it keeps the gate inside the session's active-request budget.
+DEFAULT_CALL_BUDGET_SECONDS = 6.0
 #: After a timeout, stop asking for this long: a stuck model must not add its
 #: budget to every action of every session.
 DEGRADE_COOLDOWN_SECONDS = 120.0
@@ -218,6 +219,49 @@ def laya_available() -> bool:
         return False
 
 
+#: The checkpoint directory bundled with the repository — a real Laya
+#: checkpoint (native `rl_agent_config.json` + `model.safetensors` format)
+#: trained on Aura's navigation domain by scripts/train_navigation_laya.py.
+BUNDLED_CHECKPOINT_DIR = Path(__file__).resolve().parent.parent / "assets" / "models" / "aura-nav-laya"
+
+
+def _is_checkpoint_dir(path: Path) -> bool:
+    """A usable native Laya checkpoint has its config and its weights."""
+    return (path / "rl_agent_config.json").is_file() and (path / "model.safetensors").is_file()
+
+
+def resolve_checkpoint_dir(cfg) -> tuple[str, str]:
+    """Pick the local checkpoint directory to load, and say why.
+
+    Resolution order (first hit wins):
+      1. `laya.adapter_dir`     — the user's fine-tuned checkpoint
+      2. `laya.checkpoint_dir`  — any explicit native checkpoint
+      3. `$AURA_LAYA_CHECKPOINT`
+      4. the bundled navigation checkpoint
+    Returns `("", reason)` when nothing local is usable — the caller then
+    lets the Router fall back to the hub default and logs the reason.
+    """
+    import os
+
+    laya_cfg = getattr(cfg, "laya", None)
+    for label, value in (
+        ("laya.adapter_dir", str(getattr(laya_cfg, "adapter_dir", "") or "")),
+        ("laya.checkpoint_dir", str(getattr(laya_cfg, "checkpoint_dir", "") or "")),
+        ("AURA_LAYA_CHECKPOINT", os.environ.get("AURA_LAYA_CHECKPOINT", "")),
+        ("bundled", str(BUNDLED_CHECKPOINT_DIR)),
+    ):
+        if not value:
+            continue
+        path = Path(value).expanduser()
+        if _is_checkpoint_dir(path):
+            return str(path), label
+        if label != "bundled":
+            log.warning("laya: %s points at %s but it is not a usable checkpoint "
+                        "(needs rl_agent_config.json + model.safetensors) — ignored",
+                        label, path)
+    return "", "no local checkpoint — using the hub default"
+
+
 def _noul(answer: Any, default: float = 0.0) -> float:
     """Read a `noul` probability out of whatever shape the answer arrived in."""
     if isinstance(answer, dict):
@@ -242,15 +286,21 @@ class RealLayaBackend(LayaBackend):
     `predict(state, questions)` with `choice` / `score` / `noul` questions and
     a `routing` key on the result. Both gate questions are asked in the *same*
     `predict` call, so a whole action is judged in one forward pass.
+
+    Checkpoints: the Router is pointed at a *local* checkpoint directory when
+    one is resolved (`resolve_checkpoint_dir`) — the bundled Aura navigation
+    checkpoint by default — and falls back to the hub default otherwise.
     """
 
     name = "laya"
 
     def __init__(self, device: str = "", model: str = "", adapter_dir: str = "",
-                 preload: bool = False, max_loaded: int = 2) -> None:
+                 checkpoint_dir: str = "", preload: bool = False,
+                 max_loaded: int = 2) -> None:
         self.device = device or None
         self.model = model or None
         self.adapter_dir = adapter_dir or ""
+        self.checkpoint_dir = checkpoint_dir or ""
         self.preload = bool(preload)
         self.max_loaded = max(1, int(max_loaded))
         self._router: Any = None
@@ -273,10 +323,12 @@ class RealLayaBackend(LayaBackend):
                                       "max_loaded": self.max_loaded}
             if self.device:
                 kwargs["device"] = self.device
-            if self.adapter_dir:
-                # A fine-tuned checkpoint directory stands in for the English
-                # checkpoint the router would otherwise fetch.
-                kwargs["models"] = {"english": self.adapter_dir}
+            # A local checkpoint directory (fine-tune, an explicit checkpoint,
+            # or the bundled navigation model) stands in for the English
+            # checkpoint the router would otherwise fetch from the hub.
+            local = self.adapter_dir or self.checkpoint_dir
+            if local:
+                kwargs["models"] = {"english": local}
                 kwargs["default"] = "english"
             elif self.model:
                 kwargs["default"] = self.model
@@ -447,8 +499,8 @@ class RealLayaBackend(LayaBackend):
                 loaded = []
         return {"backend": self.name, "ready": self.ready, "version": self.version,
                 "device": self.device or "auto", "model": self.model or "auto",
-                "adapter_dir": self.adapter_dir, "loaded": loaded,
-                "preload": self.preload, "error": ""}
+                "adapter_dir": self.adapter_dir, "checkpoint_dir": self.checkpoint_dir,
+                "loaded": loaded, "preload": self.preload, "error": ""}
 
 
 # --------------------------------------------------------------------------- #
@@ -882,10 +934,14 @@ def build_backend(cfg, bus=None):
                   "Install it with `pip install laya` (Aura's Setup panel can do this too).")
         return fallback
 
+    checkpoint_dir, checkpoint_source = resolve_checkpoint_dir(cfg)
     real = RealLayaBackend(
         device=str(getattr(laya_cfg, "device", "") or ""),
         model=str(getattr(laya_cfg, "model", "") or ""),
-        adapter_dir=str(getattr(laya_cfg, "adapter_dir", "") or ""),
+        # The resolved directory is the single source of truth for load(); a
+        # broken path configured by the user was already reported and skipped.
+        adapter_dir=checkpoint_dir if checkpoint_source == "laya.adapter_dir" else "",
+        checkpoint_dir=checkpoint_dir,
         preload=bool(getattr(laya_cfg, "preload", False)),
         max_loaded=int(getattr(laya_cfg, "max_loaded", 2) or 2),
     )
@@ -893,9 +949,9 @@ def build_backend(cfg, bus=None):
     gate = LayaGate(real, fallback,
                     call_budget_seconds=float(budget or DEFAULT_CALL_BUDGET_SECONDS),
                     autoload=True)
-    log.info("laya: real backend selected (device=%s, model=%s, adapter=%s, budget=%.2fs) — "
+    log.info("laya: real backend selected (device=%s, checkpoint=%s [%s], budget=%.2fs) — "
              "loading checkpoints in the background",
-             real.device or "auto", real.model or "auto", real.adapter_dir or "built-in",
+             real.device or "auto", checkpoint_dir or "hub default", checkpoint_source,
              gate.call_budget_seconds)
     return gate
 

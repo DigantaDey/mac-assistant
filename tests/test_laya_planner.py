@@ -240,11 +240,15 @@ class TestPlannerFactory:
         planner = build_planner(cfg, "catalog")
         assert isinstance(planner, MockPlanner)
 
-    def test_openai_compat_is_still_available(self, cfg):
+    def test_legacy_llm_engines_map_to_laya(self, cfg):
+        """The LLM planners were removed: whatever an old config says, the
+        brain is Laya (with the offline scorer when no backend is wired)."""
         cfg.planner.engine = "openai_compat"
-        cfg.planner.base_url = "http://127.0.0.1:9/v1"
         planner = build_planner(cfg, "catalog")
-        assert type(planner).__name__ == "HybridPlanner"
+        assert isinstance(planner, LayaPlanner)
+        cfg.planner.engine = "auto"
+        planner = build_planner(cfg, "catalog")
+        assert isinstance(planner, LayaPlanner)
 
     def test_warmup_loads_without_blocking(self, cfg, monkeypatch):
         gate = build_gate(monkeypatch, ready=False)

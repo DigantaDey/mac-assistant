@@ -7,7 +7,7 @@ the same bus the UI already watches. No terminal, no copy-pasting commands:
   2. wake-word models    — openWakeWord's pretrained models, cached locally
   3. speech model        — whisper.cpp ggml model downloaded with progress,
                            then wired into config automatically
-  4. system tools        — an honest probe (Homebrew / whisper-cli / ollama /
+  4. system tools        — an honest probe (Homebrew / whisper-cli /
                            `say`); anything missing is named precisely, with
                            the exact reason, never a vague failure
 
@@ -133,8 +133,7 @@ def step_tools(orch) -> StepResult:
     title = "System tools"
     _publish(orch, "tools", title, "running")
     found, missing = [], []
-    for tool, label in (("say", "Speech"), ("whisper-cli", "whisper.cpp"),
-                        ("ollama", "Ollama")):
+    for tool, label in (("say", "Speech"), ("whisper-cli", "whisper.cpp")):
         (found if shutil.which(tool) else missing).append(label)
     detail = ("Found: " + ", ".join(found) + ".") if found else "None found yet."
     if missing:

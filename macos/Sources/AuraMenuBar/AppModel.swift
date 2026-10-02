@@ -893,8 +893,8 @@ final class AppModel: ObservableObject {
             CapabilityRow(
                 id: "planner", title: "Aura's mind",
                 detail: planner == true
-                    ? "Your local model server is answering — full understanding is on."
-                    : "Aura falls back to built-in skills until a local model (Ollama) answers.",
+                    ? "The Laya decision model is loaded — full understanding is on."
+                    : "Aura runs on built-in commands until the Laya checkpoint loads.",
                 state: planner,
                 action: .none,
                 actionTitle: planner == true ? "Online" : "See how to connect"),

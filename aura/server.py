@@ -500,8 +500,12 @@ def _config_snapshot(cfg) -> dict:
         "host": cfg.server.host,
         "port": cfg.server.port,
         "live": live,
-        "planner": {"engine": cfg.planner.engine, "model": cfg.planner.model,
-                    "base_url": cfg.planner.base_url},
+        "planner": {"engine": cfg.planner.engine,
+                    # No LLM any more: the brain is a local Laya checkpoint,
+                    # there is no model server to point at.
+                    "model": (getattr(cfg.laya, "checkpoint_dir", "")
+                              or getattr(cfg.laya, "adapter_dir", "") or "laya"),
+                    "base_url": ""},
         "stt": {"engine": cfg.stt.engine, "language": cfg.stt.language},
         "wake_models": list(cfg.wake.models),
         "files": {
@@ -527,7 +531,10 @@ def _permissions_snapshot(orch, cfg) -> dict:
         "whisper_cpp": perms.check_whisper_cpp(cfg),
         "planner_server": perms.check_planner_server(cfg),
         "planner_engine": cfg.planner.engine,
-        "model": cfg.planner.model,
+        # No LLM any more: the brain is the Laya checkpoint the gate loads.
+        "model": (getattr(cfg.laya, "checkpoint_dir", "")
+                  or getattr(cfg.laya, "adapter_dir", "")
+                  or "laya"),
         "wake_models": {"ready": wake_ready, "detail": wake_detail},
     }
 
@@ -572,8 +579,9 @@ def _state_snapshot(orch, cfg, auth: bool = True) -> dict:
         "auth": auth,
         "laya": _laya_snapshot(orch, cfg),
         "planner": {"engine": cfg.planner.engine, "class": planner_name,
-                    "model": cfg.planner.model,
-                    "base_url": cfg.planner.base_url,
+                    "model": (getattr(cfg.laya, "checkpoint_dir", "")
+                              or getattr(cfg.laya, "adapter_dir", "") or "laya"),
+                    "base_url": "",
                     "last_error": planner_status.get("last_error", ""),
                     "ready": planner_status.get("ready"),
                     "routed_by": getattr(getattr(session, "plan", None), "routed_by", "")},

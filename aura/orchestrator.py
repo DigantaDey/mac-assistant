@@ -49,9 +49,11 @@ State = Literal["armed", "capturing", "transcribing", "planning",
                 "proposing", "executing", "responding", "disabled"]
 
 # Non-negotiable product SLO: active planning/execution ends with either a
-# result or an honest timeout in at most five seconds. Waiting for the user to
-# approve a risky proposal is deliberately separate.
-MAX_ACTIVE_REQUEST_SECONDS = 5.0
+# result or an honest timeout. Waiting for the user to approve a risky
+# proposal is deliberately separate. Laya is fast (tens of ms warm), but a
+# cold checkpoint load or a slow machine gets real headroom — the point of the
+# cap is that Aura ALWAYS answers or fails clearly, never hangs.
+MAX_ACTIVE_REQUEST_SECONDS = 20.0
 TRAIN_CAPTURE_TIMEOUT_SECONDS = 5.0
 
 
@@ -115,7 +117,7 @@ class Orchestrator:
         self._queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=200)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_activity = time.monotonic()
-        self.planner_online: bool | None = None   # last probe of the LLM endpoint
+        self.planner_online: bool | None = None   # last probe of the decision backend
         self.planner_status: dict = {}
         self._file_mtimes: dict[str, float] = {}
         self._trainer: TrainingState | None = None
@@ -158,9 +160,9 @@ class Orchestrator:
                                                      name="aura-maintenance")
         self._remember_mtimes()
         await self._probe_planner()
-        # Warm the local model in the background: loading qwen3:4b takes tens
-        # of seconds, and paying that on the user's *first* command is exactly
-        # what "still thinking" feels like. Best-effort — never fatal.
+        # Warm the decision model in the background: a cold checkpoint load
+        # takes seconds, and paying that on the user's *first* command is
+        # exactly what "still thinking" feels like. Best-effort — never fatal.
         asyncio.create_task(self._warm_planner(), name="aura-warmup")
         self.state = "armed"
         self.bus.publish("state", state=self.state, mic=mic_kind,
@@ -479,7 +481,8 @@ class Orchestrator:
             )
         except TimeoutError:
             await self._end_session(
-                "Speech recognition took too long (over five seconds). Please try again.",
+                f"Speech recognition took too long (over "
+                f"{self._session_budget_seconds():.0f} seconds). Please try again.",
                 outcome="failed")
             return
         except Exception as exc:
@@ -536,8 +539,8 @@ class Orchestrator:
                 line=("active request deadline reached — back to ready" if deadline
                       else "session cancelled — back to ready"),
             )
-            message = ("That took too long (over five seconds), so I stopped it. "
-                       "Please try again."
+            message = (f"That took too long (over {self._session_budget_seconds():.0f} "
+                       "seconds), so I stopped it. Please try again."
                        if deadline else "I stopped that one — ask me again?")
             session = self.session
             if session is not None:
@@ -682,7 +685,7 @@ class Orchestrator:
                                  "reasons": p["verdict"].reasons,
                              } for p in session.pending])
             self.bus.publish("state", state="proposing")
-            # A proposal is already a response inside the five-second SLO.
+            # A proposal is already a response inside the active-work budget.
             # Reading it is user time, not active work, so suspend the active
             # watchdog while the independent confirmation timer runs.
             self._disarm_watchdog()
@@ -705,7 +708,7 @@ class Orchestrator:
                                         else "I didn't hear a yes, so I cancelled it.")
                 return
             # Confirmed: record positive supervision, then give execution its
-            # own five-second active-work window.
+            # own active-work window under the watchdog.
             for p in session.pending:
                 self._record_example(transcript, p["action"], "confirmed", p.get("decision"))
             self._arm_watchdog()
@@ -823,11 +826,11 @@ class Orchestrator:
     def _session_budget_seconds(self) -> float:
         """Hard ceiling for active planning/execution.
 
-        The five-second cap is enforced even when an existing runtime.toml
-        still contains the old 300-second default. Confirmation waits are
-        suspended from this budget in `_run_session` and use their own timer.
-        A small floor keeps malformed zero/negative config useful in tests and
-        prevents an accidental immediate cancellation.
+        The MAX_ACTIVE_REQUEST_SECONDS cap is enforced even when an existing
+        runtime.toml still contains the old 300-second default. Confirmation
+        waits are suspended from this budget in `_run_session` and use their
+        own timer. A small floor keeps malformed zero/negative config useful in
+        tests and prevents an accidental immediate cancellation.
         """
         configured = float(getattr(
             self.cfg.session, "max_session_seconds", MAX_ACTIVE_REQUEST_SECONDS))
@@ -859,7 +862,8 @@ class Orchestrator:
             return
         if self.session is None and self.state == "armed":
             return                          # the session already ended
-        self.bus.publish("log", line="active request exceeded five-second deadline")
+        self.bus.publish("log",
+                         line=f"active request exceeded {self._session_budget_seconds():.0f}s deadline")
         self._deadline_expired = True
         owner = self._active_session_task
         if owner is not None and not owner.done() and owner is not asyncio.current_task():
@@ -870,7 +874,8 @@ class Orchestrator:
             return
         # Defensive fallback for direct-call integrations with no owner task.
         await self._end_session(
-            "That took too long (over five seconds), so I stopped it. Please try again.",
+            f"That took too long (over {self._session_budget_seconds():.0f} seconds), "
+            "so I stopped it. Please try again.",
             outcome="failed")
 
     def _release_confirmations(self) -> None:

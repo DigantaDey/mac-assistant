@@ -8,21 +8,24 @@ The parser is deliberately grounded: it never invents a value for a field the
 user didn't mention, and it only ever writes to fields that are actually on
 screen (the live AX tree is the source of truth, not the model's memory).
 
-Two brains, one path:
+One brain, one path — and it is not an LLM:
 
   heuristic  — deterministic, instant, offline. Field-driven matching with a
                small grammar ("label is value", "label: value", "first field
-               value", "fill this form: a, b, c"). Good for ~90% of dictation.
-  LLM pass   — when the local brain is online and the heuristic matched
-               nothing, one short prompt (fields + transcript → JSON) handles
-               free paraphrase ("call it j@x.com", "the mail being…"). Its
-               answers are validated against the real field list, so a model
-               that hallucinates a label writes nothing.
+               value", "fill this form: a, b, c"). This is what runs in the
+               product: Aura's brain (Laya) routes and gates but never
+               generates text, so a value is either in your words or it is
+               not written at all.
+
+The grammar is deliberately *grounded*: it only ever writes to fields that
+are actually on screen (the live AX tree is the source of truth), and it only
+ever writes a value that appears in your words. There is no model pass and
+no free paraphrase — a field the grammar can't place is reported back, never
+guessed.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 
@@ -251,55 +254,3 @@ def plan_fill(transcript: str, scan: FormScan) -> list[FieldAssignment]:
     # Screen order, stable for the user to watch follow along.
     out.sort(key=lambda a: scan.fields.index(a.field))
     return out
-
-
-# --------------------------------------------------------------------------- #
-# The LLM pass — free paraphrase, grounded output                             #
-# --------------------------------------------------------------------------- #
-
-_LLM_PROMPT = (
-    "You fill browser forms from dictation. "
-    "FIELDS (exact labels, in on-screen order): {fields}\n"
-    "TRANSCRIPT: {transcript}\n"
-    'Return ONLY JSON: {{"fields": [{{"label": "<exact label from FIELDS>", '
-    '"value": "<string>"}}]}}. Include only fields the user gave a value for. '
-    "Never invent a label. If none are mentioned, return {{\"fields\": []}}."
-)
-
-
-def llm_parse(transcript: str, scan: FormScan, ask) -> list[FieldAssignment] | None:
-    """One short local-LLM call for the cases the grammar can't reach.
-
-    `ask(prompt) -> str` is provided by the caller (the planner's endpoint).
-    Every returned label must match a real on-screen field, otherwise it is
-    dropped — the model can paraphrase, but it cannot hallucinate a box.
-    """
-    if not scan.fields:
-        return None
-    try:
-        raw = ask(_LLM_PROMPT.format(
-            fields=json.dumps(scan.labels()), transcript=transcript))
-        obj = json.loads(raw.strip().removeprefix("```json").removesuffix("```").strip())
-        entries = obj.get("fields") or []
-    except Exception:
-        return None
-
-    by_label: dict[str, FormField] = {}
-    for f in scan.fields:
-        by_label[f.label.lower()] = f
-
-    out: list[FieldAssignment] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        label = str(entry.get("label", "")).strip()
-        value = str(entry.get("value", "")).strip()
-        if not label or not value:
-            continue
-        target = by_label.get(label.lower())
-        if target is None:  # hallucinated label → drop, never write it
-            continue
-        if any(a.field is target for a in out):
-            continue
-        out.append(FieldAssignment(target, value, "llm", 0.9))
-    return out or None

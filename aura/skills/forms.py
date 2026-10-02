@@ -41,41 +41,6 @@ def _tree(ctx: SkillContext):
     return ctx.bridge.ax_tree()
 
 
-# --------------------------------------------------------------------------- #
-# LLM refine — only when the grammar found nothing and a local brain is up    #
-# --------------------------------------------------------------------------- #
-
-def _llm_ask_from_config(config):
-    """A sync prompt→text callable for the configured local brain, or None.
-
-    Used for exactly one purpose: mapping free-form dictation onto field
-    labels when the deterministic grammar matched nothing. 3 s cap — speed
-    is the contract, the heuristic path never waits on a model.
-    """
-    try:
-        import httpx  # type: ignore
-    except Exception:
-        return None
-    planner = getattr(config, "planner", None)
-    if planner is None or getattr(planner, "engine", "") == "mock":
-        return None
-    base = getattr(planner, "base_url", "") or "http://127.0.0.1:11434/v1"
-    model = getattr(planner, "model", "") or "qwen3:4b"
-    key = getattr(planner, "api_key", "") or "local"
-
-    def ask(prompt: str) -> str:
-        resp = httpx.post(
-            f"{base.rstrip('/')}/chat/completions",
-            json={"model": model,
-                  "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0},
-            headers={"Authorization": f"Bearer {key}"}, timeout=3.0)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-
-    return ask
-
-
 def _match_assignments(explicit: list[dict], fields: list[FormField]) -> list:
     """Validate planner-supplied field values against the live form."""
     from ..formfill import FieldAssignment, _mention_tokens
@@ -146,14 +111,8 @@ class AXFillForm(Skill):
         raw = str(args.get("raw", ""))
         assignments = _match_assignments(args.get("fields") or [], scan.fields)
         if not assignments and raw:
+            # The deterministic grammar is the only parser — Aura has no LLM.
             assignments = plan_fill(raw, scan)
-            if not assignments:
-                ask = _llm_ask_from_config(ctx.config)
-                if ask is not None:
-                    try:
-                        assignments = llm_parse_safe(raw, scan, ask)
-                    except Exception:
-                        assignments = []
         if not assignments:
             names = ", ".join(f.label for f in scan.fields[:8])
             btns = ", ".join(b.label for b in scan.submit_buttons[:2])
@@ -216,13 +175,6 @@ class AXDictate(Skill):
             return SkillResult(False, "I couldn't type that — is a field focused?")
         return SkillResult(True, f"Typed {text!r} into the focused field.",
                            data={"chars": len(text)})
-
-
-def llm_parse_safe(transcript: str, scan, ask):
-    from ..formfill import llm_parse
-
-    result = llm_parse(transcript, scan, ask)
-    return result or []
 
 
 def register_form_skills(registry) -> None:

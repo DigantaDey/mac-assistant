@@ -16,13 +16,13 @@ paranoid gate, and dumb-but-perfect executors.
 │      │        │   ▲                    │                                │ │
 │      │        │   │      confirm/cancel/correct                         │ │
 │      │        │   │                    ▼                                │ │
-│      │        │ responding ◄── executing ◄── proposing (timeout 45 s)   │ │
+│      │        │ responding ◄── executing ◄── proposing (timeout 20 s)   │ │
 │      │        └────────────────────────┬────────────────────────────────┘ │
 │      │                                 │                                  │
 │  TTS  │        Planner ────────► SafetyGate ────────► SkillRegistry        │
 │ `say` │  rules, then Laya       blocklist          24 declared skills      │
-│ /Piper│  (LLM optional, same    + skill manifest   AppleScript · AX · `open`│
-│       │  seam)                  + Laya gate        · pbcopy/pbpaste        │
+│ /Piper│  bundled checkpoint     + skill manifest   AppleScript · AX · `open`│
+│       │                           + Laya gate      · pbcopy/pbpaste        │
 │       │                                 │                                  │
 │  EventBus ──► SSE ──► UI (127.0.0.1)    ▼                                  │
 │                ▲              Memory (SQLite: events · preferences ·       │
@@ -33,7 +33,7 @@ paranoid gate, and dumb-but-perfect executors.
 ## Layers
 
 ### 1. Voice front-end (`audio.py`, `wakeword.py`, `vad.py`, `stt.py`, `tts.py`)
-- Only the **wake model stays resident** (~tens of MB). STT/LLM load lazily on
+- Only the **wake model stays resident** (~tens of MB). STT loads lazily on
   wake and unload after `session.idle_unload_seconds` — that's the ~200 MB idle
   promise.
 - Wake supports pretrained openWakeWord models and user-trained custom-phrase
@@ -52,7 +52,7 @@ Three layers behind one contract — and the plan is always a *typed object*
 {"reply": "one short spoken sentence",
  "actions": [{"skill": "system.open_app", "args": {"app": "Spotify"},
               "risk": "safe", "why": "asked to open it"}],
- "source": "rules|laya|laya+rules|llm|none", "complete": true,
+ "source": "rules|laya|laya+rules|none", "complete": true,
  "model_ms": 12.4, "degraded": false, "diagnostic": ""}
 ```
 
@@ -66,10 +66,10 @@ Three layers behind one contract — and the plan is always a *typed object*
   options; the model picks the skill), plus a `score` question when a value
   lives on a scale (volume). A partial rule plan is *extended*, not replaced;
   a pick below `laya.route_threshold` means "no skill" and is never acted on.
-- **LLM last (`HybridPlanner`, opt-in).** The same one-method interface over a
-  local OpenAI-compatible server (Ollama/mlx_lm/llama.cpp/LM Studio) with a
-  throttled health probe; parsing is defensive (fence-stripping,
-  brace-matching, schema coercion).
+- **There is no fourth layer.** Aura deliberately has no LLM planner — a
+  local chat model's latency (seconds to minutes per request) is a worse
+  trade than refusing and saying so. Legacy `planner.engine` values
+  (`auto`, `openai_compat`) are mapped to Laya with a warning.
 - **Arguments are never generated.** They come from deterministic extraction
   (`aura/intent.extract_args`) or a closed set offered to Laya. A skill whose
   argument cannot be read from the request is *refused*, not guessed — the one
@@ -125,8 +125,8 @@ and carried on the `Decision` (`error`, `source`).
   button", "type aura into the search field", "what's on my screen".
 - **`skills/forms.py`** fills whole forms from dictation:
   **`formfill.py`** scans the live tree for fields/buttons, maps spoken
-  values onto labels (grounded — an offline LLM pass only refines when the
-  heuristic matched nothing), and types with original casing kept.
+  values onto labels (heuristic only — nothing is guessed), and types with
+  original casing kept.
   `ax.fill_form` (safe), `ax.read_form` (reads the fields), `ax.dictate`
   (~100 ms typing into the focused field). Pressing a submit button is
   always a separate confirm-gated action.
@@ -175,8 +175,8 @@ in the planner catalog, the UI, and the safety manifest.
 Aura treats TCC as *the* consent system, not an obstacle. Every check is
 honest and live: Accessibility via `AXIsProcessTrusted()`, microphone via
 whether Aura's own audio bridge opened, automation via a harmless AppleEvent
-actually sent (the consent dialog is the feature), whisper/LLM readiness via
-real binary/endpoint probes. The Setup wizard renders these as cards with
+actually sent (the consent dialog is the feature), whisper/Laya readiness via
+real binary probes and a live checkpoint load. The Setup wizard renders these as cards with
 deep links (`x-apple.systempreferences:…`) into the exact Privacy panes,
 a progress bar, and a Check-again loop. Nothing is faked, anywhere.
 
@@ -238,8 +238,8 @@ a terminal.
 `config.default.toml` → user `config.toml` → `runtime.toml` (written by the
 app) → `AURA_*` env vars. The `auto` profile resolves to **mac** on macOS
 and **demo** elsewhere — but off-Mac the demo *base* is applied first and
-overridable, so developers can point the brain at their Ollama without
-touching the profile. `LIVE_FIELDS` marks the safe subset the UI may change
+overridable, so developers can point the brain at another Laya checkpoint
+(`laya.checkpoint_dir`) without touching the profile. `LIVE_FIELDS` marks the safe subset the UI may change
 at runtime (`POST /api/config` validates type + membership, persists to
 `runtime.toml`, hot-applies on the loop); restart-required fields are
 refused with a friendly message.

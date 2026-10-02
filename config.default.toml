@@ -25,17 +25,13 @@ whisper_model = ""            # e.g. "~/models/ggml-small.en.bin" (whisper.cpp)
 faster_whisper_model = "small"
 
 [planner]
-# laya           — the default brain: deterministic rules parse the request,
-#                  the Laya decision model routes whatever they cannot.
-#                  No model server, no Ollama, nothing to download but Laya.
-# auto           — Laya when installed, otherwise the local LLM, otherwise rules.
-# openai_compat  — the LLM-first planner (Ollama/mlx_lm/llama.cpp/LM Studio).
-# mock           — the rule layer alone (demo profile, tests).
+# Aura's brain is Laya — a non-autoregressive decision model that answers
+# typed questions in one forward pass. There is no LLM anywhere in the
+# product: no model server, no Ollama, no gigabyte downloads.
+#   laya   — the default: rules parse the everyday commands, Laya routes the rest
+#   rules  — the deterministic rule layer alone
+#   mock   — alias of rules (demo profile, tests)
 engine = "laya"
-base_url = "http://127.0.0.1:11434/v1"   # only used by openai_compat/auto
-model = "qwen3:4b"                       # only used by openai_compat/auto
-temperature = 0.2
-timeout_seconds = 4.0         # leave one second for fallback + execution (5 s SLO)
 max_actions = 3
 
 [laya]
@@ -46,11 +42,16 @@ destructive_threshold = 0.55  # above this → ask
 route_threshold = 0.30        # a routing pick below this is "no skill" (never acted on)
 device = ""                   # "" = auto (MPS/CUDA/CPU); or "cpu", "mps", "cuda"
 model = ""                    # "" = let the router choose per language
+# Which checkpoint to load. Resolution order (first usable wins):
+#   adapter_dir → checkpoint_dir → $AURA_LAYA_CHECKPOINT → the bundled
+#   navigation checkpoint (assets/models/aura-nav-laya) → the hub default.
+# The bundled checkpoint ships with the repo, so Laya works out of the box.
+checkpoint_dir = ""
+adapter_dir = ""              # your fine-tuned Laya checkpoint (feedback loop output)
 preload = false               # true = hold every checkpoint in RAM (fastest)
 max_loaded = 2                # checkpoints allowed to stay resident
-call_budget_seconds = 1.5     # past this, the offline gate answers and the log says why
+call_budget_seconds = 6.0     # past this, the offline gate answers and the log says why
 idle_unload_seconds = 0.0     # >0 releases the model after idle (reload on next use)
-adapter_dir = ""              # your fine-tuned Laya checkpoint (feedback loop output)
 
 [logging]
 # Everything the engine does is written to stderr (the app captures it into
@@ -79,5 +80,5 @@ blocked_patterns = ["rm -rf /", "diskutil erase", "sudo dd"]
 max_utterance_seconds = 12.0
 end_of_speech_seconds = 0.7
 confirmation_timeout_seconds = 45.0
-max_session_seconds = 5.0     # active work only; confirmation wait is separate
+max_session_seconds = 20.0    # active work only; confirmation wait is separate
 idle_unload_seconds = 180.0

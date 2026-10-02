@@ -1,12 +1,22 @@
 # Aura
 
-**Your machine, understood.** A private, offline, voice-first assistant for
-macOS — a **native menu-bar app** with the whole engine running on your Mac.
+**Your machine, understood.** A private, offline, **keyboardless voice
+navigator** for macOS — a **native menu-bar app** with the whole engine
+running on your Mac. You talk; Aura opens apps, clicks buttons, fills forms,
+searches the web, and drives the system — no keyboard, no LLM.
 
 There is no cloud account, no telemetry, and **no browser**: Aura is an
 `LSUIElement` app built with SwiftUI and AppKit that talks to a local Python
 engine over `127.0.0.1`. Say it, type it, or tap the orb — Aura listens,
 understands, plans, and asks before anything risky.
+
+**The brain is [Laya](https://pypi.org/project/laya/)** — a non-autoregressive
+"System 1" decision model that answers *typed questions* with calibrated
+probabilities in a single forward pass (tens of milliseconds). It never
+generates text, so it can never invent a command or an argument. There is
+**no LLM anywhere in Aura**: nothing to serve, no gigabyte pull, no
+"still thinking". A navigation checkpoint ships in the repo
+(`assets/models/aura-nav-laya`), so Laya works out of the box.
 
 > **TL;DR** — Say “*Hey Aura, open YouTube*.” Or type it. Or click the ◉ in
 > the menu bar. Everything happens on this Mac.
@@ -25,17 +35,17 @@ One command, and it is idempotent — re-run it any time to update:
 1. installs the native bits with Homebrew (PortAudio, whisper.cpp);
 2. downloads the speech model (`ggml-base.en`, ≈150 MB, one-time);
 3. copies the engine to `~/Library/Application Support/Aura/engine` and builds
-   a Python environment for it — the decision model ships with it;
-4. downloads **Laya** once and proves it answers, with
-   `python -m aura laya-check`;
+   a Python environment for it — Laya and the navigation checkpoint travel
+   with it;
+4. proves the brain answers, with `python -m aura laya-check` (if the bundled
+   checkpoint is ever missing, the installer trains a replacement on the spot);
 5. builds **Aura.app** and installs it into **/Applications**;
 6. opens it — and Aura walks you through the two macOS permissions, one click
    each.
 
-There is **no model server to run**: Aura's brain is the rule layer plus Laya,
-both inside the engine's own environment. If you *want* the optional LLM
-planner, `AURA_WITH_OLLAMA=1 ./scripts/install.sh` adds Ollama and
-`qwen3:4b` (~2.5 GB) and then set `planner.engine = "auto"`.
+There is **no model server to run** and no LLM to pull: Aura's brain is the
+deterministic reflex layer plus Laya, both inside the engine's own
+environment, working from the checkpoint committed to this repo.
 
 Then:
 
@@ -52,14 +62,16 @@ The engine is a plain Python package with a token-guarded JSON API; it runs
 head-less anywhere (that is how the test suite and CI use it):
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+python3 -m venv .venv && .venv/bin/pip install -e ".[mac]"
+.venv/bin/python -m aura laya-check # prove the brain answers, with timings
+.venv/bin/python -m aura talk       # voice-or-typed conversation REPL
 .venv/bin/python -m aura serve      # → prints the token path and the port
 .venv/bin/python -m aura doctor     # honest capability matrix
-.venv/bin/python -m aura laya-check # prove the decision model, with timings
+.venv/bin/python -m aura hear f.wav # batch: run one WAV through the pipeline
 ```
 
-(`pip install -e ".[mac]"` adds the `laya` decision model and the speech
-extras; `.[dev]` alone runs the whole engine on the deterministic fallback.)
+(`.[mac]` adds the `laya` decision model and the speech extras; `.[dev]`
+alone runs the whole engine on the deterministic reflex layer.)
 
 There is deliberately **no web UI** — the product is the app.
 
@@ -83,14 +95,16 @@ There is deliberately **no web UI** — the product is the app.
 you ── voice / type ──►  STT (whisper.cpp or faster-whisper, on-device)
                               │ transcript
                               ▼
-                        Planner (aura/planner.py)
-                          rules first — a reflex never waits for a model
-                          then Laya: one closed-set question over the skill
-                          catalog, one score question for a number
-                          (the optional LLM planner plugs in at the same seam)
+                        Rules first (aura/planner.py)
+                          a reflex never waits for a model
+                              │
+                        Laya (aura/planner.py + aura/intent.py)
+                          one closed-set question: which skill did you mean?
+                          each candidate scored by a small encoder, in
+                          parallel — no LLM, no token-by-token generation
                               │ plan: which skills, with what arguments
                               ▼
-                        The gate (aura/laya.py)
+                        The gate (aura/laya.py, also Laya)
                           scores: match (did I understand?) &
                                   destructive (is this risky?)
                               │
@@ -99,22 +113,24 @@ you ── voice / type ──►  STT (whisper.cpp or faster-whisper, on-device
      just do it                    ASK: Run it / Cancel  (native card)
 ```
 
-Laya is the one model Aura needs on the fast path, and it never writes prose:
-it *chooses* a skill from a closed list and *scores* a value on a defined
-scale, so a wrong answer is a wrong choice — never an invented command. When
-it is missing or slow, the rules still answer, the reply says what degraded,
-and the log says why.
+Laya is the only model on the fast path, and it never writes prose: it
+*chooses* a skill from a closed list and *scores* a value on a defined scale,
+so a wrong answer is a wrong choice — never an invented command. When Laya is
+missing or slow, the rules still answer, the reply says what degraded, and the
+log says why.
 
 Every outcome — done, you confirmed, you cancelled, you corrected — is
-recorded locally. That log is what the optional Laya fine-tune loop consumes
+recorded locally. That log is what the Laya fine-tune loop consumes
 (`scripts/nightly_laya.py`), so Aura's judgement improves from *your* choices.
 
-**Latency is a product contract:** everyday commands take the deterministic
-reflex path (for example, “open YouTube” opens the website directly), while an
-unfamiliar request may use the local model. Active planning and execution are
-hard-capped at five seconds; if macOS or the model does not answer, Aura says so
-and returns to Ready instead of leaving a permanent “Thinking…” message.
-Waiting for you to approve a risky action is the only deliberate exception.
+**Latency is a product contract.** Everyday commands take the deterministic
+reflex path and finish in milliseconds. Anything Laya must decide is budgeted:
+the whole planning step is capped, each Laya call gets a few seconds of that
+budget, and a request that has been *active* for twenty seconds is closed with
+a real answer instead of hanging. If macOS or the model does not answer, Aura
+says so and returns to Ready instead of leaving a permanent "Thinking…"
+message. Waiting for you to approve a risky action is the only deliberate
+exception.
 
 ---
 
