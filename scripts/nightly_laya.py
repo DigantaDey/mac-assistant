@@ -62,7 +62,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", default="")
-    ap.add_argument("--steps", type=int, default=1500)
+    # Must match the trainer's proven-to-pass default: fewer steps leave the
+    # gate's match question below the bar and the swap would (rightly) never
+    # happen. It runs unattended overnight — wall time is cheap here.
+    ap.add_argument("--steps", type=int, default=4500)
     ap.add_argument("--dry-run", action="store_true", help="export + stats only")
     ap.add_argument("--keep", action="store_true",
                     help="keep the candidate directory for inspection")

@@ -393,9 +393,7 @@ def cmd_laya_check(cfg) -> int:
     """Prove the Laya install end-to-end: import → load → decide → route."""
     from . import log as log_mod
     from .laya import (
-        LayaGate,
         RealLayaBackend,
-        build_backend,
         laya_available,
         resolve_checkpoint_dir,
     )
@@ -413,18 +411,32 @@ def cmd_laya_check(cfg) -> int:
         print("  log               : " + str(log_mod.log_path() or "stderr"))
         return 2
 
+    laya_cfg = getattr(cfg, "laya", None)
+    mode = str(getattr(laya_cfg, "backend", "auto") or "auto").lower()
+    if mode in ("heuristic", "off", "none") or not getattr(laya_cfg, "enabled", True):
+        print("  backend           : offline gate deliberately configured "
+              f"(laya.backend={getattr(laya_cfg, 'backend', mode)})")
+        return 0
+
     checkpoint, source = resolve_checkpoint_dir(cfg)
     print(f"  checkpoint        : {checkpoint or 'hub default'}  [{source}]")
 
-    backend = build_backend(cfg)
-    if isinstance(backend, LayaGate):
-        inner = backend.real
-    elif isinstance(backend, RealLayaBackend):
-        inner = backend
-    else:
-        print("  backend           : offline gate deliberately configured "
-              f"(laya.backend={cfg.laya.backend})")
-        return 0
+    # Load synchronously, on this thread — never through build_backend(). The
+    # gate that serves the engine warms up on a *daemon* thread; in a one-shot
+    # command the interpreter can start tearing itself down while that thread
+    # is still inside native (torch/MPS) code, which is exactly how this
+    # self-test used to end with `Segmentation fault: 11` right after printing
+    # its result. Here the model loads, answers and unloads before exit.
+    inner = RealLayaBackend(
+        device=str(getattr(laya_cfg, "device", "") or ""),
+        model=str(getattr(laya_cfg, "model", "") or ""),
+        adapter_dir=checkpoint if source == "laya.adapter_dir" else "",
+        checkpoint_dir=checkpoint,
+        preload=bool(getattr(laya_cfg, "preload", False)),
+        max_loaded=int(getattr(laya_cfg, "max_loaded", 2) or 2),
+    )
+    log.info("laya-check: loading %s synchronously (device=%s)",
+             checkpoint or "hub default", inner.device or "auto")
 
     print(f"  device            : {inner.device or 'auto'}")
     print("  loading           : this may download weights on the first run…", flush=True)

@@ -14,9 +14,11 @@
 #   6. Aura.app             built and installed into /Applications, then opened
 #
 # No model server, no Ollama, no LLM: Aura's brain is Laya, a non-autoregressive
-# decision model that answers typed questions in one forward pass. A navigation
-# checkpoint ships with the repo (assets/models/aura-nav-laya); if it is ever
-# missing this script rebuilds it on the spot — no hub download required.
+# decision model that answers typed questions in one forward pass. The navigation
+# checkpoint (assets/models/aura-nav-laya) is trained on this Mac by step 4
+# when it is missing — no hub download required; re-running is safe (a
+# half-finished training run is detected by its missing training_report.json
+# and redone, never mistaken for a real checkpoint).
 #
 # After this, the terminal never appears again: everything (permissions,
 # wake phrase, settings, installs) lives inside Aura.
@@ -83,10 +85,23 @@ fi
 
 say_step "4/6  Decision model (Laya) — the bundled checkpoint, proven end-to-end"
 CKPT="$ENGINE_DIR/assets/models/aura-nav-laya"
+# A checkpoint only counts when training RAN TO COMPLETION: the trainer writes
+# training_report.json last and now stages + renames atomically. An interrupted
+# earlier run (or one that hit the laya < 0.3.22 ImportError) can leave
+# scaffolding plus untrained weights behind — a directory that LOOKS done, so
+# this script would skip retraining and laya-check would load random weights.
+if [ -f "$CKPT/model.safetensors" ] && [ ! -f "$CKPT/training_report.json" ]; then
+  note "Found an incomplete checkpoint (an earlier training run did not finish) — retraining."
+  rm -rf "$CKPT"
+fi
 if [ ! -f "$CKPT/model.safetensors" ]; then
-  note "Navigation checkpoint missing — training it now (a few minutes, once)…"
+  note "Navigation checkpoint missing — training it now (one-time: a few minutes on"
+  note "Apple Silicon, longer on an Intel Mac; the progress lines below are live)…"
+  # The trainer exits non-zero when its internal quality bar is not met; the
+  # verdict the user lives with is the laya-check below, so keep going either
+  # way and let the self-test be the judge.
   .venv/bin/python scripts/train_navigation_laya.py --out "$CKPT" \
-    || note "training failed — Aura will run on the offline gate (see the log)"
+    || note "training did not clear its quality bar — verifying with the self-test below…"
 fi
 if .venv/bin/python -m aura laya-check; then
   note "Laya is answering — Aura's brain is on this Mac."

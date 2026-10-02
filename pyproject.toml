@@ -29,7 +29,8 @@ mac = [
   "numpy>=1.26",             # PCM processing
   "openwakeword>=0.6",       # on-device wake word models (ONNX)
   "faster-whisper>=1.0",     # local STT (alternative to whisper.cpp)
-  "laya>=0.3.20,<0.4",       # the System-1 decision model — the brain (Apache-2.0)
+  "laya>=0.3.22,<0.4",       # the System-1 decision model — the brain (Apache-2.0);
+                             # ≥0.3.22: the trainer needs laya.agent._option_logits
   "piper-tts>=1.2",          # optional local TTS
 ]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4", "numpy>=1.26",
