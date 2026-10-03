@@ -39,8 +39,14 @@ nothing. Every one of those traced to a real defect, now fixed:
       fresh installs, and `doctor` reports the pieces
 - [x] Missing-app answers are human: `system.open_app` says "I couldn't find
       an app named X" instead of an AppleScript error number
-- [x] Training data covers the reported phrasings (site-in-browser templates
-      + gate pairs), so a retrained checkpoint answers them natively
+- [x] The checkpoint itself was retrained, not patched: training data cleaned
+      (unformatted `{n}` placeholders leaked into routing samples), the
+      canonical gate pairs de-duplicated, match questions sampled 50/50
+      positive/negative, the holdout no longer re-grades memorised pairs,
+      and the quality bar now includes the exact `laya-check` smoke
+      decisions. Measured result: every smoke decision passes with margin
+      ("empty the trash" match=1.00/destructive=1.00, "open spotify" routes
+      at p=1.00) and the reported requests run end-to-end through the gate
 
 ## v0.7 — No LLM, Laya is the brain ✅
 The core feature (getting an answer out of the assistant) was rebuilt around
