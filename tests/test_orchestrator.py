@@ -143,3 +143,83 @@ async def test_feedback_learns(orch):
     assert orch.memory.get_preference("when i say open spotify i mean the web player") is None or True
     # weighted examples exist for the fine-tune
     assert orch.examples.stats()["total"] == 1
+
+
+class _RecordingTTS:
+    def __init__(self) -> None:
+        self.spoken: list[str] = []
+
+    def speak(self, text: str) -> float:
+        self.spoken.append(text)
+        return 0.0
+
+
+async def test_the_confirmation_question_is_spoken(orch):
+    """A voice user isn't looking at the panel: the question itself must be
+    spoken when the proposal goes out, and the reply after a yes reports the
+    OUTCOME — it does not ask again."""
+    orch.tts = _RecordingTTS()
+    sid = orch.bus.subscribe_async()
+    task = asyncio.create_task(orch.submit_text("empty the trash"))
+    while True:
+        ev = await asyncio.wait_for(orch.bus.get(sid), timeout=5)
+        if ev.type == "proposal":
+            break
+    # TTS is fire-and-forget on an executor — give it a beat to run.
+    for _ in range(100):
+        if any("go ahead" in line for line in orch.tts.spoken):
+            break
+        await asyncio.sleep(0.02)
+    assert any("go ahead" in line for line in orch.tts.spoken), orch.tts.spoken
+    orch.resolve_confirmation(ev.data["token"], "confirm")
+    await asyncio.wait_for(task, timeout=5)
+    for _ in range(100):
+        if orch.tts.spoken and orch.tts.spoken[-1] == "Trash emptied.":
+            break
+        await asyncio.sleep(0.02)
+    assert orch.tts.spoken[-1] == "Trash emptied.", orch.tts.spoken
+    orch.bus.unsubscribe_async(sid)
+
+
+async def test_a_timed_out_proposal_is_loud_not_silent(orch, aura_logs):
+    """The old failure mode: the ask went out, nobody saw it, and 45 s later
+    the session cancelled itself without a trace in the log."""
+    orch.cfg.session.confirmation_timeout_seconds = 0.2
+    sid = orch.bus.subscribe_async()
+    await asyncio.wait_for(orch.submit_text("empty the trash"), timeout=5)
+    assert orch.state == "armed"
+    assert orch.memory.recent_events()[0]["outcome"] == "cancelled"
+    assert any("no answer within" in r.getMessage() for r in aura_logs), \
+        [r.getMessage() for r in aura_logs if "proposal" in r.getMessage()]
+    orch.bus.unsubscribe_async(sid)
+
+
+async def test_feedback_lands_on_its_skill_with_its_args(orch):
+    orch.record_feedback("open youtube.com in safari", "browser.open_url",
+                         "corrected", "", {"url": "youtube.com", "browser": "Safari"})
+    stats = orch.examples.stats()
+    assert stats["corrected"] == 1 and stats["total"] == 1
+    # and a verdict without a skill supervises nothing — no ""-skill rows
+    orch.record_feedback("open spotify", "", "corrected")
+    assert orch.examples.stats()["total"] == 1
+
+
+async def test_setup_done_is_guaranteed_when_the_installer_crashes(stack):
+    """If the install raises, the UI must still see setup_done — without it
+    the Setup panel is stuck in 'Installing…' with every button disabled."""
+    orch = stack.build_orchestrator()
+    orch.cfg.profile = "mac"
+
+    def boom():
+        raise RuntimeError("disk full")
+
+    orch._run_setup_sync = boom
+    sid = orch.bus.subscribe_async()
+    result = await orch.run_setup()
+    events = orch.bus.drain(sid)
+    done = [ev for ev in events if ev.type == "setup_done"]
+    assert result["ok"] is False
+    assert done and done[0].data["ok"] is False
+    assert "disk full" in done[0].data["summary"]
+    assert orch._setup_running is False
+    orch.bus.unsubscribe_async(sid)

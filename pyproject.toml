@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aura-mac"
-version = "0.6.2"
+version = "0.7.1"
 description = "Aura — a private, offline voice assistant for macOS, with a native menu-bar app and the whole engine on your Mac."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,6 +32,13 @@ mac = [
   "laya>=0.3.22,<0.4",       # the System-1 decision model — the brain (Apache-2.0);
                              # ≥0.3.22: the trainer needs laya.agent._option_logits
   "piper-tts>=1.2",          # optional local TTS
+  # Aura sees and clicks inside apps through the Accessibility API
+  # (aura/ax.py). Without these every ax.* skill fails with
+  # "No module named 'ApplicationServices'" — they are not optional on a Mac.
+  "pyobjc-core>=10.0",
+  "pyobjc-framework-Cocoa>=10.0",               # NSWorkspace (frontmost app)
+  "pyobjc-framework-Quartz>=10.0",              # CGEvent clicks
+  "pyobjc-framework-ApplicationServices>=10.0", # AXUIElement tree
 ]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4", "numpy>=1.26",
   # Swift syntax gate that runs anywhere (see scripts/check_swift_syntax.py)

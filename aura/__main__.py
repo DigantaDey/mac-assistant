@@ -297,7 +297,12 @@ def cmd_doctor(cfg) -> int:
     check("profile", True, _profile_for(cfg))
     check("data dir", True, cfg.data_dir)
 
-    for mod in ("numpy", "sounddevice", "openwakeword", "faster_whisper", "laya"):
+    mods = ["numpy", "sounddevice", "openwakeword", "faster_whisper", "laya"]
+    if sys.platform == "darwin":
+        # The Accessibility bridge (aura/ax.py) stands on pyobjc; without it,
+        # every ax.* skill fails with "No module named 'ApplicationServices'".
+        mods += ["ApplicationServices", "AppKit", "Quartz"]
+    for mod in mods:
         try:
             __import__(mod)
             check(f"python: {mod}", True)
@@ -549,7 +554,7 @@ def cmd_serve(cfg) -> int:
         print(f"Engine:  http://{host}:{cfg.server.port}  (JSON API — the app is the UI)")
         print(f"Data:    {cfg.data_dir}")
         if server.token:
-            print(f"Token:   {localauth.token_path(cfg.data_dir)}  (send it as {TOKEN_HEADER} = X-Aura-Token)")
+            print(f"Token:   {localauth.token_path(cfg.data_dir)}  (send it as the {TOKEN_HEADER} header)")
         else:
             print("Token:   DISABLED — anyone on this Mac can drive Aura (AURA_NO_AUTH=1).")
         if not localauth.is_loopback_host(cfg.server.host):

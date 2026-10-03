@@ -45,16 +45,37 @@ def _ensure_url(raw: str) -> str:
 
 
 class OpenURL(Skill):
-    spec = _spec("browser.open_url", "Open a website or URL in the default browser",
-                 args={"url": "string"}, examples=["open github.com", "go to youtube"])
+    spec = _spec("browser.open_url",
+                 "Open a website or URL — in the default browser, or in a "
+                 "named one (\"open youtube.com in safari\")",
+                 args={"url": "string", "browser": "string (optional)"},
+                 examples=["open github.com", "go to youtube",
+                           "open youtube.com in safari"])
 
     async def execute(self, args: dict[str, Any], ctx: SkillContext) -> SkillResult:
         url = _ensure_url(str(args.get("url", "")))
         if not url or url == SEARCH_URL.format(q=""):
             return SkillResult(False, "Which site should I open?")
-        ok, out = ctx.bridge.open_url(url)
-        return SkillResult(ok, f"Opened {url}." if ok else f"Couldn't open {url}: {out}",
-                           data={"url": url})
+        browser = str(args.get("browser", "") or "").strip()
+        ok, out = ctx.bridge.open_url(url, browser=browser or None)
+        where = f" in {browser}" if browser else ""
+        if ok:
+            return SkillResult(True, f"Opened {url}{where}.",
+                               data={"url": url, "browser": browser})
+        # The usual cause of a named-browser failure is that the browser
+        # itself isn't installed — fall back to the default browser rather
+        # than dropping the request on the floor.
+        if browser:
+            ok2, out2 = ctx.bridge.open_url(url)
+            if ok2:
+                return SkillResult(
+                    True,
+                    f"I couldn't find {browser} ({out}), so I opened {url} "
+                    "in your default browser.",
+                    data={"url": url, "browser": ""})
+            out = f"{out}; default browser too: {out2}"
+        return SkillResult(False, f"Couldn't open {url}{where}: {out}",
+                           data={"url": url, "browser": browser})
 
 
 class SearchWeb(Skill):

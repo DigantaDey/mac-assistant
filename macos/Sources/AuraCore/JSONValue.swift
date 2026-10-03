@@ -96,4 +96,18 @@ public enum JSONValue: Decodable, Equatable, Sendable {
                 .joined(separator: ", ")
         }
     }
+
+    /// Plain Foundation values, for building request bodies back to the
+    /// engine (e.g. the action args attached to a 👍/👎 verdict).
+    public var anyValue: Any {
+        switch self {
+        case .string(let value): return value
+        case .number(let value):
+            return value == value.rounded() ? Int(value) : value
+        case .bool(let value): return value
+        case .array(let values): return values.map { $0.anyValue }
+        case .object(let values): return values.mapValues { $0.anyValue }
+        case .null: return NSNull()
+        }
+    }
 }

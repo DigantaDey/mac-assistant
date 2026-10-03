@@ -117,6 +117,34 @@ class MockPlanner(Planner):
     def _title_case(name: str) -> str:
         return intent_mod.title_case(name)
 
+    @staticmethod
+    def _open_target(raw: str) -> tuple[Action, str]:
+        """Turn the words after “open” into one action.
+
+        Trailing context is dropped, never swallowed: “open youtube.com
+        **in safari**” used to become `browser.open_url(url="youtube.com in
+        safari")` — an address nobody owns, which the gate rightly refused.
+        Now the site is separated from the browser, and a named browser
+        becomes an argument the skill honours.
+        """
+        raw = raw.strip(" ,.!?")
+        browser = intent_mod.browser_from_tail(raw)
+        target = intent_mod.strip_trailing_context(raw)
+        app = intent_mod.title_case(target)
+        lowered = app.lower()
+        if "." in lowered or lowered in POPULAR_SITES:
+            # “Open YouTube” means the website for the overwhelming majority
+            # of Mac users. Route it to `open <url>` instead of AppleScript,
+            # which can block while looking for a nonexistent app or waiting
+            # on an Automation dialog.
+            args: dict[str, Any] = {"url": lowered}
+            if browser:
+                args["browser"] = browser
+            reply = f"Opening {app} in {browser}." if browser else f"Opening {app}."
+            return Action("browser.open_url", args, "safe", "opening site"), reply
+        return (Action("system.open_app", {"app": app}, "safe", "asked to open it"),
+                f"Opening {app}.")
+
     async def plan(self, transcript: str, context: dict[str, Any]) -> Plan:
         started = time.monotonic()
         # Chain support: "open spotify and set volume to 30" → two actions.
@@ -163,20 +191,9 @@ class MockPlanner(Planner):
         elif "what can you do" in t or "help" == t:
             reply = ("I can open and quit apps, control volume and brightness, search the "
                      "web, manage tabs and clipboard, remember facts, and more — ask away.")
-        elif m := re.search(r"open (?:the )?(?:app )?(.+?)(?: and|$)", t):
-            app = self._title_case(m.group(1))
-            target = app.lower()
-            if "." in app or target in POPULAR_SITES:
-                # “Open YouTube” means the website for the overwhelming
-                # majority of Mac users. Route it to `open <url>` instead of
-                # AppleScript, which can block while looking for a nonexistent
-                # app or waiting on an Automation dialog.
-                actions.append(Action("browser.open_url", {"url": target},
-                                      "safe", "opening site"))
-                reply = f"Opening {app}."
-            else:
-                actions.append(Action("system.open_app", {"app": app}, "safe", "asked to open it"))
-                reply = f"Opening {app}."
+        elif m := re.search(r"open (?:the )?(?:app )?(.+)$", t):
+            action, reply = self._open_target(m.group(1))
+            actions.append(action)
         elif re.search(r"\b(?:close|shut|dismiss|hide)\b[^.]*\btabs?\b"
                        r"|\btabs?\b[^.]*\b(?:close|shut|dismiss)\b", t) or \
                 re.search(r"\b(?:next|previous|prev|last|switch(?: to)?|go to|back to)\b"
@@ -189,16 +206,9 @@ class MockPlanner(Planner):
                      "by name, or open a new one.")
             complete = False
         elif m := re.search(r"(?:open|launch|fire up|pull up|bring up|switch to|go to) "
-                            r"(?:the )?(?:app )?(.+?)(?: and|$)", t):
-            app = self._title_case(m.group(1))
-            target = app.lower()
-            if "." in app or target in POPULAR_SITES:
-                actions.append(Action("browser.open_url", {"url": target},
-                                      "safe", "opening site"))
-                reply = f"Opening {app}."
-            else:
-                actions.append(Action("system.open_app", {"app": app}, "safe", "asked to open it"))
-                reply = f"Opening {app}."
+                            r"(?:the )?(?:app )?(.+)$", t):
+            action, reply = self._open_target(m.group(1))
+            actions.append(action)
         elif m := re.search(r"(?:quit|close|kill|force ?quit|terminate|shut down) (.+)", t):
             app = self._title_case(m.group(1))
             actions.append(Action("system.quit_app", {"app": app}, "confirm", "closing an app can lose work"))

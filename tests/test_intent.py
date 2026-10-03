@@ -265,3 +265,36 @@ class TestReplies:
     ])
     def test_replies_are_short_and_specific(self, skill, args, fragment):
         assert fragment in reply_for(skill, args)
+
+
+class TestBrowserArguments:
+    """'open youtube.com in safari' — the two halves of the request."""
+
+    @pytest.mark.parametrize("text,expected", [
+        ("open youtube.com in safari", {"url": "youtube.com", "browser": "Safari"}),
+        ("open youtube in safari", {"url": "youtube", "browser": "Safari"}),
+        ("open github.com in chrome", {"url": "github.com", "browser": "Google Chrome"}),
+        ("go to reddit.com on firefox", {"url": "reddit.com", "browser": "Firefox"}),
+        ("open github.com", {"url": "github.com"}),
+    ])
+    def test_url_and_named_browser(self, text, expected):
+        assert extract_args("browser.open_url", text) == expected
+
+    def test_trailing_context_is_dropped_from_app_names(self):
+        assert extract_args("system.open_app", "open spotify on my mac") == {"app": "Spotify"}
+
+    def test_strip_trailing_context(self):
+        from aura.intent import strip_trailing_context
+
+        assert strip_trailing_context("youtube.com in safari") == "youtube.com"
+        assert strip_trailing_context("spotify on my mac") == "spotify"
+        assert strip_trailing_context("activity monitor") == "activity monitor"
+
+    def test_browser_from_tail(self):
+        from aura.intent import browser_from_tail
+
+        assert browser_from_tail("youtube.com in safari") == "Safari"
+        assert browser_from_tail("github.com in google chrome") == "Google Chrome"
+        assert browser_from_tail("youtube.com") == ""
+        # "safari" as the TARGET is not a browser tail
+        assert browser_from_tail("safari") == ""

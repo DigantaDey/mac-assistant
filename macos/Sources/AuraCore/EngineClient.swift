@@ -111,9 +111,12 @@ public final class EngineClient: @unchecked Sendable {
     }
 
     @discardableResult
-    public func feedback(transcript: String, skill: String, good: Bool, note: String = "") async throws -> EngineReply {
-        try await post("/api/correct", body: ["transcript": transcript, "skill": skill,
-                                              "verdict": good ? "good" : "bad", "note": note])
+    public func feedback(transcript: String, skill: String, good: Bool,
+                         args: [String: Any]? = nil, note: String = "") async throws -> EngineReply {
+        var body: [String: Any] = ["transcript": transcript, "skill": skill,
+                                   "verdict": good ? "good" : "bad", "note": note]
+        if let args, !args.isEmpty { body["args"] = args }
+        return try await post("/api/correct", body: body)
     }
 
     @discardableResult

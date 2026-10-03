@@ -118,6 +118,6 @@ public enum Prefs {
 
 public enum AuraVersion {
     /// Kept in step with pyproject.toml and the bundle's CFBundleShortVersionString.
-    public static let semantic = "0.6.2"
+    public static let semantic = "0.7.1"
     public static var display: String { "Aura \(semantic)" }
 }

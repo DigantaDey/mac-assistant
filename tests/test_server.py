@@ -175,3 +175,70 @@ class TestServer:
         base = f"http://127.0.0.1:{cfg.server.port}"
         _, res = post(f"{base}/api/setup/install", {})
         assert res["ok"] is False
+
+
+class TestSetupAndFeedbackContracts:
+    def test_test_automation_reply_decodes_by_the_app_contract(self, server):
+        """The app decodes `EngineReply` with a required `ok`; an answer
+        without it used to die silently inside `try?` — a dead button."""
+        orch, srv, cfg = server
+        status, body = post(
+            f"http://127.0.0.1:{cfg.server.port}/api/permissions/test_automation", {})
+        assert status == 200
+        assert "ok" in body and "status" in body and "message" in body
+        assert body["ok"] is (body["status"] == "ok")
+
+    def test_feedback_is_answered_fast_and_recorded_with_its_skill(self, server):
+        orch, srv, cfg = server
+        base = f"http://127.0.0.1:{cfg.server.port}"
+        import time as _time
+
+        started = _time.monotonic()
+        status, body = post(f"{base}/api/correct",
+                            {"transcript": "open youtube.com in safari",
+                             "skill": "browser.open_url", "verdict": "bad",
+                             "args": {"url": "youtube.com", "browser": "Safari"}})
+        assert status == 200 and body["ok"] is True
+        assert _time.monotonic() - started < 2.0, "a thumb tap must not block on the model"
+
+        async def wait_recorded():
+            for _ in range(200):
+                if orch.examples.stats()["corrected"]:
+                    return
+                await asyncio.sleep(0.02)
+            raise AssertionError("feedback example never landed")
+
+        asyncio.run(wait_recorded())
+        assert orch.examples.stats()["corrected"] == 1
+
+    def test_feedback_without_a_skill_records_no_bogus_example(self, server):
+        orch, srv, cfg = server
+        status, body = post(f"http://127.0.0.1:{cfg.server.port}/api/correct",
+                            {"transcript": "open spotify", "skill": "",
+                             "verdict": "bad"})
+        assert status == 200 and body["ok"] is True
+
+        async def settle():
+            await asyncio.sleep(0.2)
+
+        asyncio.run(settle())
+        assert orch.examples.stats()["total"] == 0
+
+    def test_history_carries_the_plan_so_feedback_has_a_skill(self, server):
+        orch, srv, cfg = server
+        base = f"http://127.0.0.1:{cfg.server.port}"
+        post(f"{base}/api/input", {"text": "open spotify"})
+
+        async def wait_idle():
+            for _ in range(200):
+                if orch.state == "armed" and orch.memory.recent_events():
+                    return
+                await asyncio.sleep(0.02)
+            raise AssertionError("session never completed")
+
+        asyncio.run(wait_idle())
+        status, body = get(f"{base}/api/history")
+        assert status == 200
+        events = json.loads(body)["events"]
+        assert events and events[0]["plan"]["actions"]
+        assert events[0]["plan"]["actions"][0]["skill"] == "system.open_app"

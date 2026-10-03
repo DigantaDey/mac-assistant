@@ -234,6 +234,42 @@ def title_case(name: str) -> str:
 POPULAR_SITES = {"youtube", "github", "gmail", "google", "maps", "calendar",
                  "whatsapp", "reddit"}
 
+#: Browsers people name when they say "open X **in** something". Maps what the
+#: user says to the application name `open -a` understands.
+KNOWN_BROWSERS = {
+    "safari": "Safari",
+    "chrome": "Google Chrome", "google chrome": "Google Chrome",
+    "firefox": "Firefox",
+    "edge": "Microsoft Edge", "microsoft edge": "Microsoft Edge",
+    "brave": "Brave", "arc": "Arc", "opera": "Opera", "vivaldi": "Vivaldi",
+    "tor": "Tor Browser", "tor browser": "Tor Browser",
+}
+
+#: Trailing context that is NOT part of an app/site name: "open spotify
+#: **on my mac**", "open youtube.com **in safari**". Left in the capture, it
+#: used to become part of the argument ("youtube.com in safari"), which the
+#: gate then rightly refused to run.
+_TRAILING_CONTEXT = re.compile(
+    r"\s+(?:in|on|using|with|inside|via|through)\s+.+$", re.IGNORECASE)
+
+_BROWSER_TAIL = re.compile(
+    r"\s+(?:in|on|using|with)\s+((?:google\s+|microsoft\s+|tor\s+)?"
+    r"(?:safari|chrome|firefox|edge|brave|arc|opera|vivaldi))\s*$",
+    re.IGNORECASE)
+
+
+def strip_trailing_context(target: str) -> str:
+    """Drop a trailing 'in/on/using …' phrase from an open/quit target."""
+    return _TRAILING_CONTEXT.sub("", str(target or "")).strip(" ,.!?")
+
+
+def browser_from_tail(target: str) -> str:
+    """'youtube.com in safari' → 'Safari' (the app name `open -a` takes)."""
+    m = _BROWSER_TAIL.search(str(target or ""))
+    if not m:
+        return ""
+    return KNOWN_BROWSERS.get(" ".join(m.group(1).lower().split()), "")
+
 
 # --------------------------------------------------------------------------- #
 # Shortlisting — what Laya is allowed to choose from                           #
@@ -325,7 +361,9 @@ def extract_args(skill: str, transcript: str) -> dict[str, Any] | None:
         m = re.search(rf"(?:{verb})\s+(?:the\s+)?(?:app\s+)?(.+?)(?:\s+and|$)", t)
         if not m:
             return None
-        target = m.group(1).strip(" ,.!?")
+        # "open spotify on my mac" — the trailing context is not part of the
+        # name; leaving it in produced an app nobody has.
+        target = strip_trailing_context(m.group(1))
         if not target:
             return None
         # A domain is a website, not an installed application, and a popular
@@ -344,12 +382,20 @@ def extract_args(skill: str, transcript: str) -> dict[str, Any] | None:
 
     if skill == "browser.open_url":
         m = re.search(rf"(?:open|go to|visit|browse)\s+(?:the\s+)?(?:site\s+)?({_URLISH.pattern})", t)
+        url = ""
         if m:
-            return {"url": m.group(1).strip(" ,.!?").lower()}
-        for site in POPULAR_SITES:
-            if re.search(rf"\b{site}\b", t):
-                return {"url": site}
-        return None
+            url = m.group(1).strip(" ,.!?").lower()
+        else:
+            for site in POPULAR_SITES:
+                if re.search(rf"\b{site}\b", t):
+                    url = site
+                    break
+        if not url:
+            return None
+        # "open youtube.com in safari" — the named browser becomes an argument
+        # the skill can honour (`open -a Safari <url>`).
+        browser = browser_from_tail(t)
+        return {"url": url, "browser": browser} if browser else {"url": url}
 
     if skill == "browser.search":
         query = _capture(original, r"\b(?:search|look ?up|google|find)\b"

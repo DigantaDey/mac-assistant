@@ -123,9 +123,17 @@ OPEN_TEMPLATES = [
 ]
 
 SITE_TEMPLATES = [
-    "open {x}", "go to {x}", "open {x} dot com", "take me to {x}",
+    "open {x}", "go to {x}", "open {x} dot com", "open {x}.com", "take me to {x}",
     "visit {x}", "pull up {x}", "open the {x} website", "browse to {x}",
     "hey aura open {x}", "can you go to {x}",
+]
+
+#: People name the browser they want — the gate must score these as perfectly
+#: matched browser.open_url actions, not hesitate over the trailing words.
+SITE_BROWSER_TEMPLATES = [
+    "open {x} in safari", "open {x} in chrome", "open {x}.com in safari",
+    "open {x} dot com in safari", "go to {x} in firefox",
+    "open {x} in edge", "open {x} on safari", "open {x} using chrome",
 ]
 
 QUIT_TEMPLATES = [
@@ -240,6 +248,10 @@ def routing_samples(seed: int = 7) -> list[tuple[str, str]]:
 
     add(OPEN_TEMPLATES, "system.open_app", APPS, 260)
     add(SITE_TEMPLATES, "browser.open_url", SITES, 120)
+    # 60, not more: these teach the "…in safari" tail, but every one of them
+    # starts with "open {x}" — the same prefix system.open_app owns. At 90
+    # the prior tipped and "open spotify" started routing to open_url.
+    add(SITE_BROWSER_TEMPLATES, "browser.open_url", SITES, 60)
     add(QUIT_TEMPLATES, "system.quit_app", APPS, 130)
     add(SEARCH_TEMPLATES, "browser.search", SEARCH_TOPICS, 130)
     add(VOLUME_EXACT_TEMPLATES, "system.set_volume", [], 90)
@@ -390,6 +402,13 @@ def gate_samples(routing: list[tuple[str, str]], seed: int = 17,
         ("list my tabs", "browser.list_tabs", {}),
         ("read the clipboard", "clipboard.get_text", {}),
         ("click the sign in button", "ax.click", {"target": "the sign in button"}),
+        # naming the browser is part of the request, not noise to hesitate over
+        ("open youtube.com in safari", "browser.open_url",
+         {"url": "youtube.com", "browser": "Safari"}),
+        ("open youtube in safari", "browser.open_url",
+         {"url": "youtube", "browser": "Safari"}),
+        ("open github.com in chrome", "browser.open_url",
+         {"url": "github.com", "browser": "Google Chrome"}),
     ]
     for _ in range(120):
         t, skill, args = r.choice(benign)
@@ -950,14 +969,16 @@ def main() -> int:
     # Measured on a 2-core CPU box (so wall time is an upper bound): the gate's
     # *match* question — a request↔action comparison through attention — is the
     # slowest thing to converge. 500 steps leaves it at chance (≈0.53); 1500
-    # ≈0.65, 3000 ≈0.76, 4500 ≈0.73–0.77 and asymptotic, while route (≈0.97)
-    # and destructive (≈0.99) clear their bars comfortably. 4500 is also where
-    # every laya-check smoke decision — the shipping contract — passes, with
-    # rationale-robust judging (see rationale_for). Deeper, wider and longer
-    # were all measured and are documented in this file; none beat this config.
-    # The installer passes nothing, so the default must be exactly the proven
-    # configuration.
-    ap.add_argument("--steps", type=int, default=4500)
+    # ≈0.65, 3000 ≈0.76; at 4500 it still sits below the 0.85 bar the
+    # installer's laya-check enforces ("empty the trash" — a canonical nasty
+    # pair it sees hundreds of times — judged match=0.13), while route
+    # (≈0.94) and destructive (≈0.99) clear theirs early. 7000 steps is where
+    # match clears the bar and every laya-check smoke decision — the shipping
+    # contract — passes, with rationale-robust judging (see rationale_for).
+    # Deeper, wider and heavier match sampling were all measured and are
+    # documented in this file; none beat this config. The installer passes
+    # nothing, so the default must be exactly the proven configuration.
+    ap.add_argument("--steps", type=int, default=7000)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--lr", type=float, default=6e-4)
     ap.add_argument("--seed", type=int, default=7)

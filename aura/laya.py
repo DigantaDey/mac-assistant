@@ -579,7 +579,7 @@ class HeuristicBackend(LayaBackend):
         if not tokens:
             match = 0.7
         else:
-            hits = sum(1 for tok in tokens if tok in req)
+            hits = sum(1 for tok in tokens if _token_in_request(tok, req))
             match = 0.55 + 0.4 * (hits / len(tokens))
         return Decision(match=min(match, 0.99), destructive=destructive,
                         backend=self.name, source="heuristic",
@@ -619,6 +619,26 @@ class HeuristicBackend(LayaBackend):
         return Score(value=_clamp(index / span), index=index, criteria=list(criteria),
                      backend=self.name, source="heuristic",
                      ms=(time.perf_counter() - started) * 1000.0)
+
+
+def _token_in_request(token: str, request: str) -> bool:
+    """Does this argument/skill token appear in the request?
+
+    URL-ish arguments get a domain-aware match: the user says “youtube.com”,
+    the argument says “https://youtube.com” — that is the same site, and
+    counting it as a miss used to sink the match score of exactly the
+    requests the browser skill exists for.
+    """
+    if token in request:
+        return True
+    if "." in token:
+        core = token.split("://")[-1].split("/")[0].split("?")[0].lower()
+        parts = core.split(".")
+        if len(parts) >= 2:
+            domain = ".".join(parts[-2:])
+            if len(domain) > 3 and domain in request:
+                return True
+    return False
 
 
 def _flatten(value: Any) -> str:

@@ -31,6 +31,15 @@ from .log import get_logger, log_exception
 
 log = get_logger("safety")
 
+#: A gate built from a small trained model can miscalibrate on an everyday
+#: request — match 0.15 for “open youtube.com in safari” happened in the
+#: wild. Below the confidence threshold Aura normally asks, but when the
+#: action is *safe by declaration* and the deterministic word check agrees
+#: with the user this strongly, asking is friction, not caution. The
+#: override applies to exactly that intersection — never to risky actions,
+#: never when the model also smells destructiveness.
+WORDS_OVERRIDE_MATCH = 0.75
+
 
 @dataclass
 class Verdict:
@@ -68,8 +77,11 @@ class SafetyGate:
         decision = decision or self._decide(transcript, action)
         if decision.destructive >= self.cfg.laya.destructive_threshold:
             reasons.append(f"destructive score {decision.destructive:.2f}")
+        override = ""
         if decision.match < self.cfg.laya.confidence_threshold:
-            reasons.append(f"match confidence {decision.match:.2f} below threshold")
+            override = self._words_override(action, transcript, decision)
+            if not override:
+                reasons.append(f"match confidence {decision.match:.2f} below threshold")
 
         confirmed_by_default = action.risk == "safe"
         if self.cfg.safety.confirm_destructive and reasons:
@@ -78,15 +90,46 @@ class SafetyGate:
             reasons.append("skill requests confirmation")
             verdict = Verdict("confirm", reasons)
         else:
-            verdict = Verdict("run", [f"laya[{decision.backend}] "
-                                      f"match={decision.match:.2f} "
-                                      f"destructive={decision.destructive:.2f}"])
+            run_reasons = [f"laya[{decision.backend}] "
+                           f"match={decision.match:.2f} "
+                           f"destructive={decision.destructive:.2f}"]
+            if override:
+                run_reasons.append(override)
+                log.info("gate: %s — model match %.2f is below threshold, but the "
+                         "deterministic word check confirms a safe, matched action — running",
+                         action.skill, decision.match)
+            verdict = Verdict("run", run_reasons)
 
         log.info("gate: %s → %s (match=%.2f destructive=%.2f via %s%s, %.1fms)",
                  action.skill, verdict.decision, decision.match, decision.destructive,
                  decision.backend, f" {decision.error}" if decision.error else "",
                  decision.ms)
         return verdict
+
+    def _words_override(self, action, transcript: str, decision: Decision) -> str:
+        """Vouch for a low model match with the deterministic word check.
+
+        Returns a human-readable reason when the override applies, else "".
+        The bar is deliberately narrow: the action must be safe by
+        declaration, the model must not flag destructiveness, and the
+        request must literally carry the action's own words. Anything else
+        keeps the conservative behaviour — Aura asks.
+        """
+        if action.risk != "safe":
+            return ""
+        if decision.destructive >= self.cfg.laya.destructive_threshold:
+            return ""
+        if decision.backend != "laya":
+            # The offline scorer already judged the words itself; there is no
+            # second opinion to overrule it with.
+            return ""
+        words = HeuristicBackend().decide(transcript, action.skill, action.args,
+                                          getattr(action, "why", ""))
+        if (words.match >= WORDS_OVERRIDE_MATCH
+                and words.destructive < self.cfg.laya.destructive_threshold):
+            return (f"wording clearly matches the request "
+                    f"(offline check match={words.match:.2f})")
+        return ""
 
     def _decide(self, transcript: str, action) -> Decision:
         """Ask the decision layer for this action — or answer offline, loudly."""

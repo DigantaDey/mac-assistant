@@ -120,3 +120,44 @@ class TestReflexCoverage:
         plan = await MockPlanner("").plan("open notes and then close safari", {})
         assert [a.skill for a in plan.actions] == ["system.open_app", "system.quit_app"]
         assert plan.complete is True
+
+
+class TestBrowserTargetedOpens:
+    """'open X in <browser>' — the reported failure. The site must be
+    separated from the browser; the trailing words must never leak into the
+    URL (they used to produce `url="youtube.com in safari"`, which the gate
+    rightly refused and the user experienced as "nothing happened")."""
+
+    @pytest.mark.parametrize("text,url,browser", [
+        ("open youtube.com in safari", "youtube.com", "Safari"),
+        ("open youtube in safari", "youtube", "Safari"),
+        ("open github.com in chrome", "github.com", "Google Chrome"),
+        ("go to reddit.com in firefox", "reddit.com", "Firefox"),
+        ("open reddit on edge", "reddit", "Microsoft Edge"),
+    ])
+    async def test_the_site_is_separated_from_the_browser(self, text, url, browser):
+        plan = await MockPlanner("").plan(text, {})
+        assert plan.actions, text
+        assert plan.actions[0].skill == "browser.open_url", text
+        assert plan.actions[0].args == {"url": url, "browser": browser}, text
+        assert plan.complete is True
+
+    async def test_trailing_context_never_pollutes_an_app_name(self):
+        plan = await MockPlanner("").plan("open spotify on my mac", {})
+        assert plan.actions[0].skill == "system.open_app"
+        assert plan.actions[0].args == {"app": "Spotify"}
+
+    async def test_the_url_stays_an_address_not_a_search(self):
+        """The old capture yielded "youtube.com in safari", which the browser
+        skill's `_ensure_url` demoted to a Google search of that string."""
+        from aura.skills.browser import _ensure_url
+
+        plan = await MockPlanner("").plan("open youtube.com in safari", {})
+        url = _ensure_url(plan.actions[0].args["url"])
+        assert url.startswith("https://"), url
+        assert " " not in url, url
+
+    async def test_plain_opens_are_untouched(self):
+        plan = await MockPlanner("").plan("open safari", {})
+        assert plan.actions[0].skill == "system.open_app"
+        assert plan.actions[0].args == {"app": "Safari"}

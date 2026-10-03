@@ -36,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         observe()
         registerHotKey()
         observeNotifications()
+        setupNotifications()
 
         model.start()
 
@@ -128,6 +129,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Task { @MainActor in self.updateIcon() }
             }
             .store(in: &cancellables)
+    }
+
+    /// Proposals must reach the user even when the popover is closed — the
+    /// notification carries the same confirm/cancel decision as the card.
+    private func setupNotifications() {
+        Notify.panelIsVisible = { [weak self] in self?.popover.isShown ?? true }
+        Notify.onRun = { [weak self] token in self?.model.confirmProposal(token: token) }
+        Notify.onCancel = { [weak self] token in self?.model.cancelProposal(token: token) }
+        Notify.onShow = { [weak self] in self?.openPanel() }
+        Notify.bootstrap()
     }
 
     private func observeNotifications() {

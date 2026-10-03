@@ -15,8 +15,9 @@ understands, plans, and asks before anything risky.
 probabilities in a single forward pass (tens of milliseconds). It never
 generates text, so it can never invent a command or an argument. There is
 **no LLM anywhere in Aura**: nothing to serve, no gigabyte pull, no
-"still thinking". A navigation checkpoint ships in the repo
-(`assets/models/aura-nav-laya`), so Laya works out of the box.
+"still thinking". The navigation checkpoint
+(`assets/models/aura-nav-laya`) is trained on your Mac by the installer —
+a few minutes, once, no hub download — so Laya works out of the box.
 
 > **TL;DR** — Say “*Hey Aura, open YouTube*.” Or type it. Or click the ◉ in
 > the menu bar. Everything happens on this Mac.
@@ -35,10 +36,10 @@ One command, and it is idempotent — re-run it any time to update:
 1. installs the native bits with Homebrew (PortAudio, whisper.cpp);
 2. downloads the speech model (`ggml-base.en`, ≈150 MB, one-time);
 3. copies the engine to `~/Library/Application Support/Aura/engine` and builds
-   a Python environment for it — Laya and the navigation checkpoint travel
-   with it;
-4. proves the brain answers, with `python -m aura laya-check` (if the bundled
-   checkpoint is ever missing, the installer trains a replacement on the spot);
+   a Python environment for it (microphone, wake word, STT, Laya **and the
+   pyobjc Accessibility bridge**);
+4. trains the navigation checkpoint if it is missing, then proves the brain
+   answers with `python -m aura laya-check`;
 5. builds **Aura.app** and installs it into **/Applications**;
 6. opens it — and Aura walks you through the two macOS permissions, one click
    each.

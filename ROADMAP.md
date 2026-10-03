@@ -4,7 +4,43 @@ Ship order matters: each stage is usable on its own, and every stage widens
 the moat (offline + personal + fast) before Apple's Siri V2 closes the
 mainstream gap.
 
-**Current release: v0.7.0 — the keyboardless Laya navigator** (see below).
+**Current release: v0.7.1 — the keyboardless Laya navigator, made reliable**
+(see below).
+
+## v0.7.1 — It must not only work, it must be seen working ✅
+Field report: "open youtube.com in safari" did nothing, "empty the trash"
+asked a question nobody heard, Setup buttons were dead, and 👍/👎 taught
+nothing. Every one of those traced to a real defect, now fixed:
+
+- [x] "open X in <browser>" understood end-to-end: the rules no longer
+      swallow trailing words into the target (`url="youtube.com in safari"`
+      was the silent killer), `browser.open_url` gained a `browser` argument
+      (`open -a Safari <url>`, with default-browser fallback), and
+      `extract_args` agrees with the rules layer-for-layer
+- [x] A safe action the words clearly support can no longer be stranded by a
+      miscalibrated gate: below the match threshold, a deterministic word
+      check may vouch for *safe* actions only — risky ones always ask
+      (`aura/safety.py`, `WORDS_OVERRIDE_MATCH`)
+- [x] Confirmations reach you outside the panel: a system notification with
+      Run / Cancel answers the same proposal token the panel card uses; the
+      question is spoken when the proposal goes out, and a timed-out or
+      answered proposal is logged instead of vanishing
+- [x] Setup buttons alive again: `/api/permissions/test_automation` honours
+      the `ok` reply contract, the Accessibility flow prompts natively from
+      the app and opens the exact System Settings pane, and `setup_done` is
+      now guaranteed even when the installer raises (no more permanent
+      "Installing…" with every button disabled)
+- [x] 👍/👎 supervises the real skill with the real args: history entries
+      carry the plan, `/api/correct` records off the request thread, and
+      empty-skill verdicts can no longer pollute the fine-tune set
+- [x] The Accessibility bridge actually installs: pyobjc (ApplicationServices
+      / Cocoa / Quartz) is part of the `[mac]` extra — the "No module named
+      'ApplicationServices'" failure of every `ax.*` skill is gone from
+      fresh installs, and `doctor` reports the pieces
+- [x] Missing-app answers are human: `system.open_app` says "I couldn't find
+      an app named X" instead of an AppleScript error number
+- [x] Training data covers the reported phrasings (site-in-browser templates
+      + gate pairs), so a retrained checkpoint answers them natively
 
 ## v0.7 — No LLM, Laya is the brain ✅
 The core feature (getting an answer out of the assistant) was rebuilt around
