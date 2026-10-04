@@ -7,9 +7,14 @@ dropped in later for premium voices without touching anything else.
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import subprocess
+
+log = logging.getLogger("aura.tts")
+
+SAY_TIMEOUT_SECONDS = 30.0
 
 
 class TTS:
@@ -36,7 +41,17 @@ class MacSayTTS(TTS):
         if self.voice:
             cmd += ["-v", self.voice]
         cmd += ["-r", str(self.rate), text]
-        subprocess.run(cmd, check=False, timeout=120)
+        try:
+            subprocess.run(cmd, check=False, timeout=SAY_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # Speech is an enhancement, not part of session completion. Never
+            # let a wedged system `say` process create an unhandled executor
+            # exception or occupy a worker for two minutes.
+            log.warning("macOS speech timed out after %.0f seconds", SAY_TIMEOUT_SECONDS)
+            return 0.0
+        except OSError as exc:
+            log.warning("couldn't start macOS speech: %s", exc)
+            return 0.0
         # ~2.6 words/second at the default rate; good enough for pacing.
         return max(0.6, len(text.split()) / 2.6)
 

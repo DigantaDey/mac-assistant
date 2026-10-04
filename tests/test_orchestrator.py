@@ -31,6 +31,38 @@ async def test_simple_safe_session(orch):
     orch.bus.unsubscribe_async(sid)
 
 
+async def test_tts_worker_failure_is_observed_without_failing_the_session(orch, caplog):
+    class BrokenTTS:
+        def speak(self, _text):
+            raise RuntimeError("speech device unavailable")
+
+    orch._loop = asyncio.get_running_loop()
+    orch.tts = BrokenTTS()
+    orch._speak_async("The action is complete.")
+
+    for _ in range(50):
+        if "text-to-speech failed" in caplog.text:
+            break
+        await asyncio.sleep(0.01)
+
+    assert "text-to-speech failed: RuntimeError: speech device unavailable" in caplog.text
+
+
+async def test_terminal_state_keeps_session_id_for_ui_recovery(orch):
+    sid = orch.bus.subscribe_async()
+    await orch.submit_text("set volume to 30")
+    events = orch.bus.drain(sid)
+
+    planned = next(event for event in events
+                   if event.type == "state" and event.data.get("state") == "planning")
+    reply = next(event for event in events if event.type == "reply")
+    terminal = next(event for event in reversed(events)
+                    if event.type == "state" and event.data.get("state") == "armed")
+    assert reply.data["session"] == planned.data["session"]
+    assert terminal.data["session"] == planned.data["session"]
+    orch.bus.unsubscribe_async(sid)
+
+
 async def test_confirmation_flow(orch):
     sid = orch.bus.subscribe_async()
     task = asyncio.create_task(orch.submit_text("empty the trash"))

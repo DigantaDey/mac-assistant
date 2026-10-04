@@ -200,6 +200,23 @@ class AuraServer:
                 except RuntimeError:           # the engine is shutting down
                     coro.close()              # nothing will ever await this
 
+            def _call_on_loop(self, fn, *args, timeout: float = 3.0):
+                """Run a short synchronous state transition on the engine loop.
+
+                HTTP handlers are worker threads. Wake-phrase capture touches
+                the same VAD and sample buffer as the audio loop, so even a
+                one-line setter must be serialized with audio processing.
+                """
+                async def invoke():
+                    return fn(*args)
+
+                future = asyncio.run_coroutine_threadsafe(invoke(), orch.loop)
+                try:
+                    return future.result(timeout=timeout)
+                except Exception:
+                    future.cancel()
+                    raise
+
             # ---------------- GET ---------------- #
 
             def do_GET(self) -> None:
@@ -239,7 +256,11 @@ class AuraServer:
                 elif path == "/api/metrics":
                     self._json(orch.metrics())
                 elif path == "/api/wake/train":
-                    self._json(orch.training_status())
+                    try:
+                        self._json(self._call_on_loop(orch.training_status))
+                    except Exception:
+                        self._json({"active": False,
+                                    "message": "Couldn't read wake-phrase training status."}, 503)
                 elif path == "/api/history":
                     self._json({"events": orch.memory.recent_events(100)})
                 elif path == "/api/log":
@@ -436,11 +457,25 @@ class AuraServer:
                     except Exception:
                         self._json({"ok": False, "message": "wake switch timed out"}, 503)
                 elif path == "/api/wake/train":
-                    self._json(orch.training_start(str(body.get("phrase", ""))))
+                    try:
+                        result = self._call_on_loop(
+                            orch.training_start, str(body.get("phrase", "")))
+                        self._json(result)
+                    except Exception:
+                        self._json({"ok": False,
+                                    "message": "Couldn't start wake-phrase training."}, 503)
                 elif path == "/api/wake/train/capture":
-                    self._json(orch.training_capture())
+                    try:
+                        self._json(self._call_on_loop(orch.training_capture))
+                    except Exception:
+                        self._json({"ok": False,
+                                    "message": "Couldn't start the recording — try again."}, 503)
                 elif path == "/api/wake/train/cancel":
-                    self._json(orch.training_cancel())
+                    try:
+                        self._json(self._call_on_loop(orch.training_cancel))
+                    except Exception:
+                        self._json({"ok": False,
+                                    "message": "Couldn't cancel wake-phrase training."}, 503)
                 elif path == "/api/wake/train/finish":
                     future = asyncio.run_coroutine_threadsafe(
                         orch.training_finish(), loop)

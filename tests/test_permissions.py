@@ -30,6 +30,34 @@ class TestPermissionsOffMac:
         assert ok is False
 
 
+class TestAccessibilityRefresh:
+    def test_check_uses_fresh_process_after_a_cached_denial(self, monkeypatch):
+        from aura import permissions
+
+        monkeypatch.setattr(permissions, "is_mac", lambda: True)
+        monkeypatch.setattr(permissions, "_fresh_accessibility_check", lambda: True)
+        monkeypatch.setattr(
+            permissions, "_load_application_services",
+            lambda: pytest.fail("a fresh result should win over the stale process cache"))
+
+        assert permissions.check_accessibility() is True
+
+    def test_check_falls_back_when_fresh_probe_is_unavailable(self, monkeypatch):
+        from aura import permissions
+
+        class ApplicationServices:
+            @staticmethod
+            def AXIsProcessTrusted():
+                return False
+
+        monkeypatch.setattr(permissions, "is_mac", lambda: True)
+        monkeypatch.setattr(permissions, "_fresh_accessibility_check", lambda: None)
+        monkeypatch.setattr(permissions, "_load_application_services",
+                            lambda: ApplicationServices())
+
+        assert permissions.check_accessibility() is False
+
+
 class TestReadinessChecks:
     def test_whisper_off_mac_is_false(self, stack):
         from aura.permissions import check_whisper_cpp

@@ -46,6 +46,23 @@ final class HistoryEntryTests: XCTestCase {
     }
 }
 
+final class WakeTrainingModelTests: XCTestCase {
+    func testTrainingStatusCarriesVisibleCaptureMessage() throws {
+        let json = #"{"active":true,"phrase":"hey aura","count":2,"need":6,"listening":true,"message":"Recording — say it now."}"#
+        let status = try JSONDecoder().decode(WakeTraining.self, from: Data(json.utf8))
+        XCTAssertTrue(status.active)
+        XCTAssertEqual(status.count, 2)
+        XCTAssertTrue(status.listening ?? false)
+        XCTAssertEqual(status.message, "Recording — say it now.")
+    }
+
+    func testOlderTrainingStatusMayOmitMessage() throws {
+        let json = #"{"active":true,"phrase":"hey aura","count":0,"need":6,"listening":false}"#
+        let status = try JSONDecoder().decode(WakeTraining.self, from: Data(json.utf8))
+        XCTAssertNil(status.message)
+    }
+}
+
 final class JSONValueAnyTests: XCTestCase {
 
     func testAnyValueRoundTripsPrimitives() throws {

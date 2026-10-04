@@ -219,13 +219,16 @@ public struct WakeTraining: Decodable, Sendable {
     public let count: Int?
     public let need: Int?
     public let listening: Bool?
+    public let message: String?
 
-    public init(active: Bool, phrase: String?, count: Int?, need: Int?, listening: Bool?) {
+    public init(active: Bool, phrase: String?, count: Int?, need: Int?, listening: Bool?,
+                message: String? = nil) {
         self.active = active
         self.phrase = phrase
         self.count = count
         self.need = need
         self.listening = listening
+        self.message = message
     }
 
     public var progress: Double {

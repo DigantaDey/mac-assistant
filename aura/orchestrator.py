@@ -71,6 +71,7 @@ class Session:
 class TrainingState:
     phrase: str
     samples: list = field(default_factory=list)
+    message: str = ""
 
 
 class Orchestrator:
@@ -567,13 +568,14 @@ class Orchestrator:
                     self._failure_message("Something went wrong while thinking.", detail),
                     outcome="failed", diagnostic=detail)
             except BaseException:  # even the apology must not hang the state
+                session_id = self.session.id if self.session is not None else None
                 self._disarm_watchdog()
                 self._release_confirmations()
                 self.session = None
                 self._active_session_task = None
                 self._deadline_expired = False
                 self.state = "armed"
-                self.bus.publish("state", state=self.state)
+                self.bus.publish("state", state=self.state, session=session_id)
 
     @staticmethod
     def _failure_message(headline: str, detail: str) -> str:
@@ -816,26 +818,36 @@ class Orchestrator:
         await self._end_session()
 
     def _speak_async(self, text: str) -> None:
-        """Speak text on the default executor without blocking the session flow."""
-        if self._loop is not None:
-            self._loop.run_in_executor(None, self.tts.speak, text)
+        """Speak on a worker without blocking the session or leaking failures."""
+        if self._loop is None:
+            return
+        future = self._loop.run_in_executor(None, self.tts.speak, text)
+
+        def report_failure(done) -> None:
+            try:
+                done.result()
+            except Exception as exc:
+                log.warning("text-to-speech failed: %s: %s", type(exc).__name__, exc)
+
+        future.add_done_callback(report_failure)
 
     async def _end_session(self, message: str | None = None,
                            outcome: str = "ok", diagnostic: str = "") -> None:
         self._disarm_watchdog()
         self._release_confirmations()
+        session_id = self.session.id if self.session is not None else None
         if message:
             if diagnostic:
                 log.warning("session ended (%s): %s", outcome, diagnostic)
-            self.bus.publish("reply", text=message, total_ms=0, outcome=outcome,
-                             diagnostic=diagnostic)
+            self.bus.publish("reply", text=message, session=session_id,
+                             total_ms=0, outcome=outcome, diagnostic=diagnostic)
             self._speak_async(message)
         self.session = None
         self._active_session_task = None
         self._deadline_expired = False
         self.state = "armed"
         self._last_activity = time.monotonic()
-        self.bus.publish("state", state=self.state)
+        self.bus.publish("state", state=self.state, session=session_id)
 
     # ------------------------------------------------------------------ #
     # The session watchdog — the promise that the orb always comes back    #
@@ -949,6 +961,7 @@ class Orchestrator:
             self._train_vad.reset()
             count = len(self._trainer.samples)
             message = "I didn't hear a phrase — tap Record and try again."
+            self._trainer.message = message
             self.bus.publish("train_sample", ok=False, message=message,
                              count=count, need=self.TRAIN_SAMPLES_NEEDED,
                              phase="capture", seconds=0.0)
@@ -996,15 +1009,20 @@ class Orchestrator:
         self._cancel_training_capture_timeout()
         self._train_capture_armed = False
         self._train_vad.reset()
-        self._trainer = TrainingState(phrase=phrase.lower())
+        ready_message = "Ready — tap Record, then say your phrase."
+        self._trainer = TrainingState(phrase=phrase.lower(), message=ready_message)
         self.bus.publish("train_update", phase="capture", phrase=phrase.lower(),
-                         count=0, need=self.TRAIN_SAMPLES_NEEDED)
+                         count=0, need=self.TRAIN_SAMPLES_NEEDED,
+                         message=ready_message)
         return {"ok": True, "need": self.TRAIN_SAMPLES_NEEDED,
                 "minimum": self.TRAIN_SAMPLES_MINIMUM}
 
     def training_capture(self) -> dict:
         if self._trainer is None:
             return {"ok": False, "message": "Start training first."}
+        if not self._has_audio:
+            return {"ok": False,
+                    "message": "Aura's microphone isn't connected — allow it in Settings and try again."}
         if self.state != "armed" or self.session is not None:
             return {"ok": False, "message": "One moment — finish the current request."}
         if self._train_capture_armed:
@@ -1013,12 +1031,14 @@ class Orchestrator:
             return {"ok": False, "message": "All samples are ready — train the phrase."}
         self._train_capture_armed = True
         self._train_vad.reset()
+        self._trainer.message = "Recording — say your phrase now, then pause briefly."
         self._arm_training_capture_timeout()
         self.bus.publish("train_update", phase="listening",
                          phrase=self._trainer.phrase,
                          count=len(self._trainer.samples),
-                         need=self.TRAIN_SAMPLES_NEEDED)
-        return {"ok": True, "message": "Listening — say your phrase now."}
+                         need=self.TRAIN_SAMPLES_NEEDED,
+                         message=self._trainer.message)
+        return {"ok": True, "message": self._trainer.message}
 
     def _handle_train_sample(self, frames: list[AudioFrame]) -> None:
         self._cancel_training_capture_timeout()
@@ -1042,11 +1062,13 @@ class Orchestrator:
         else:
             message = quality.message
         phase = "ready" if count >= self.TRAIN_SAMPLES_NEEDED else "capture"
+        self._trainer.message = message
         self.bus.publish("train_sample", ok=quality.ok, message=message,
                          count=count, need=self.TRAIN_SAMPLES_NEEDED,
                          phase=phase, seconds=round(quality.seconds, 2))
         self.bus.publish("train_update", phase=phase, phrase=self._trainer.phrase,
-                         count=count, need=self.TRAIN_SAMPLES_NEEDED)
+                         count=count, need=self.TRAIN_SAMPLES_NEEDED,
+                         message=message)
 
     def training_status(self) -> dict:
         if self._trainer is None:
@@ -1054,7 +1076,8 @@ class Orchestrator:
         return {"active": True, "phrase": self._trainer.phrase,
                 "count": len(self._trainer.samples),
                 "need": self.TRAIN_SAMPLES_NEEDED,
-                "listening": self._train_capture_armed}
+                "listening": self._train_capture_armed,
+                "message": self._trainer.message}
 
     def training_cancel(self) -> dict:
         self._cancel_training_capture_timeout()

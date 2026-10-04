@@ -17,6 +17,7 @@ from __future__ import annotations
 import ctypes
 import platform
 import subprocess
+import sys
 from typing import Any
 
 # Deep links into System Settings → Privacy & Security. Apple keeps moving
@@ -40,15 +41,57 @@ def _load_application_services() -> Any:
     )
 
 
-def check_accessibility() -> bool | None:
-    """True when this process may read UI elements / send keystrokes.
+_ACCESSIBILITY_PROBE = r"""
+import ctypes
+lib = ctypes.CDLL(
+    "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+)
+lib.AXIsProcessTrusted.restype = ctypes.c_bool
+print("1" if lib.AXIsProcessTrusted() else "0")
+"""
 
-    Uses AXIsProcessTrusted — the same API Voice Control and every automation
-    utility sit on. When TCC hasn't decided yet, this is False; once the user
-    flips the toggle it becomes True without a restart.
+
+def _fresh_accessibility_check(timeout: float = 2.0) -> bool | None:
+    """Read TCC from a fresh process so a settings change is not hidden by
+    ApplicationServices' per-process cached AXIsProcessTrusted result.
+
+    The app's engine is a child of Aura.app. Spawning the same interpreter for
+    this read keeps the responsible-app attribution while giving Application
+    Services a fresh cache. This is only a read; the UI owns the consent prompt.
+    """
+    if not sys.executable:
+        return None
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _ACCESSIBILITY_PROBE],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in reversed((proc.stdout or "").splitlines()):
+        value = line.strip().lower()
+        if value in {"1", "true"}:
+            return True
+        if value in {"0", "false"}:
+            return False
+    return None
+
+
+def check_accessibility() -> bool | None:
+    """True when Aura's responsible process may use Accessibility.
+
+    AXIsProcessTrusted can keep a denied answer cached after the user enables
+    Aura in System Settings. Check in a short-lived child first so the visible
+    state refreshes without restarting Aura; fall back to this process only if
+    launching that probe is unavailable.
     """
     if not is_mac():
         return None
+    fresh = _fresh_accessibility_check()
+    if fresh is not None:
+        return fresh
     try:
         lib = _load_application_services()
         lib.AXIsProcessTrusted.restype = ctypes.c_bool
@@ -58,42 +101,21 @@ def check_accessibility() -> bool | None:
 
 
 def request_accessibility() -> tuple[str, str]:
-    """Ask macOS to show the Accessibility consent dialog, then re-check.
+    """Report Accessibility status; the native app owns the consent prompt.
 
-    status: "ok" | "asked" | "denied" | "unavailable"
-    The system dialog has an "Open System Settings" button — the user grants
-    the toggle there, and AXIsProcessTrusted flips to True without a restart.
+    Calling AXIsProcessTrustedWithOptions from Aura's Python engine attributes
+    the prompt to a different process on some macOS releases. Aura.app calls
+    the native API itself, then this endpoint re-checks from a fresh process.
+
+    status: "ok" | "asked" | "unavailable"
     """
     if not is_mac():
         return "unavailable", "Accessibility exists only on macOS"
-    try:
-        import ctypes
-
-        lib = _load_application_services()
-        lib.AXIsProcessTrusted.restype = ctypes.c_bool
-        if lib.AXIsProcessTrusted():
-            return "ok", "Accessibility is already granted."
-
-        # Build {kAXTrustedCheckOptionPrompt: true} and call the prompting
-        # variant — the same call Voice Control uses to surface its dialog.
-        cf = ctypes.cdll.LoadLibrary(
-            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
-        kCFStringEncodingUTF8 = 0x08000100
-        key = cf.CFStringCreateWithCString(
-            None, b"kAXTrustedCheckOptionPrompt", kCFStringEncodingUTF8)
-        value = cf.CFBooleanCreate(None, 1)
-        ptr = ctypes.c_void_p
-        keys = (ptr * 1)(key)
-        values = (ptr * 1)(value)
-        key_cb = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")
-        val_cb = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryValueCallBacks")
-        options = cf.CFDictionaryCreate(None, keys, values, 1, key_cb, val_cb)
-        lib.AXIsProcessTrustedWithOptions(ctypes.c_void_p(options))
-    except Exception as exc:
-        return "denied", f"Couldn't show the Accessibility dialog: {exc}"
     if check_accessibility():
-        return "ok", "Accessibility granted — Aura can act inside your apps."
-    return "asked", "macOS is asking you to allow it — open System Settings from the dialog."
+        return "ok", "Accessibility is granted — Aura can act inside your apps."
+    return "asked", (
+        "Allow Aura in System Settings › Privacy & Security › Accessibility, "
+        "then return to Aura and choose Check again.")
 
 
 def check_microphone(orch: Any) -> bool | None:
