@@ -316,10 +316,35 @@ class AuraServer:
                     ok = orch.resolve_confirmation(str(body.get("token", "")), "cancel")
                     self._json({"ok": ok})
                 elif path == "/api/correct":
-                    orch.record_feedback(str(body.get("transcript", ""))[:500],
-                                         str(body.get("skill", ""))[:100],
-                                         "confirmed" if body.get("verdict") == "good" else "corrected",
-                                         str(body.get("note", ""))[:500])
+                    # Recording may ask the decision model for a destructive
+                    # score — seconds in the worst case. That work belongs on
+                    # an executor, not on this request; the tap is answered
+                    # immediately and the example lands a moment later.
+                    transcript = str(body.get("transcript", ""))[:500]
+                    skill = str(body.get("skill", ""))[:100]
+                    verdict = "confirmed" if body.get("verdict") == "good" else "corrected"
+                    note = str(body.get("note", ""))[:500]
+                    raw_args = body.get("args")
+                    args = raw_args if isinstance(raw_args, dict) else None
+
+                    async def _feedback():
+                        try:
+                            await orch.loop.run_in_executor(
+                                None, orch.record_feedback, transcript, skill,
+                                verdict, note, args)
+                        except Exception as exc:  # never lose a verdict silently
+                            detail = log_mod.log_exception("feedback failed", exc)
+                            orch.bus.publish("log", line=f"feedback failed: {detail}")
+
+                    def _spawn_feedback() -> None:
+                        task = orch.loop.create_task(_feedback())
+                        inflight.add(task)
+                        task.add_done_callback(inflight.discard)
+
+                    try:
+                        orch.loop.call_soon_threadsafe(_spawn_feedback)
+                    except RuntimeError:           # engine shutting down
+                        orch.record_feedback(transcript, skill, verdict, note, args)
                     self._json({"ok": True})
                 elif path == "/api/permissions/open":
                     from . import permissions as perms
@@ -328,7 +353,9 @@ class AuraServer:
                 elif path == "/api/permissions/test_automation":
                     from . import permissions as perms
                     status, msg = perms.test_automation()
-                    self._json({"status": status, "message": msg})
+                    # "ok" is part of the reply contract — without it the app
+                    # can't decode the answer and the button looks dead.
+                    self._json({"ok": status == "ok", "status": status, "message": msg})
                 elif path == "/api/permissions/request":
                     from . import permissions as perms
 

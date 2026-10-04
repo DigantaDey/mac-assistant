@@ -29,7 +29,17 @@ class OpenApp(Skill):
             return SkillResult(False, "Which app should I open?")
         ok, out = ctx.bridge.osascript(
             f"tell application {applescript_quote(app)} to activate")
-        return SkillResult(ok, f"Opened {app}." if ok else f"Couldn't open {app}: {out}")
+        if ok:
+            return SkillResult(True, f"Opened {app}.")
+        # -1728: macOS doesn't know an application by that name. Say exactly
+        # that — an "execution error" is a bug report, not an answer.
+        if "-1728" in out:
+            return SkillResult(
+                False,
+                f"I couldn't find an app named {app} on this Mac. "
+                f"If it isn't installed yet, I can open it in your browser "
+                f"instead — just say “open {app.lower()}.com”.")
+        return SkillResult(False, f"Couldn't open {app}: {out}")
 
 
 class QuitApp(Skill):

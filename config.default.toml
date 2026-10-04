@@ -37,7 +37,10 @@ max_actions = 3
 [laya]
 enabled = true
 backend = "auto"              # auto uses the `laya` package; "heuristic" never loads it
-confidence_threshold = 0.62   # a proposed action below this match score → ask
+confidence_threshold = 0.62   # a proposed action below this match score → ask.
+                              # one narrow exception: a *safe* action whose words
+                              # demonstrably match the request (see WORDS_OVERRIDE_MATCH
+                              # in aura/safety.py) still runs — friction, not caution.
 destructive_threshold = 0.55  # above this → ask
 route_threshold = 0.30        # a routing pick below this is "no skill" (never acted on)
 device = ""                   # "" = auto (MPS/CUDA/CPU); or "cpu", "mps", "cuda"

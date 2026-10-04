@@ -213,6 +213,7 @@ final class AppModel: ObservableObject {
                 if value == "planning" { liveActions.removeAll() }
                 if value == "armed" {
                     proposal = nil
+                    Notify.clearProposals()
                     Task { await refreshAfterSession() }
                 }
                 watchForStall()
@@ -222,18 +223,32 @@ final class AppModel: ObservableObject {
             if let text = event.text, !text.isEmpty { appendUser(text) }
 
         case "proposal":
-            proposal = Proposal(id: event.token ?? "",
+            let token = event.token ?? ""
+            let proposalActions = (event.data["actions"]?.arrayValue ?? []).map { value in
+                ProposedAction(skill: value["skill"]?.stringValue ?? "action",
+                               why: value["why"]?.stringValue ?? "",
+                               risk: value["risk"]?.stringValue ?? "safe",
+                               verdict: value["verdict"]?.stringValue ?? "confirm",
+                               reasons: (value["reasons"]?.arrayValue ?? [])
+                                   .compactMap { $0.stringValue })
+            }
+            proposal = Proposal(id: token,
                                 reply: event.data["reply"]?.stringValue ?? "",
-                                actions: (event.data["actions"]?.arrayValue ?? []).map { value in
-                                    ProposedAction(skill: value["skill"]?.stringValue ?? "action",
-                                                   why: value["why"]?.stringValue ?? "",
-                                                   risk: value["risk"]?.stringValue ?? "safe",
-                                                   verdict: value["verdict"]?.stringValue ?? "confirm",
-                                                   reasons: (value["reasons"]?.arrayValue ?? [])
-                                                       .compactMap { $0.stringValue })
-                                })
+                                actions: proposalActions)
             if let reply = event.data["reply"]?.stringValue, !reply.isEmpty {
                 appendSystem("Plan ready — \(reply)")
+            }
+            // The card only exists inside the popover — one click elsewhere
+            // and a transient popover is gone. If the user can't see the
+            // panel, the question must reach them as a system notification,
+            // or the ask is indistinguishable from nothing happening.
+            if !token.isEmpty && !Notify.panelIsVisible() {
+                let titles = proposalActions.map { $0.title }.joined(separator: ", ")
+                let detail = event.data["reply"]?.stringValue ?? ""
+                Notify.proposal(
+                    title: "Aura needs your OK" + (titles.isEmpty ? "" : ": \(titles)"),
+                    body: detail.isEmpty ? "Open Aura to review the plan." : detail,
+                    token: token)
             }
 
         case "action_started":
@@ -416,10 +431,18 @@ final class AppModel: ObservableObject {
 
     func confirmProposal() {
         guard let proposal else { return }
-        self.proposal = nil
+        confirmProposal(token: proposal.id)
+    }
+
+    /// Resolve a proposal by token — from the panel card OR from the
+    /// Run/Cancel buttons of the system notification.
+    func confirmProposal(token: String) {
+        guard !token.isEmpty else { return }
+        proposal = nil
+        Notify.clearProposals()
         Task {
             do {
-                let reply = try await client.confirm(token: proposal.id)
+                let reply = try await client.confirm(token: token)
                 if reply.ok == false { toast("That request expired — ask again.", kind: .warning) }
             } catch {
                 toast(error.localizedDescription, kind: .failure)
@@ -429,8 +452,14 @@ final class AppModel: ObservableObject {
 
     func cancelProposal() {
         guard let proposal else { return }
-        self.proposal = nil
-        Task { _ = try? await client.cancel(token: proposal.id) }
+        cancelProposal(token: proposal.id)
+    }
+
+    func cancelProposal(token: String) {
+        guard !token.isEmpty else { return }
+        proposal = nil
+        Notify.clearProposals()
+        Task { _ = try? await client.cancel(token: token) }
     }
 
     private func handleUnauthorized() {
@@ -581,14 +610,33 @@ final class AppModel: ObservableObject {
                     return
                 }
             }
+            if target == "accessibility" {
+                // Ask from the app itself: the native TCC prompt is the
+                // reliable one, and macOS attributes the grant to Aura.
+                Permissions.requestAccessibility()
+            }
             do {
                 // The engine may have started with SilentMic before the native
                 // TCC answer. This call both verifies the device and hot-attaches
                 // the real stream; no engine restart is required.
                 let answer = try await client.requestPermission(target)
-                toast(answer.message ?? "Checked.", kind: answer.ok ? .success : .warning)
+                if target == "accessibility" && answer.status != "ok" {
+                    // Not granted yet: open the exact pane and say what to do.
+                    // A tap on this button must always end somewhere visible.
+                    Permissions.openAccessibilitySettings()
+                    toast("Switch Aura on in the Accessibility list — the System Settings pane is open.",
+                          kind: .warning)
+                } else {
+                    toast(answer.message ?? "Checked.", kind: answer.ok ? .success : .warning)
+                }
             } catch {
-                toast(error.localizedDescription, kind: .failure)
+                if target == "accessibility" {
+                    Permissions.openAccessibilitySettings()
+                    toast("Couldn't reach the engine — enable Aura in the Accessibility pane that just opened.",
+                          kind: .warning)
+                } else {
+                    toast(error.localizedDescription, kind: .failure)
+                }
             }
             await refreshPermissions()
         }
@@ -605,9 +653,12 @@ final class AppModel: ObservableObject {
 
     func testAutomation() {
         Task {
-            let answer = try? await client.testAutomation()
-            if let answer {
+            do {
+                let answer = try await client.testAutomation()
                 toast(answer.message ?? "Tested.", kind: answer.ok ? .success : .warning)
+            } catch {
+                // Was silently swallowed before — the button looked dead.
+                toast(error.localizedDescription, kind: .failure)
             }
             await refreshPermissions()
         }
@@ -747,12 +798,24 @@ final class AppModel: ObservableObject {
     // MARK: - feedback + files
 
     func feedback(_ entry: HistoryEntry, good: Bool) {
+        // The verdict supervises the skill that actually ran, with the args
+        // it ran with — that row is what the decision model's fine-tune
+        // learns from. A thumb with no skill was feedback to nobody.
+        let skill = entry.primarySkill ?? ""
+        let args = entry.primaryArgs
         Task {
-            _ = try? await client.feedback(transcript: entry.transcript,
-                                           skill: "",
-                                           good: good)
-            toast(good ? "Thanks — noted." : "Got it — Aura will be more careful.",
-                  kind: .success)
+            do {
+                _ = try await client.feedback(transcript: entry.transcript,
+                                              skill: skill,
+                                              good: good,
+                                              args: args)
+                toast(good
+                      ? "Thanks — recorded for Aura's next training run."
+                      : "Got it — Aura learns from this one.",
+                      kind: .success)
+            } catch {
+                toast(error.localizedDescription, kind: .failure)
+            }
             await refreshActivity()
         }
     }

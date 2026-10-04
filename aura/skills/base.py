@@ -130,7 +130,9 @@ class MacBridge:
             return False, "the system command did not answer within four seconds"
         return proc.returncode == 0, (proc.stdout or proc.stderr).strip()
 
-    def open_url(self, url: str) -> tuple[bool, str]:
+    def open_url(self, url: str, browser: str | None = None) -> tuple[bool, str]:
+        if browser:
+            return self.run(["open", "-a", browser, url])
         return self.run(["open", url])
 
     def keystroke(self, text: str) -> tuple[bool, str]:
@@ -163,9 +165,11 @@ class DryRunBridge(MacBridge):
         self.calls.append(("run", " ".join(argv)))
         return True, f"[dry-run] {' '.join(argv[:4])}"
 
-    def open_url(self, url: str) -> tuple[bool, str]:
+    def open_url(self, url: str, browser: str | None = None) -> tuple[bool, str]:
         self.calls.append(("open", url))
-        return True, f"[dry-run] open {url}"
+        if browser:
+            self.calls.append(("browser", browser))
+        return True, f"[dry-run] open {url}" + (f" in {browser}" if browser else "")
 
     def keystroke(self, text: str) -> tuple[bool, str]:
         self.calls.append(("keystroke", text))

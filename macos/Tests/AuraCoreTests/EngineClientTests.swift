@@ -157,4 +157,32 @@ final class EngineClientTests: XCTestCase {
                        "http://127.0.0.1:9999")
         XCTAssertEqual(EngineEndpoint().port, 7331)
     }
+
+    func testFeedbackCarriesTheSkillAndItsArgs() async throws {
+        StubURLProtocol.respond = { _ in (200, Data(#"{"ok": true}"#.utf8)) }
+        let client = makeClient()
+        _ = try await client.feedback(transcript: "open youtube.com in safari",
+                                      skill: "browser.open_url",
+                                      good: false,
+                                      args: ["url": "youtube.com", "browser": "Safari"])
+        XCTAssertEqual(StubURLProtocol.lastRequest?.url?.path, "/api/correct")
+
+        var data = Data()
+        if let stream = StubURLProtocol.lastRequest?.httpBodyStream {
+            stream.open()
+            var buffer = [UInt8](repeating: 0, count: 512)
+            while stream.hasBytesAvailable {
+                let read = stream.read(&buffer, maxLength: buffer.count)
+                if read <= 0 { break }
+                data.append(buffer, count: read)
+            }
+            stream.close()
+        }
+        let body = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(body["skill"] as? String, "browser.open_url")
+        XCTAssertEqual(body["verdict"] as? String, "bad")
+        let args = try XCTUnwrap(body["args"] as? [String: Any])
+        XCTAssertEqual(args["url"] as? String, "youtube.com")
+        XCTAssertEqual(args["browser"] as? String, "Safari")
+    }
 }

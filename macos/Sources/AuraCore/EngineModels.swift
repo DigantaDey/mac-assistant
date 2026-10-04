@@ -127,11 +127,35 @@ public struct HistoryEntry: Decodable, Identifiable, Sendable {
     public let reply: String
     public let outcome: String
     public let totalMs: Int
+    public let plan: Plan?
+
+    public struct Plan: Decodable, Sendable {
+        public let reply: String?
+        public let actions: [PlanAction]?
+
+        public struct PlanAction: Decodable, Sendable {
+            public let skill: String?
+            public let args: [String: JSONValue]?
+        }
+    }
 
     public var date: Date { Date(timeIntervalSince1970: ts) }
 
+    /// The skill a 👍/👎 verdict supervises. Without it, feedback can't be
+    /// attributed to anything the model could learn from.
+    public var primarySkill: String? {
+        plan?.actions?.lazy.compactMap { $0.skill }.first { !$0.isEmpty }
+    }
+
+    /// The action's arguments, as plain Foundation values for a request body.
+    public var primaryArgs: [String: Any]? {
+        guard let args = plan?.actions?
+            .first(where: { ($0.skill ?? "").isEmpty == false })?.args else { return nil }
+        return args.mapValues { $0.anyValue }
+    }
+
     private enum CodingKeys: String, CodingKey {
-        case id, ts, transcript, reply, outcome
+        case id, ts, transcript, reply, outcome, plan
         case totalMs = "total_ms"
     }
 }

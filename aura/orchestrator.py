@@ -685,18 +685,28 @@ class Orchestrator:
                                  "reasons": p["verdict"].reasons,
                              } for p in session.pending])
             self.bus.publish("state", state="proposing")
+            timeout = self.cfg.session.confirmation_timeout_seconds
+            log.info("proposal %s: %s — waiting up to %.0fs for your go-ahead",
+                     token, [p["action"].skill for p in session.pending], timeout)
+            # A voice user isn't looking at a card: the question itself must
+            # be spoken ("…go ahead?"), not only the eventual outcome.
+            if plan.reply:
+                self._speak_async(plan.reply)
             # A proposal is already a response inside the active-work budget.
             # Reading it is user time, not active work, so suspend the active
             # watchdog while the independent confirmation timer runs.
             self._disarm_watchdog()
             try:
-                answer = await asyncio.wait_for(
-                    fut, timeout=self.cfg.session.confirmation_timeout_seconds)
+                answer = await asyncio.wait_for(fut, timeout=timeout)
             except TimeoutError:
                 answer = "timeout"
             finally:
                 self._confirmations.pop(token, None)
+            if answer == "timeout":
+                log.info("proposal %s: no answer within %.0fs — cancelled",
+                         token, timeout)
             if answer != "confirm":
+                log.info("proposal %s: answered %r — nothing will run", token, answer)
                 for p in session.pending:
                     self._record_example(transcript, p["action"],
                                          "cancelled" if answer in ("cancel", "timeout") else "corrected",
@@ -709,9 +719,17 @@ class Orchestrator:
                 return
             # Confirmed: record positive supervision, then give execution its
             # own active-work window under the watchdog.
+            log.info("proposal %s: confirmed — running %d action(s)",
+                     token, len(session.pending))
             for p in session.pending:
                 self._record_example(transcript, p["action"], "confirmed", p.get("decision"))
             self._arm_watchdog()
+            # The question ("…go ahead?") was already asked — spoken and
+            # shown — when the proposal went out. The reply that follows
+            # execution should report the OUTCOME, not ask again; drop the
+            # canned question so `_respond` falls back to the grounded
+            # result ("Trash emptied.", "Opened … in Safari.").
+            plan.reply = ""
 
         for p in blocked:
             p["result"] = _SkillOutcome(False, f"Refused: {'; '.join(p['verdict'].reasons)}")
@@ -1123,7 +1141,13 @@ class Orchestrator:
             try:
                 await self.loop.run_in_executor(None, self._run_setup_sync)
             except Exception as exc:
-                self.bus.publish("log", line=f"install failed: {exc!r}")
+                detail = log_exception("install failed", exc, logger=log)
+                self.bus.publish("log", line=f"install failed: {detail}")
+                # The UI's buttons live and die by `setup_done`: without it
+                # the Setup panel stays in "Installing…" forever, and every
+                # button there is disabled. Always settle the account.
+                self.bus.publish("setup_done", ok=False,
+                                 summary=f"Install stopped: {detail[:120]}")
             finally:
                 self._setup_running = False
         self._laya_idle_unloaded = False
@@ -1141,6 +1165,12 @@ class Orchestrator:
         self._setup_running = True
         try:
             await self.loop.run_in_executor(None, self._run_setup_sync)
+        except Exception as exc:
+            detail = log_exception("install failed", exc, logger=log)
+            # Same contract as start_setup: the UI must always see setup_done.
+            self.bus.publish("setup_done", ok=False,
+                             summary=f"Install stopped: {detail[:120]}")
+            return {"ok": False, "message": f"Install stopped: {detail[:120]}"}
         finally:
             self._setup_running = False
         self._laya_idle_unloaded = False
@@ -1263,7 +1293,10 @@ class Orchestrator:
         or the session would hang in `proposing` forever."""
         fut = self._confirmations.get(token)
         if fut is None or fut.done():
+            log.info("proposal %s: %r arrived too late — the proposal is gone",
+                     token, answer)
             return False
+        log.info("proposal %s: answered %r", token, answer)
 
         def _set() -> None:
             if not fut.done():
@@ -1279,9 +1312,21 @@ class Orchestrator:
             _set()
         return True
 
-    def record_feedback(self, transcript: str, skill: str, verdict: str, note: str = "") -> None:
-        """Explicit 👍/👎 from the Activity timeline — the richest signal we get."""
-        self._record_example(transcript, _ShadowAction(skill), verdict)
+    def record_feedback(self, transcript: str, skill: str, verdict: str, note: str = "",
+                        args: dict | None = None) -> None:
+        """Explicit 👍/👎 from the Activity timeline — the richest signal we get.
+
+        The verdict becomes a supervised example for the Laya fine-tune
+        (`ExampleBuffer`), keyed by the skill the verdict is about. A feedback
+        row without a skill cannot supervise anything, so it is stored as a
+        preference note at most, never as a bogus ""-skill example.
+        """
+        if skill:
+            self._record_example(transcript, _ShadowAction(skill, args or {}), verdict)
+            log.info("feedback: %s %r on %r", verdict, skill, transcript[:60])
+        else:
+            log.info("feedback: %r on %r arrived without a skill — kept as a note only",
+                     verdict, transcript[:60])
         if note:
             key, value = self.memory.extract_preference(note)
             self.memory.set_preference(key, value, source="user")
@@ -1381,11 +1426,12 @@ def _skill_result(ok: bool, message: str, data: dict | None = None):
 
 
 class _ShadowAction:
-    """Feedback arrives per skill name; that's enough supervision for the buffer."""
+    """Feedback arrives per skill name (+ the action's args when the timeline
+    still has them); that's enough supervision for the buffer."""
 
-    def __init__(self, skill: str) -> None:
+    def __init__(self, skill: str, args: dict | None = None) -> None:
         self.skill = skill
-        self.args = {}
+        self.args = args or {}
         self.why = ""
 
 

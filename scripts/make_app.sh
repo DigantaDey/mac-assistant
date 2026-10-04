@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../macos"
 
 say() { printf "\033[1;36m▸ %s\033[0m\n" "$1"; }
-VERSION="0.6.2"
+VERSION="0.7.1"
 BUILD="9"
 
 if ! command -v swift >/dev/null 2>&1; then
