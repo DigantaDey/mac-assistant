@@ -170,6 +170,30 @@ class TestServer:
         _, status = get(f"{base}/api/wake/train")
         assert json.loads(status) == {"active": False}
 
+    def test_training_state_transitions_are_serialized_with_audio_loop(self, server):
+        orch, _srv, cfg = server
+        orch._has_audio = True
+        engine_loop = orch.loop
+        observed = []
+        original_start = orch.training_start
+        original_capture = orch.training_capture
+
+        def check_loop(callback):
+            def wrapped(*args):
+                observed.append(asyncio.get_running_loop() is engine_loop)
+                return callback(*args)
+            return wrapped
+
+        orch.training_start = check_loop(original_start)
+        orch.training_capture = check_loop(original_capture)
+        base = f"http://127.0.0.1:{cfg.server.port}"
+        _, started = post(f"{base}/api/wake/train", {"phrase": "hey aura"})
+        assert started["ok"] is True
+        _, captured = post(f"{base}/api/wake/train/capture", {})
+        assert captured["ok"] is True
+        assert observed == [True, True]
+        post(f"{base}/api/wake/train/cancel", {})
+
     def test_setup_install_refused_in_demo(self, server):
         _, srv, cfg = server
         base = f"http://127.0.0.1:{cfg.server.port}"

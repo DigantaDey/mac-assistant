@@ -53,6 +53,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model?.shutdown()
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        // Permission toggles happen in System Settings, outside Aura. Refresh
+        // the engine's fresh-process TCC checks when the user returns.
+        Task { await model?.refreshPermissions() }
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false   // Aura lives in the menu bar
     }

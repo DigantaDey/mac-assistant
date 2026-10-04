@@ -38,7 +38,20 @@ struct OnboardingView: View {
         }
         .frame(width: 620, height: 540)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear(perform: refresh)
+        .onAppear {
+            refresh()
+            Task { await model.refreshPermissions() }
+        }
+        .onChange(of: model.permissions?.accessibility) { value in
+            if let value { accessibilityGranted = value }
+        }
+        .overlay(alignment: .bottom) {
+            if let toast = model.toast {
+                ToastView(toast: toast)
+                    .padding(.bottom, 58)
+                    .allowsHitTesting(false)
+            }
+        }
     }
 
     private var header: some View {
@@ -99,8 +112,18 @@ struct OnboardingView: View {
                               actionTitle: microphoneGranted ? "Granted" : "Allow",
                               action: {
                                   Task {
-                                      _ = await Permissions.requestMicrophone()
+                                      let granted = await Permissions.requestMicrophone()
                                       refresh()
+                                      if granted {
+                                          // A microphone grant doesn't replace
+                                          // the engine's SilentMic stream; attach
+                                          // the live input before wake setup.
+                                          model.requestPermission("microphone")
+                                      } else {
+                                          model.toast("Allow Aura under System Settings › Privacy & Security › Microphone.",
+                                                      kind: .warning)
+                                          Permissions.openMicrophoneSettings()
+                                      }
                                   }
                               },
                               settingsAction: Permissions.openMicrophoneSettings)
@@ -119,10 +142,16 @@ struct OnboardingView: View {
             Card {
                 SectionTitle(text: "Automation (asked later, per app)",
                              subtitle: "The first time Aura drives Safari or Spotify, macOS asks you then — not now.")
-                Button("Run a harmless test") { model.testAutomation() }.auraButton()
-                if let automation = model.setupProgress["automation"] {
-                    Text(automation).font(.system(size: 11)).foregroundStyle(.secondary)
+                Button {
+                    model.testAutomation()
+                } label: {
+                    HStack(spacing: 6) {
+                        if model.isTestingAutomation { ProgressView().controlSize(.small) }
+                        Text(model.isTestingAutomation ? "Testing…" : "Run a harmless test")
+                    }
                 }
+                .auraButton()
+                .disabled(model.isTestingAutomation)
             }
 
             Text("Still not sure? Skip it — Aura works with typing, and Settings ▸ Permissions shows the same switches later.")
@@ -237,6 +266,7 @@ struct OnboardingView: View {
 
     private func refresh() {
         microphoneGranted = Permissions.microphoneStatus == .authorized
-        accessibilityGranted = Permissions.accessibilityGranted
+        accessibilityGranted = model.permissions?.accessibility
+            ?? Permissions.accessibilityGranted
     }
 }

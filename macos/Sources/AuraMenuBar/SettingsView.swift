@@ -78,6 +78,13 @@ struct SettingsView: View {
             if let requested = Section.from(value) { section = requested }
             model.requestedSection = nil
         }
+        .overlay(alignment: .bottom) {
+            if let toast = model.toast {
+                ToastView(toast: toast)
+                    .padding(.bottom, 18)
+                    .allowsHitTesting(false)
+            }
+        }
     }
 
     private var sidebar: some View {
@@ -448,8 +455,10 @@ private struct PermissionsSection: View {
             SectionTitle(text: "The honest state", subtitle: "Read straight off your Mac, not guessed.")
             InfoRow(label: "Profile", value: model.permissions?.resolvedProfile ?? model.config?.resolvedProfile ?? "—")
             InfoRow(label: "Accessibility",
-                    value: model.permissions?.accessibility == true ? "Granted" : "Not granted",
-                    color: model.permissions?.accessibility == true ? Theme.ready : Theme.attention)
+                    value: model.permissions?.accessibility.map { $0 ? "Granted" : "Not granted" }
+                        ?? "Checking…",
+                    color: model.permissions?.accessibility.map { $0 ? Theme.ready : Theme.attention }
+                        ?? Color.secondary)
             InfoRow(label: "Wake models",
                     value: model.permissions?.wakeModels?.ready == true ? "Ready" : "Missing",
                     color: model.permissions?.wakeModels?.ready == true ? Theme.ready : Theme.attention)
@@ -485,9 +494,18 @@ private struct CapabilityRowView: View {
 
             Spacer(minLength: 8)
 
-            Button(row.actionTitle) { perform(row.action) }
-                .auraButton()
-                .disabled(model.isInstalling)
+            Button { perform(row.action) } label: {
+                HStack(spacing: 6) {
+                    if row.action == .testAutomation && model.isTestingAutomation {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(row.action == .testAutomation && model.isTestingAutomation
+                         ? "Testing…" : row.actionTitle)
+                }
+            }
+            .auraButton()
+            .disabled(model.isInstalling
+                      || (row.action == .testAutomation && model.isTestingAutomation))
         }
         .padding(.vertical, 2)
     }
@@ -561,10 +579,12 @@ private struct WakeSection: View {
                     Text("\(training.count ?? 0) of \(training.need ?? 6)")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
-                Text(training.listening == true
-                     ? "Recording… say the phrase now (stops automatically)."
-                     : "Record each take naturally. Every tap finishes or reports a problem within five seconds.")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(training.message ?? (training.listening == true
+                     ? "Recording… say the phrase now, then pause briefly."
+                     : "Record each take naturally; Aura stops when you pause."))
+                    .font(.system(size: 11))
+                    .foregroundStyle(training.listening == true ? Theme.busy : Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 8) {
                     Button {
                         model.captureTrainingSample()
@@ -629,9 +649,9 @@ private struct ActivitySection: View {
             Button {
                 Task {
                     refreshing = true
-                    await model.refreshActivity()
+                    let refreshed = await model.refreshActivity()
                     refreshing = false
-                    model.toast("Activity refreshed.", kind: .success)
+                    if refreshed { model.toast("Activity refreshed.", kind: .success) }
                 }
             } label: {
                 HStack(spacing: 6) {
@@ -722,18 +742,49 @@ private struct ActivityRow: View {
             Spacer(minLength: 6)
             HStack(spacing: 4) {
                 Button { model.feedback(entry, good: true) } label: {
-                    Image(systemName: "hand.thumbsup")
+                    feedbackLabel(for: .good)
                 }
-                .auraButton()
+                .auraButton(prominent: feedback?.vote == .good && feedback?.phase == .sent,
+                            tint: Theme.ready)
+                .disabled(feedback?.phase == .sending || feedback?.phase == .sent)
                 .help("That was right")
+                .accessibilityLabel("That was right")
+
                 Button { model.feedback(entry, good: false) } label: {
-                    Image(systemName: "hand.thumbsdown")
+                    feedbackLabel(for: .bad)
                 }
-                .auraButton()
+                .auraButton(prominent: feedback?.vote == .bad && feedback?.phase == .sent,
+                            tint: Theme.danger)
+                .disabled(feedback?.phase == .sending || feedback?.phase == .sent)
                 .help("That was wrong — Aura learns from it")
+                .accessibilityLabel("That was wrong")
+
+                if feedback?.phase == .sent {
+                    Text("Sent")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 2)
+                }
             }
         }
         .padding(.vertical, 4)
+    }
+
+    private var feedback: ActivityFeedbackState? {
+        model.feedbackStatus(for: entry.id)
+    }
+
+    @ViewBuilder
+    private func feedbackLabel(for vote: ActivityFeedbackState.Vote) -> some View {
+        if feedback?.phase == .sending && feedback?.vote == vote {
+            ProgressView().controlSize(.small).frame(width: 13, height: 13)
+        } else {
+            Image(systemName: vote == .good
+                  ? (feedback?.vote == .good && feedback?.phase == .sent
+                     ? "hand.thumbsup.fill" : "hand.thumbsup")
+                  : (feedback?.vote == .bad && feedback?.phase == .sent
+                     ? "hand.thumbsdown.fill" : "hand.thumbsdown"))
+        }
     }
 }
 

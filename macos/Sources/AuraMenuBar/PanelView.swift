@@ -356,11 +356,24 @@ struct MessageRow: View {
 struct LiveActionsView: View {
     let actions: [LiveAction]
 
+    private var isFinished: Bool { actions.allSatisfy { $0.status != .running } }
+    private var hasFailure: Bool { actions.contains { $0.status == .failed } }
+
+    private var title: String {
+        guard isFinished else { return "Working" }
+        return hasFailure ? "Finished with an issue" : "Completed"
+    }
+
+    private var subtitle: String? {
+        guard isFinished else { return nil }
+        return actions.count == 1 ? "Aura has finished this action." : "Aura has finished these actions."
+    }
+
     var body: some View {
         Card(spacing: 8) {
-            SectionTitle(text: "Working", subtitle: nil)
+            SectionTitle(text: title, subtitle: subtitle)
             ForEach(actions) { action in
-                HStack(spacing: 8) {
+                HStack(alignment: .top, spacing: 8) {
                     switch action.status {
                     case .running:
                         ProgressView().controlSize(.small).frame(width: 12, height: 12)
@@ -371,12 +384,14 @@ struct LiveActionsView: View {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 11)).foregroundStyle(Theme.danger)
                     }
-                    Text(action.title).font(.system(size: 12))
-                    if let message = action.message, action.status != .running {
-                        Text(message)
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(action.title).font(.system(size: 12, weight: .medium))
+                        if let message = action.message, action.status != .running {
+                            Text(message)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                     Spacer(minLength: 0)
                 }
@@ -480,15 +495,30 @@ struct ToastView: View {
         }
     }
 
+    private var symbol: String {
+        switch toast.kind {
+        case .info: return "info.circle.fill"
+        case .success: return "checkmark.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .failure: return "xmark.octagon.fill"
+        }
+    }
+
     var body: some View {
-        Text(toast.text)
-            .font(.system(size: 11.5, weight: .medium))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            .background(Capsule().fill(color.opacity(0.95)))
-            .shadow(color: .black.opacity(0.25), radius: 8, y: 3)
-            .padding(.horizontal, 16)
-            .transition(.move(edge: .bottom).combined(with: .opacity))
+        HStack(spacing: 7) {
+            Image(systemName: symbol)
+                .font(.system(size: 12, weight: .semibold))
+            Text(toast.text)
+                .font(.system(size: 11.5, weight: .medium))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Capsule().fill(color.opacity(0.97)))
+        .shadow(color: .black.opacity(0.25), radius: 8, y: 3)
+        .padding(.horizontal, 16)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+        .accessibilityElement(children: .combine)
     }
 }

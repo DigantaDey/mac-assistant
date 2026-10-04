@@ -59,6 +59,14 @@ struct Toast: Identifiable, Equatable {
     var kind: Kind = .info
 }
 
+struct ActivityFeedbackState: Equatable {
+    enum Vote: Equatable { case good, bad }
+    enum Phase: Equatable { case sending, sent, failed }
+
+    let vote: Vote
+    let phase: Phase
+}
+
 /// What the Setup screen shows for one row of the capability matrix.
 struct CapabilityRow: Identifiable {
     enum Action: Equatable {
@@ -108,6 +116,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var training: WakeTraining?
     @Published private(set) var isStartingTraining = false
     @Published private(set) var isFinishingTraining = false
+    @Published private(set) var isTestingAutomation = false
+    @Published private(set) var feedbackByEntryID: [Int: ActivityFeedbackState] = [:]
     @Published private(set) var setupProgress: [String: String] = [:]
     @Published private(set) var messages: [PanelMessage] = []
     @Published private(set) var liveActions: [LiveAction] = []
@@ -123,6 +133,9 @@ final class AppModel: ObservableObject {
     private var toastTask: Task<Void, Never>?
     private var stallTask: Task<Void, Never>?
     private var thinkingMessageID: UUID?
+    private var activeSessionID: String?
+    private var activePlanReply: String?
+    private var automationProbeID: UUID?
 
     init(token: String) {
         let endpoint = EngineEndpoint(host: "127.0.0.1", port: Prefs.port, token: token)
@@ -174,10 +187,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// UI-side backstop for the engine's five-second active-work deadline.
+    /// UI-side backstop for the engine's 20-second active-work deadline.
     /// One timer spans planning → executing; phase changes must not restart it.
-    /// If SSE drops at exactly the wrong moment, the user still never stares at
-    /// a permanent “Thinking…”.
+    /// If SSE drops, query the engine first so the UI never says a finished
+    /// action is still thinking (or says it stopped while the engine can act).
     private func watchForStall() {
         let activeWork = ["planning", "executing", "responding"].contains(phase)
         guard activeWork else {
@@ -187,21 +200,24 @@ final class AppModel: ObservableObject {
         }
         guard stallTask == nil else { return }
         stallTask = Task { [weak self] in
-            do { try await Task.sleep(nanoseconds: 5_000_000_000) }
+            do { try await Task.sleep(nanoseconds: 22_000_000_000) }
             catch { return }
             guard !Task.isCancelled, let self, self.thinkingMessageID != nil else { return }
 
-            // Deliver the deadline locally first; a state refresh must not add
-            // network latency to the product's visible response guarantee.
             self.stallTask = nil
-            self.appendAura("That took too long (over five seconds), so I stopped waiting. Please try again.",
-                            failed: true)
             let snapshot = try? await self.client.state(timeout: 1)
+            guard !Task.isCancelled, self.thinkingMessageID != nil else { return }
             if let snapshot {
                 self.state = snapshot
                 self.phase = snapshot.state
-                if snapshot.state == "armed" { self.proposal = nil }
+                if snapshot.state == "armed" {
+                    self.proposal = nil
+                    self.recoverMissingReply()
+                    return
+                }
             }
+            self.appendAura("Aura hasn't returned a result yet. Check Activity or restart the engine.",
+                            failed: true)
         }
     }
 
@@ -209,9 +225,27 @@ final class AppModel: ObservableObject {
         switch event.type {
         case "state":
             if let value = event.state {
+                let previousPhase = phase
                 if value != phase { phase = value }
-                if value == "planning" { liveActions.removeAll() }
+                if value == "planning" {
+                    liveActions.removeAll()
+                    activePlanReply = nil
+                    activeSessionID = event.session
+                } else if ["proposing", "executing", "responding"].contains(value),
+                          let session = event.session {
+                    activeSessionID = session
+                }
+                if value == "executing", proposal == nil, thinkingMessageID == nil {
+                    beginThinking()
+                }
                 if value == "armed" {
+                    let sessionMatches = event.session != nil
+                        && event.session == activeSessionID
+                    let legacyTerminalTransition = event.session == nil
+                        && previousPhase != "armed"
+                    if sessionMatches || legacyTerminalTransition {
+                        recoverMissingReply()
+                    }
                     proposal = nil
                     Notify.clearProposals()
                     Task { await refreshAfterSession() }
@@ -219,10 +253,16 @@ final class AppModel: ObservableObject {
                 watchForStall()
             }
 
+        case "plan":
+            if let session = event.session { activeSessionID = session }
+            activePlanReply = event.data["reply"]?.stringValue
+
         case "transcript":
             if let text = event.text, !text.isEmpty { appendUser(text) }
 
         case "proposal":
+            if let session = event.session { activeSessionID = session }
+            removeThinkingIndicator()
             let token = event.token ?? ""
             let proposalActions = (event.data["actions"]?.arrayValue ?? []).map { value in
                 ProposedAction(skill: value["skill"]?.stringValue ?? "action",
@@ -252,12 +292,14 @@ final class AppModel: ObservableObject {
             }
 
         case "action_started":
+            if let session = event.session { activeSessionID = session }
             let skill = event.skill ?? "action"
             if !liveActions.contains(where: { $0.skill == skill && $0.status == .running }) {
                 liveActions.append(LiveAction(skill: skill, status: .running))
             }
 
         case "action_result":
+            if let session = event.session { activeSessionID = session }
             let skill = event.skill ?? "action"
             let ok = event.data["ok"]?.boolValue ?? true
             let message = event.message
@@ -269,6 +311,10 @@ final class AppModel: ObservableObject {
             }
 
         case "reply":
+            if let replySession = event.session {
+                if let activeSessionID, replySession != activeSessionID { return }
+                if activeSessionID == nil && thinkingMessageID == nil { return }
+            }
             let text = event.text ?? ""
             if !text.isEmpty {
                 let failed = (event.data["outcome"]?.stringValue ?? "ok") == "failed"
@@ -296,7 +342,8 @@ final class AppModel: ObservableObject {
                                     phrase: event.data["phrase"]?.stringValue ?? prior?.phrase,
                                     count: event.data["count"]?.intValue ?? prior?.count,
                                     need: event.data["need"]?.intValue ?? prior?.need,
-                                    listening: trainingPhase == "listening")
+                                    listening: trainingPhase == "listening",
+                                    message: event.data["message"]?.stringValue ?? prior?.message)
             if trainingPhase == "done" {
                 let threshold = event.data["threshold"]?.doubleValue
                 toast("Wake phrase trained" + (threshold.map { String(format: " (confidence %.2f)", $0) } ?? ""),
@@ -311,7 +358,8 @@ final class AppModel: ObservableObject {
                                     phrase: training?.phrase,
                                     count: event.data["count"]?.intValue ?? training?.count,
                                     need: event.data["need"]?.intValue ?? training?.need,
-                                    listening: false)
+                                    listening: false,
+                                    message: event.message ?? training?.message)
 
         case "setup_progress":
             let key = event.data["key"]?.stringValue ?? "step"
@@ -355,9 +403,44 @@ final class AppModel: ObservableObject {
         stallTask?.cancel()
         stallTask = nil
         thinkingMessageID = nil
+        activeSessionID = nil
+        activePlanReply = nil
         messages.removeAll { $0.text == "Thinking…" && $0.role == .aura }
         messages.append(PanelMessage(role: .aura, text: text, failed: failed))
         trimMessages()
+    }
+
+    private func removeThinkingIndicator() {
+        guard let thinkingMessageID else { return }
+        messages.removeAll { $0.id == thinkingMessageID }
+        self.thinkingMessageID = nil
+        stallTask?.cancel()
+        stallTask = nil
+    }
+
+    /// Final `armed` state is authoritative. If a reply event was lost while
+    /// SSE was reconnecting, replace the stale spinner with the most grounded
+    /// result we saw; never leave the conversation in a permanent thinking state.
+    private func recoverMissingReply() {
+        guard thinkingMessageID != nil else { return }
+        let failures = liveActions.filter { $0.status == .failed }
+        if !failures.isEmpty {
+            let details = failures.compactMap(\.message)
+            appendAura(details.isEmpty ? "Aura couldn't complete that action. Check Activity for details."
+                       : details.joined(separator: " "), failed: true)
+            return
+        }
+        let completed = liveActions.filter { $0.status == .ok }
+        if !completed.isEmpty {
+            let details = completed.compactMap(\.message)
+            appendAura(details.isEmpty ? "Done." : details.joined(separator: " "), failed: false)
+            return
+        }
+        if let reply = activePlanReply, !reply.isEmpty {
+            appendAura(reply, failed: false)
+        } else {
+            appendAura("That request finished. Check Activity for the result.", failed: false)
+        }
     }
 
     private func appendSystem(_ text: String) {
@@ -411,19 +494,40 @@ final class AppModel: ObservableObject {
     func send(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        guard phase == "armed" else {
+            toast("Aura is still working on the last request.", kind: .warning)
+            return
+        }
+
         appendUser(trimmed)
+        phase = "planning"
+        watchForStall()
         Task {
             do {
                 let reply = try await client.send(text: trimmed)
                 if reply.accepted == false {
                     let message = reply.message ?? "Aura is busy."
+                    if let snapshot = try? await client.state(timeout: 1) {
+                        state = snapshot
+                        phase = snapshot.state
+                    } else {
+                        phase = "armed"
+                    }
+                    removeThinkingIndicator()
                     appendSystem(message)
                     toast(message, kind: .warning)
-                    messages.removeAll { $0.text == "Thinking…" }
                 }
             } catch let error as EngineError where error.isUnauthorized {
+                removeThinkingIndicator()
+                phase = "armed"
                 handleUnauthorized()
             } catch {
+                if let snapshot = try? await client.state(timeout: 1) {
+                    state = snapshot
+                    phase = snapshot.state
+                } else {
+                    phase = "armed"
+                }
                 appendAura(error.localizedDescription, failed: true)
             }
         }
@@ -459,7 +563,15 @@ final class AppModel: ObservableObject {
         guard !token.isEmpty else { return }
         proposal = nil
         Notify.clearProposals()
-        Task { _ = try? await client.cancel(token: token) }
+        Task {
+            do {
+                let reply = try await client.cancel(token: token)
+                toast(reply.ok ? "Cancelled — nothing ran." : "That request had already expired.",
+                      kind: reply.ok ? .info : .warning)
+            } catch {
+                toast(error.localizedDescription, kind: .failure)
+            }
+        }
     }
 
     private func handleUnauthorized() {
@@ -521,9 +633,15 @@ final class AppModel: ObservableObject {
         if let snapshot { state = snapshot; phase = snapshot.state }
     }
 
-    func refreshActivity() async {
-        let list = try? await client.history()
-        if let list { activity = list }
+    @discardableResult
+    func refreshActivity() async -> Bool {
+        do {
+            activity = try await client.history()
+            return true
+        } catch {
+            toast(error.localizedDescription, kind: .warning)
+            return false
+        }
     }
 
     func refreshPermissions() async {
@@ -652,15 +770,36 @@ final class AppModel: ObservableObject {
     }
 
     func testAutomation() {
-        Task {
-            do {
-                let answer = try await client.testAutomation()
-                toast(answer.message ?? "Tested.", kind: answer.ok ? .success : .warning)
-            } catch {
-                // Was silently swallowed before — the button looked dead.
-                toast(error.localizedDescription, kind: .failure)
+        guard !isTestingAutomation else { return }
+        let probeID = UUID()
+        automationProbeID = probeID
+        isTestingAutomation = true
+        toast("Checking Automation access…", kind: .info)
+
+        Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Permissions.testAutomation()
+            }.value
+            guard let self, self.automationProbeID == probeID else { return }
+            self.automationProbeID = nil
+            self.isTestingAutomation = false
+            if result.permissionRequired {
+                Permissions.openAutomationSettings()
             }
-            await refreshPermissions()
+            self.toast(result.message, kind: result.ok ? .success : .warning)
+            await self.refreshPermissions()
+        }
+
+        // NSAppleScript can wait on a macOS consent sheet. Keep the UI honest
+        // even if that sheet was hidden behind another window.
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 12_000_000_000)
+            guard let self, self.automationProbeID == probeID else { return }
+            self.automationProbeID = nil
+            self.isTestingAutomation = false
+            Permissions.openAutomationSettings()
+            self.toast("Automation is taking too long — check the macOS permission prompt or Privacy & Security › Automation.",
+                       kind: .warning)
         }
     }
 
@@ -719,7 +858,8 @@ final class AppModel: ObservableObject {
                     return
                 }
                 training = WakeTraining(active: true, phrase: phrase.lowercased(),
-                                        count: 0, need: start.need ?? 6, listening: false)
+                                        count: 0, need: start.need ?? 6, listening: false,
+                                        message: "Ready — tap Record, then say your phrase.")
                 toast("Ready — tap Record, then say your phrase.", kind: .info)
             } catch {
                 toast(error.localizedDescription, kind: .failure)
@@ -735,14 +875,27 @@ final class AppModel: ObservableObject {
         // therefore always has visible feedback and duplicate taps are blocked.
         training = WakeTraining(active: true, phrase: current.phrase,
                                 count: current.count, need: current.need,
-                                listening: true)
+                                listening: true,
+                                message: "Recording — say your phrase now, then pause briefly.")
         toast("Listening… say it now.", kind: .info)
         Task {
             do {
                 let capture = try await client.captureSample()
-                if capture.ok == false {
+                guard capture.ok else {
                     toast(capture.message ?? "Couldn't record that.", kind: .warning)
                     await refreshTraining()
+                    return
+                }
+
+                // SSE is the fast path; this short poll is the recovery path if
+                // the event stream reconnects while a take is in progress.
+                for _ in 0..<12 {
+                    guard training?.active == true,
+                          training?.phrase == current.phrase,
+                          training?.listening == true else { return }
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    await refreshTraining()
+                    if training?.listening != true { return }
                 }
             } catch {
                 toast(error.localizedDescription, kind: .failure)
@@ -797,26 +950,48 @@ final class AppModel: ObservableObject {
 
     // MARK: - feedback + files
 
+    func feedbackStatus(for entryID: Int) -> ActivityFeedbackState? {
+        feedbackByEntryID[entryID]
+    }
+
     func feedback(_ entry: HistoryEntry, good: Bool) {
+        let entryID = entry.id
+        let vote: ActivityFeedbackState.Vote = good ? .good : .bad
+        if let current = feedbackByEntryID[entryID],
+           current.phase == .sending || current.phase == .sent {
+            return
+        }
+        feedbackByEntryID[entryID] = ActivityFeedbackState(vote: vote, phase: .sending)
+
         // The verdict supervises the skill that actually ran, with the args
-        // it ran with — that row is what the decision model's fine-tune
-        // learns from. A thumb with no skill was feedback to nobody.
+        // it ran with. A no-action session can still be noted, but must not be
+        // described as a training example it cannot produce.
         let skill = entry.primarySkill ?? ""
         let args = entry.primaryArgs
         Task {
             do {
-                _ = try await client.feedback(transcript: entry.transcript,
-                                              skill: skill,
-                                              good: good,
-                                              args: args)
-                toast(good
-                      ? "Thanks — recorded for Aura's next training run."
-                      : "Got it — Aura learns from this one.",
-                      kind: .success)
+                let answer = try await client.feedback(transcript: entry.transcript,
+                                                       skill: skill,
+                                                       good: good,
+                                                       args: args)
+                guard answer.ok else {
+                    feedbackByEntryID[entryID] = ActivityFeedbackState(vote: vote, phase: .failed)
+                    toast(answer.message ?? "Aura couldn't save that feedback.", kind: .failure)
+                    return
+                }
+                feedbackByEntryID[entryID] = ActivityFeedbackState(vote: vote, phase: .sent)
+                let message: String
+                if skill.isEmpty {
+                    message = "Feedback sent — this session had no action for Aura to learn from."
+                } else {
+                    message = good ? "Thanks — feedback sent to Aura." : "Got it — correction sent to Aura."
+                }
+                toast(message, kind: .success)
             } catch {
+                feedbackByEntryID[entryID] = ActivityFeedbackState(vote: vote, phase: .failed)
                 toast(error.localizedDescription, kind: .failure)
             }
-            await refreshActivity()
+            _ = await refreshActivity()
         }
     }
 
