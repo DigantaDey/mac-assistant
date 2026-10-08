@@ -255,3 +255,160 @@ async def test_setup_done_is_guaranteed_when_the_installer_crashes(stack):
     assert "disk full" in done[0].data["summary"]
     assert orch._setup_running is False
     orch.bus.unsubscribe_async(sid)
+
+
+# --------------------------------------------------------------------------- #
+# A wedged skill must fail honestly — not spend the whole session budget        #
+# --------------------------------------------------------------------------- #
+
+
+class _StuckPlanner:
+    """Plans one action whose skill takes far longer than any deadline."""
+
+    async def plan(self, transcript, context):
+        from aura.planner import Action, Plan
+
+        return Plan(reply="Working on it.",
+                    actions=[Action("system.hang", {}, "safe", "never returns")])
+
+
+def _make_stuck_skill():
+    """A skill wedged on a blocking system call — no inner timeout at all.
+
+    The thread is released explicitly at the end of the test: a timed-out
+    skill leaves its worker unwinding in the background (that is documented
+    behaviour of the per-skill deadline), and the suite must not pay for it.
+    """
+    import threading
+
+    from aura.skills.base import Skill, SkillResult, SkillSpec
+
+    release = threading.Event()
+
+    class StuckSkill(Skill):
+        spec = SkillSpec(name="system.hang", description="never returns")
+
+        async def execute(self, args, ctx):
+            release.wait(10)               # a wedged AX call, from the outside
+            return SkillResult(True, "unreachable")
+
+    return StuckSkill(), release
+
+
+async def test_skill_timeout_beats_the_session_watchdog(stack, monkeypatch):
+    """The field failure: 'what's on my screen' died on the watchdog's
+    generic 'that took too long' after 20 s, with the state machine killed
+    mid-flight. A per-skill deadline reports WHICH skill wedged, keeps the
+    session alive to deliver the reply, and returns to armed cleanly."""
+    from aura import orchestrator as orch_mod
+    from aura.skills.base import SkillRegistry
+
+    monkeypatch.setattr(orch_mod, "SKILL_TIMEOUT_SECONDS", 0.3)
+    stuck, release = _make_stuck_skill()
+    orch = stack.build_orchestrator()
+    orch.planner = _StuckPlanner()
+    registry = SkillRegistry()
+    registry.register(stuck)
+    orch.registry = registry
+
+    try:
+        sid = orch.bus.subscribe_async()
+        events = []
+
+        async def watch():
+            while True:
+                events.append(await orch.bus.get(sid))
+
+        watcher = asyncio.create_task(watch())
+        await orch.submit_text("hang forever")
+        await asyncio.sleep(0.05)
+        watcher.cancel()
+        orch.bus.unsubscribe_async(sid)
+
+        assert orch.state == "armed"
+        types = [ev.type for ev in events]
+        assert "reply" in types
+        result = next(ev for ev in events if ev.type == "action_result")
+        assert result.data["ok"] is False
+        assert "didn't finish within" in result.data["message"]
+        reply = next(ev for ev in events if ev.type == "reply")
+        assert "system.hang" in reply.data["text"]
+    finally:
+        release.set()                      # let the orphaned worker finish
+
+
+async def test_stale_speech_is_never_announced(stack, monkeypatch):
+    """A Mac waking from sleep must not blurt a cancellation from an hour
+    ago: speech older than the freshness window is dropped, with a log line."""
+    from aura import orchestrator as orch_mod
+
+    orch = stack.build_orchestrator()
+    orch._loop = asyncio.get_running_loop()
+    spoken: list[str] = []
+
+    class RecordingTTS:
+        def speak(self, text):
+            spoken.append(text)
+            return 1.0
+
+    orch.tts = RecordingTTS()
+
+    monkeypatch.setattr(orch_mod, "MAX_SPEECH_AGE_SECONDS", -1)   # everything is stale
+    orch._speak_async("I didn't hear a yes, so I cancelled it.")
+    await asyncio.sleep(0.15)
+    assert spoken == []
+
+    monkeypatch.setattr(orch_mod, "MAX_SPEECH_AGE_SECONDS", 20.0)  # fresh again
+    orch._speak_async("Done.")
+    for _ in range(50):
+        if spoken:
+            break
+        await asyncio.sleep(0.02)
+    assert spoken == ["Done."]
+
+
+async def test_stt_warm_up_runs_at_startup(stack, aura_logs):
+    """whisper.cpp loads its model per invocation; the first command after a
+    wake must not pay that under the transcription deadline. The engine warms
+    any STT backend that offers it, in the background, best-effort."""
+    orch = stack.build_orchestrator()
+    warmed = []
+
+    class WarmableSTT:
+        def transcribe(self, frames):
+            return ""
+
+        def warm(self):
+            warmed.append(True)
+            return True
+
+    orch.stt = WarmableSTT()
+    await orch.start()
+    try:
+        for _ in range(100):
+            if warmed:
+                break
+            await asyncio.sleep(0.02)
+        assert warmed == [True]
+        assert any("warm-up" in r.getMessage() and "speech" in r.getMessage()
+                   for r in aura_logs), [r.getMessage() for r in aura_logs]
+    finally:
+        await orch.stop()
+
+
+async def test_broken_stt_warm_up_never_breaks_startup(stack):
+    orch = stack.build_orchestrator()
+
+    class ExplodingSTT:
+        def transcribe(self, frames):
+            return ""
+
+        def warm(self):
+            raise RuntimeError("no model here")
+
+    orch.stt = ExplodingSTT()
+    await orch.start()
+    try:
+        assert orch.state == "armed"
+    finally:
+        await orch.stop()

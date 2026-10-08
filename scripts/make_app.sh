@@ -6,8 +6,8 @@ set -euo pipefail
 cd "$(dirname "$0")/../macos"
 
 say() { printf "\033[1;36m▸ %s\033[0m\n" "$1"; }
-VERSION="0.7.1"
-BUILD="9"
+VERSION="0.7.2"
+BUILD="10"
 
 if ! command -v swift >/dev/null 2>&1; then
   echo "swift not found — install the Xcode command line tools first:"

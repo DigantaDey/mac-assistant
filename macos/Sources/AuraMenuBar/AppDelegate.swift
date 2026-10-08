@@ -166,6 +166,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             Task { @MainActor in self.registerHotKey() }
         }
+
+        // A transient popover closes on any click elsewhere — taking the
+        // proposal card with it while the engine is still waiting for an
+        // answer. The model re-delivers a pending question as a notification
+        // (or, when notifications are off, presents the panel again): the
+        // closing of the panel must never be the moment a question dies.
+        NotificationCenter.default.addObserver(forName: NSPopover.didCloseNotification,
+                                               object: popover, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in self.model?.panelDidClose() }
+        }
     }
 
     // MARK: - the icon

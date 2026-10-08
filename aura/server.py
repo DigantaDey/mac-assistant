@@ -662,6 +662,14 @@ def _state_snapshot(orch, cfg, auth: bool = True) -> dict:
         "wake_active": wake_status["active"],
         "wake_error": wake_status["error"],
         "wake_detail": wake_status["detail"],
+        # Live listening telemetry for the Wake Phrase panel: the detector's
+        # best recent score beside its threshold answers "did Aura hear me?"
+        # without a single guess, and the notice flags templates trained by
+        # an older build whose thresholds predate the current calibration.
+        "wake_notice": wake_status.get("notice", ""),
+        "wake_level": wake_status.get("level"),
+        "wake_threshold": wake_status.get("threshold"),
+        "wake_fires": wake_status.get("fires"),
         "tts_enabled": cfg.tts.enabled,
         "ask_before_run": cfg.safety.show_plan_before_run,
         "data_dir": cfg.data_dir,

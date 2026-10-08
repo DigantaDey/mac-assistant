@@ -531,6 +531,8 @@ private struct CapabilityRowView: View {
         case .requestAccessibility: model.requestPermission("accessibility")
         case .openAccessibility: model.openSystemSettings("accessibility")
         case .testAutomation: model.testAutomation()
+        case .requestNotifications: model.requestNotifications()
+        case .openNotificationSettings: model.openNotificationSettings()
         case .installComponents: model.installEverything()
         case .installWakeModels: model.runSetupStep("wake")
         case .installWhisper: model.runSetupStep("whisper")
@@ -595,6 +597,32 @@ private struct WakeSection: View {
                             .auraButton()
                     }
                 }
+            }
+
+            // A phrase trained by an older Aura was calibrated in a score
+            // space this detector never reaches — listening "works" while
+            // the phrase can't fire. Say so, right where it can be fixed.
+            if let notice = model.state?.wakeNotice, !notice.isEmpty {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.attention)
+                        .padding(.top, 1)
+                    Text(notice)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Theme.attention)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Theme.attention.opacity(0.10))
+                )
+            }
+
+            if mode == "openwakeword" && model.state?.wakeActive == true {
+                ListeningMeter()
             }
         }
 
@@ -684,6 +712,79 @@ private struct WakeSection: View {
 
     private func beginTraining() {
         model.beginTraining(phrase)
+    }
+}
+
+/// "Is Aura actually hearing me?" — the detector's own live score beside the
+/// threshold it must clear, polled while this panel is open. This is the
+/// number that turns "I said it and nothing happened" from a mystery into
+/// something the user can watch, and retrain on the spot if it stays low.
+private struct ListeningMeter: View {
+    @EnvironmentObject var model: AppModel
+
+    private var level: Double? { model.state?.wakeLevel ?? nil }
+    private var threshold: Double? { model.state?.wakeThreshold ?? nil }
+    private var heard: Bool {
+        guard let level, let threshold else { return false }
+        return level >= threshold
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: heard ? "checkmark.circle.fill" : "waveform")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(heard ? Theme.ready : Theme.busy)
+                Text(heard ? "Heard it — that wakes Aura."
+                           : "Say your phrase now — this is what Aura hears.")
+                    .font(.system(size: 11, weight: heard ? .semibold : .regular))
+                    .foregroundStyle(heard ? Theme.ready : .secondary)
+                Spacer()
+                if let level, let threshold {
+                    Text(String(format: "%.3f / %.3f", level, threshold))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            GeometryReader { geo in
+                // Raw cosines cluster in a narrow band near 1.0; the bar
+                // zooms onto ±0.06 around the threshold so movement is
+                // visible and the marker sits where firing actually happens.
+                let lo = max(0, (threshold ?? 1) - 0.06)
+                let hi = min(1, (threshold ?? 1) + 0.06)
+                let span = max(hi - lo, 0.0001)
+                let fill = level.map { max(0, min(1, ($0 - lo) / span)) } ?? 0
+                let mark = threshold.map { max(0, min(1, ($0 - lo) / span)) } ?? 0.5
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.08))
+                    Capsule()
+                        .fill(heard ? Theme.ready : Theme.busy.opacity(0.75))
+                        .frame(width: geo.size.width * fill)
+                        .animation(.easeOut(duration: 0.25), value: fill)
+                    Rectangle()
+                        .fill(Theme.attention)
+                        .frame(width: 2, height: 10)
+                        .offset(x: geo.size.width * mark - 1, y: -2)
+                }
+            }
+            .frame(height: 6)
+            Text("The marker is the firing threshold. Your voice never leaves this Mac.")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.primary.opacity(0.04))
+        )
+        .task {
+            // Live while this panel is open; SwiftUI cancels the task the
+            // moment the section disappears, so nothing polls forever.
+            while !Task.isCancelled {
+                await model.refreshState()
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+            }
+        }
     }
 }
 

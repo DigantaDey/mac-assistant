@@ -463,6 +463,34 @@ struct ProposalCard: View {
                 }
             }
 
+            // The answer window is finite and the engine enforces it — show
+            // it. A confirmation that silently expires mid-read is how a
+            // cancelled "Empty the trash" once looked like a dead product.
+            TimelineView(.periodic(from: proposal.receivedAt, by: 1)) { timeline in
+                let remaining = proposal.timeout
+                    - timeline.date.timeIntervalSince(proposal.receivedAt)
+                if remaining > 0 {
+                    let fraction = max(0, min(1, remaining / max(proposal.timeout, 1)))
+                    let urgent = remaining <= 10
+                    VStack(alignment: .leading, spacing: 5) {
+                        GeometryReader { geo in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color.primary.opacity(0.08))
+                                Capsule()
+                                    .fill(urgent ? Theme.danger : Theme.attention)
+                                    .frame(width: geo.size.width * fraction)
+                                    .animation(.linear(duration: 1), value: fraction)
+                            }
+                        }
+                        .frame(height: 3)
+                        Text("Auto-cancels in \(Int(remaining.rounded(.up)))s")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .monospacedDigit()
+                            .foregroundStyle(urgent ? Theme.danger : .secondary)
+                    }
+                }
+            }
+
             HStack(spacing: 8) {
                 Spacer()
                 Button("Cancel", action: onCancel)

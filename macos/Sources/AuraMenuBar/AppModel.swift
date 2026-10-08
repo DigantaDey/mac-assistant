@@ -37,6 +37,11 @@ struct Proposal: Identifiable, Equatable {
     let id: String          // the confirmation token
     let reply: String
     let actions: [ProposedAction]
+    /// When the question arrived and how long the engine will wait for an
+    /// answer — the card counts down, because a confirmation that silently
+    /// expires is how "Empty the trash" once died with nobody watching.
+    let receivedAt: Date
+    let timeout: TimeInterval
 }
 
 struct LiveAction: Identifiable, Equatable {
@@ -74,6 +79,8 @@ struct CapabilityRow: Identifiable {
         case requestAccessibility
         case openAccessibility
         case testAutomation
+        case requestNotifications
+        case openNotificationSettings
         case installComponents
         case installWakeModels
         case installWhisper
@@ -134,6 +141,13 @@ final class AppModel: ObservableObject {
     @Published private(set) var liveActions: [LiveAction] = []
     @Published private(set) var logLines: [String] = []
     @Published private(set) var proposal: Proposal?
+    /// Whether macOS will actually show Aura's notifications — read live, and
+    /// surfaced in Setup, because a denied grant turns every proposal alert
+    /// into silence (and an ad-hoc rebuild can orphan the grant unnoticed).
+    @Published private(set) var notificationsAllowed: Bool?
+    /// Proposals already delivered as a notification, so re-delivery (panel
+    /// closing again, re-opening, …) never double-banners the same question.
+    private var notifiedProposalTokens: Set<String> = []
     @Published var toast: Toast?
     @Published var isInstalling = false
     @Published private(set) var lastError: String?
@@ -171,6 +185,7 @@ final class AppModel: ObservableObject {
         watchAccessibility()
         supervisor.start()
         Task { await refreshAll() }
+        Task { await refreshNotificationStatus() }
     }
 
     func shutdown() {
@@ -291,6 +306,7 @@ final class AppModel: ObservableObject {
                 self.phase = snapshot.state
                 if snapshot.state == "armed" {
                     self.proposal = nil
+                    self.notifiedProposalTokens.removeAll()
                     self.recoverMissingReply()
                     return
                 }
@@ -326,6 +342,7 @@ final class AppModel: ObservableObject {
                         recoverMissingReply()
                     }
                     proposal = nil
+                    notifiedProposalTokens.removeAll()
                     Notify.clearProposals()
                     Task { await refreshAfterSession() }
                 }
@@ -351,24 +368,16 @@ final class AppModel: ObservableObject {
                                reasons: (value["reasons"]?.arrayValue ?? [])
                                    .compactMap { $0.stringValue })
             }
-            proposal = Proposal(id: token,
-                                reply: event.data["reply"]?.stringValue ?? "",
-                                actions: proposalActions)
+            let pending = Proposal(id: token,
+                                   reply: event.data["reply"]?.stringValue ?? "",
+                                   actions: proposalActions,
+                                   receivedAt: Date(),
+                                   timeout: confirmationTimeout)
+            proposal = pending
             if let reply = event.data["reply"]?.stringValue, !reply.isEmpty {
                 appendSystem("Plan ready — \(reply)")
             }
-            // The card only exists inside the popover — one click elsewhere
-            // and a transient popover is gone. If the user can't see the
-            // panel, the question must reach them as a system notification,
-            // or the ask is indistinguishable from nothing happening.
-            if !token.isEmpty && !Notify.panelIsVisible() {
-                let titles = proposalActions.map { $0.title }.joined(separator: ", ")
-                let detail = event.data["reply"]?.stringValue ?? ""
-                Notify.proposal(
-                    title: "Aura needs your OK" + (titles.isEmpty ? "" : ": \(titles)"),
-                    body: detail.isEmpty ? "Open Aura to review the plan." : detail,
-                    token: token)
-            }
+            deliverProposalQuestion(pending)
 
         case "action_started":
             if let session = event.session { activeSessionID = session }
@@ -654,6 +663,7 @@ final class AppModel: ObservableObject {
     func confirmProposal(token: String) {
         guard !token.isEmpty else { return }
         proposal = nil
+        notifiedProposalTokens.removeAll()
         Notify.clearProposals()
         Task {
             do {
@@ -673,6 +683,7 @@ final class AppModel: ObservableObject {
     func cancelProposal(token: String) {
         guard !token.isEmpty else { return }
         proposal = nil
+        notifiedProposalTokens.removeAll()
         Notify.clearProposals()
         Task {
             do {
@@ -683,6 +694,61 @@ final class AppModel: ObservableObject {
                 toast(error.localizedDescription, kind: .failure)
             }
         }
+    }
+
+    // MARK: - a pending question always reaches the user
+
+    /// The engine's answer window for a proposal — the card counts down with
+    /// it. The fallback matches config.default.toml when the config hasn't
+    /// loaded yet.
+    var confirmationTimeout: TimeInterval {
+        config?.liveValue("session", "confirmation_timeout_seconds")?.doubleValue ?? 45
+    }
+
+    /// Deliver a pending question that the user cannot currently see.
+    ///
+    /// The confirmation card lives only inside the popover — one click
+    /// elsewhere and a transient popover is gone, while the engine keeps
+    /// waiting 45 s for an answer nobody can give any more. That silence is
+    /// the bug this closes, so the question travels:
+    ///   * panel visible → the card is on screen; nothing to do;
+    ///   * panel hidden  → a system notification with Run / Cancel buttons
+    ///                     (once per proposal — no re-bannering);
+    ///   * notifications unavailable (denied — an ad-hoc rebuild orphans the
+    ///     grant silently) → Aura presents its own panel instead.
+    /// Every proposal now has a route to the user's eyes.
+    func deliverProposalQuestion(_ pending: Proposal) {
+        guard !pending.id.isEmpty, !Notify.panelIsVisible() else { return }
+        guard !notifiedProposalTokens.contains(pending.id) else { return }
+        notifiedProposalTokens.insert(pending.id)
+        let titles = pending.actions.map { $0.title }.joined(separator: ", ")
+        let title = "Aura needs your OK" + (titles.isEmpty ? "" : ": \(titles)")
+        let body = pending.reply.isEmpty ? "Open Aura to review the plan." : pending.reply
+        let token = pending.id
+        Task { @MainActor [weak self] in
+            if await Notify.ensureAuthorization() {
+                Notify.proposal(title: title, body: body, token: token)
+                self?.notificationsAllowed = true
+            } else {
+                self?.notificationsAllowed = false
+                self?.log.write("Aura.app: notifications are off — presenting the panel "
+                                + "so proposal \(token) is still seen")
+                NotificationCenter.default.post(name: .auraOpenPanel, object: nil)
+            }
+        }
+    }
+
+    /// The popover just closed on its own (transient — any click elsewhere).
+    /// A question still pending just lost its only visible home; deliver it.
+    func panelDidClose() {
+        guard let proposal else { return }
+        deliverProposalQuestion(proposal)
+    }
+
+    /// Read macOS's live notification answer — for the Setup panel and for
+    /// deciding whether a proposal alert can be trusted to show.
+    func refreshNotificationStatus() async {
+        notificationsAllowed = await Notify.refreshAuthorization()
     }
 
     private func handleUnauthorized() {
@@ -764,6 +830,7 @@ final class AppModel: ObservableObject {
         nativeAccessibilityGranted = Permissions.accessibilityGranted
         engineAccessibilityGranted = permissions?.accessibility
         engineAccessibilityDetail = permissions?.accessibilityDetail
+        notificationsAllowed = await Notify.refreshAuthorization()
         let snapshot = try? await client.state()
         if let snapshot { state = snapshot }
     }
@@ -771,6 +838,16 @@ final class AppModel: ObservableObject {
     private func refreshTraining() async {
         let snapshot = try? await client.training()
         if let snapshot { training = snapshot.active ? snapshot : nil }
+    }
+
+    /// A light re-read of the engine's live state — the Wake Phrase panel
+    /// polls this while it is open so the listening meter stays honest.
+    /// Touches `state` only: `phase` belongs to the SSE stream and the
+    /// session code, and a poll must never fight them.
+    func refreshState() async {
+        if let snapshot = try? await client.state(timeout: 2) {
+            state = snapshot
+        }
     }
 
     // MARK: - settings
@@ -910,6 +987,30 @@ final class AppModel: ObservableObject {
             if let answer = answer, answer.ok == false {
                 toast(answer.message ?? "Couldn't open settings.", kind: .warning)
             }
+        }
+    }
+
+    /// Notifications are the app's own permission — no engine round trip.
+    /// macOS shows its prompt exactly once; after a "no" the only road back
+    /// is System Settings, so a refused request opens the exact pane.
+    func requestNotifications() {
+        Task { @MainActor in
+            let allowed = await Notify.ensureAuthorization()
+            notificationsAllowed = allowed
+            if allowed {
+                toast("Aura can now alert you when the panel is closed.", kind: .success)
+            } else {
+                openNotificationSettings()
+                toast("Turn Aura on in the Notifications pane that just opened.",
+                      kind: .warning)
+            }
+        }
+    }
+
+    func openNotificationSettings() {
+        let urlString = "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+        if let url = URL(string: urlString) {
+            NSWorkspace.shared.open(url)
         }
     }
 
@@ -1314,6 +1415,16 @@ final class AppModel: ObservableObject {
                 state: automationTestSucceeded,
                 action: .testAutomation,
                 actionTitle: automationTestSucceeded == true ? "Run again" : "Run a test"),
+            CapabilityRow(
+                id: "notifications", title: "Notifications",
+                detail: notificationsAllowed == true
+                    ? "Confirmations reach you even when Aura's panel is closed — with Run and Cancel buttons."
+                    : "Without notifications, a confirmation asked while the panel is closed has nowhere to go. Aura will pop its panel open instead — but alerts are the reliable route.",
+                state: notificationsAllowed,
+                action: notificationsAllowed == true
+                    ? .openNotificationSettings : .requestNotifications,
+                actionTitle: notificationsAllowed == true
+                    ? "Open System Settings" : "Allow notifications"),
             CapabilityRow(
                 id: "whisper", title: "Speech-to-text",
                 detail: whisper == true

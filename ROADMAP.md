@@ -4,8 +4,53 @@ Ship order matters: each stage is usable on its own, and every stage widens
 the moat (offline + personal + fast) before Apple's Siri V2 closes the
 mainstream gap.
 
-**Current release: v0.7.1 — the keyboardless Laya navigator, made reliable**
-(see below).
+**Current release: v0.7.2 — always-listening actually listens, and a pending
+question can no longer die unseen** (see below).
+
+## v0.7.2 — "I said it and nothing happened" ✅
+Field report: a trained wake phrase with Always listening on never activated
+Aura (the log showed the detector never fired once), and an "empty the trash"
+confirmation expired after 45 s with no notification ever reaching the user —
+even though "every access has been given". Both traced to real defects:
+
+- [x] The trained phrase can now wake Aura: `train_wake` calibrated its
+      threshold on embeddings of whole ~2 s studio takes while the live
+      detector scores 1 s windows — the stored number lived in a score space
+      the microphone never reaches (measured: live renditions fell below it
+      6 times out of 8 in a realistic room). The trainer now simulates the
+      detector's own window grid over every take and calibrates there, with
+      a sensitivity bias the spoken-phrase gate makes safe
+- [x] Detection itself got honest coverage: a second scoring window 384 ms
+      behind the trailing one (phrases up to ~1.4 s were never fully inside
+      any scored window), a 128 ms cadence, and a bounded rolling buffer —
+      the old one grew ~2 MB per minute forever
+- [x] Templates carry a calibration version: v1 files still load but the
+      engine flags them and the Wake Phrase panel recommends retraining,
+      instead of silently never waking
+- [x] "Did Aura hear me?" is answerable: the detector publishes a live
+      listening level beside its threshold (`wake_level` in `/api/state`),
+      rendered as a meter in the Wake Phrase panel; wake fires, phrase-gate
+      rejections and always-listening fallbacks now reach the file log, not
+      just the Activity feed
+- [x] A pending confirmation always reaches the user: the proposal card
+      counts down the engine's answer window; when the transient popover
+      closes with a question still pending, the notification is delivered at
+      that moment (not only at arrival, which is how it was missed before);
+      and when macOS won't show notifications at all, Aura presents its own
+      panel instead of asking into the void
+- [x] Notification permission is a first-class capability: read live from
+      `UNUserNotificationCenter`, surfaced in Setup with a deep link into
+      System Settings › Notifications — an ad-hoc rebuild orphans this grant
+      exactly like Accessibility, and it can never hide behind "best effort"
+      again
+- [x] Cold starts stopped eating the first request: whisper.cpp gets a 15 s
+      deadline instead of 4 s (a cold model load once transcribed as "" =
+      "I didn't catch that"), the STT and the pyobjc Accessibility bridge
+      pre-warm at startup, and one wedged skill now fails as itself
+      ("ax.read_screen didn't finish…") under a per-skill deadline instead
+      of taking the whole session down on the watchdog's generic timeout
+- [x] A Mac waking from sleep no longer blurts an hour-old sentence: queued
+      speech goes stale after 20 s and is dropped, logged
 
 ## v0.7.1 — It must not only work, it must be seen working ✅
 Field report: "open youtube.com in safari" did nothing, "empty the trash"
