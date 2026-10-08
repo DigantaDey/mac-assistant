@@ -88,9 +88,12 @@ def step_wake(orch) -> StepResult:
         if getattr(orch.cfg.wake, "mode", "manual") == "openwakeword":
             try:
                 orch._wake = orch._build_wake()
-                result.detail += " Always-listening is now active."
-            except Exception:
-                pass
+                status = orch.wake_status()
+                result.detail += (" Always-listening is now active."
+                                  if status["active"]
+                                  else f" Listener not active: {status['detail']}")
+            except Exception as exc:
+                result.detail += f" Listener rebuild failed: {exc}"
     except Exception as exc:
         result = StepResult("wake", title, "fail",
                             f"Download didn't take ({exc.__class__.__name__}). "

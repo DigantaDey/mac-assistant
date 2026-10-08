@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
 import pytest
@@ -138,6 +139,43 @@ async def test_open_youtube_uses_the_instant_browser_path(stack: DemoStack):
     assert orch.state == "armed"
     assert ("open", "https://www.youtube.com") in orch.bridge.calls
     assert not any(kind == "osascript" for kind, _ in orch.bridge.calls)
+
+
+async def test_reply_and_ready_are_not_blocked_by_activity_disk_write(stack: DemoStack):
+    """A completed action should be done in the UI before SQLite finishes."""
+    orch = stack.build_orchestrator()
+    await orch.start()
+    sid = orch.bus.subscribe_async()
+    original_record = orch.memory.record_event
+    write_started = threading.Event()
+    allow_write = threading.Event()
+
+    def slow_record(*args, **kwargs):
+        write_started.set()
+        if not allow_write.wait(timeout=2):
+            raise TimeoutError("test did not release the history write")
+        return original_record(*args, **kwargs)
+
+    orch.memory.record_event = slow_record
+    task = asyncio.create_task(orch.submit_text("set volume to 30"))
+    try:
+        assert await asyncio.to_thread(write_started.wait, 1)
+        assert orch.state == "armed"
+        before_disk = orch.bus.drain(sid)
+        assert any(event.type == "reply" for event in before_disk)
+        assert any(event.type == "state" and event.data.get("state") == "armed"
+                   for event in before_disk)
+
+        allow_write.set()
+        await asyncio.wait_for(task, 1)
+        assert any(event.type == "history_updated" for event in orch.bus.drain(sid))
+    finally:
+        allow_write.set()
+        orch.memory.record_event = original_record
+        if not task.done():
+            await task
+        orch.bus.unsubscribe_async(sid)
+        await orch.stop()
 
 
 async def test_cancelled_session_still_returns_to_armed(stack: DemoStack):

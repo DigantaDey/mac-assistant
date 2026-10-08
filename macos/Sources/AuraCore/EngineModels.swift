@@ -26,6 +26,10 @@ public struct EngineState: Decodable, Sendable {
     public let bridge: String?
     public let wakeMode: String?
     public let wakePhrase: String?
+    public let wakeEngine: String?
+    public let wakeActive: Bool?
+    public let wakeError: String?
+    public let wakeDetail: String?
     public let ttsEnabled: Bool?
     public let askBeforeRun: Bool?
     public let dataDir: String?
@@ -58,6 +62,10 @@ public struct EngineState: Decodable, Sendable {
         case state, version, profile, bridge, planner, session, auth
         case wakeMode = "wake_mode"
         case wakePhrase = "wake_phrase"
+        case wakeEngine = "wake_engine"
+        case wakeActive = "wake_active"
+        case wakeError = "wake_error"
+        case wakeDetail = "wake_detail"
         case ttsEnabled = "tts_enabled"
         case askBeforeRun = "ask_before_run"
         case dataDir = "data_dir"
@@ -242,6 +250,9 @@ public struct EngineMetrics: Decodable, Sendable {
     public let state: String?
     public let wakeMode: String?
     public let wakeEngine: String?
+    public let wakeActive: Bool?
+    public let wakeError: String?
+    public let wakeDetail: String?
     public let sttEngine: String?
     public let examples: Examples?
 
@@ -257,6 +268,9 @@ public struct EngineMetrics: Decodable, Sendable {
         case rssMB = "rss_mb"
         case wakeMode = "wake_mode"
         case wakeEngine = "wake_engine"
+        case wakeActive = "wake_active"
+        case wakeError = "wake_error"
+        case wakeDetail = "wake_detail"
         case sttEngine = "stt_engine"
     }
 }

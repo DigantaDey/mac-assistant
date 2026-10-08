@@ -12,6 +12,7 @@ import itertools
 import queue
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -43,6 +44,9 @@ class EventBus:
         self._history_max = history
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
+        # A new engine process starts a new sequence. The SSE epoch lets a
+        # reconnecting native client distinguish that from an old cursor.
+        self.epoch = uuid.uuid4().hex
 
     def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """The loop that owns the async subscriber queues. `publish()` may be
@@ -55,49 +59,77 @@ class EventBus:
     def subscribe_async(self) -> int:
         q: asyncio.Queue[Event] = asyncio.Queue(maxsize=256)
         sid = next(self._ids)
-        self._async_subs[sid] = q
+        with self._lock:
+            self._async_subs[sid] = q
         return sid
 
     def unsubscribe_async(self, sid: int) -> None:
-        self._async_subs.pop(sid, None)
+        with self._lock:
+            self._async_subs.pop(sid, None)
 
     def subscribe_queue(self) -> tuple[int, queue.SimpleQueue[Event]]:
         q: queue.SimpleQueue[Event] = queue.SimpleQueue()
         sid = next(self._ids)
-        self._queue_subs[sid] = q
+        with self._lock:
+            self._queue_subs[sid] = q
         return sid, q
 
+    def subscribe_queue_after(
+        self, after_seq: int,
+    ) -> tuple[int, queue.SimpleQueue[Event], list[Event]]:
+        """Subscribe atomically and return events newer than ``after_seq``.
+
+        Registering the live queue and taking the backlog under the same lock
+        closes the replay/live race: each event is delivered once, either in
+        the backlog or in the queue, never lost between the two.
+        """
+        q: queue.SimpleQueue[Event] = queue.SimpleQueue()
+        sid = next(self._ids)
+        with self._lock:
+            backlog = [event for event in self._history if event.seq > after_seq]
+            self._queue_subs[sid] = q
+        return sid, q, backlog
+
     def unsubscribe_queue(self, sid: int) -> None:
-        self._queue_subs.pop(sid, None)
+        with self._lock:
+            self._queue_subs.pop(sid, None)
 
     # -- publishing ---------------------------------------------------------
 
     def publish(self, type_: str, **data: Any) -> Event:
-        ev = Event(type=type_, data=data, seq=next(self._seq))
+        try:
+            here = asyncio.get_running_loop()
+        except RuntimeError:
+            here = None
+
         with self._lock:
+            ev = Event(type=type_, data=data, seq=next(self._seq))
             self._history.append(ev)
             if len(self._history) > self._history_max:
                 del self._history[: len(self._history) - self._history_max]
             async_qs = list(self._async_subs.values())
             queue_qs = list(self._queue_subs.values())
 
-        def deliver_async() -> None:
-            for q in async_qs:
-                try:
-                    q.put_nowait(ev)
-                except asyncio.QueueFull:  # slow subscriber must not stall the bus
-                    pass
+            # Preserve sequence order for SSE subscribers even when multiple
+            # worker threads publish concurrently.
+            for q in queue_qs:
+                q.put(ev)
 
-        try:
-            here = asyncio.get_running_loop()
-        except RuntimeError:
-            here = None
-        if self._loop is not None and here is not self._loop:
-            self._loop.call_soon_threadsafe(deliver_async)
-        else:
-            deliver_async()
-        for q in queue_qs:
-            q.put(ev)  # queue.SimpleQueue is thread-safe
+            def deliver_async() -> None:
+                for q in async_qs:
+                    try:
+                        q.put_nowait(ev)
+                    except asyncio.QueueFull:  # slow subscriber must not stall the bus
+                        pass
+
+            if self._loop is not None and here is not self._loop:
+                try:
+                    self._loop.call_soon_threadsafe(deliver_async)
+                except RuntimeError:  # loop closed during shutdown
+                    pass
+            else:
+                deliver_async()
+
         return ev
 
     # -- reading ------------------------------------------------------------
@@ -106,7 +138,8 @@ class EventBus:
         return await self._async_subs[sid].get()
 
     def recent(self, limit: int = 100) -> list[Event]:
-        return list(self._history[-limit:])
+        with self._lock:
+            return list(self._history[-limit:])
 
     def drain(self, sid: int) -> list[Event]:
         """Pop everything currently queued for an async subscriber."""

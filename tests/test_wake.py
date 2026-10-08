@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import time
+
 from conftest import DemoStack
 
 from aura.wakeword import phrase_gate, strip_phrase
@@ -50,24 +54,121 @@ class TestLiveWakeSwitch:
         stack.cfg.profile = "mac"          # not pinned to manual like demo
         return stack
 
-    async def test_switch_persists_and_rebuilds_engine(self, tmp_path, monkeypatch):
+    async def test_switch_refuses_to_claim_listening_without_a_live_detector(
+        self, tmp_path, monkeypatch,
+    ):
         stack = self.build_mac_stack(tmp_path, monkeypatch)
         orch = stack.build_orchestrator()
-        await orch.start()
+        orch._has_audio = True
+        orch._audio_task = asyncio.current_task()
 
+        from aura.wakeword import ManualTrigger
+
+        def fallback(_cfg, on_fallback=None):
+            if on_fallback:
+                on_fallback("test detector unavailable")
+            return ManualTrigger()
+
+        monkeypatch.setattr("aura.wakeword.build_wake_engine", fallback)
         result = await orch.set_wake_mode("openwakeword", phrase="hey aura")
-        await orch.stop()
+
+        assert result["ok"] is False
+        assert "couldn't start" in result["message"].lower()
+        assert stack.cfg.wake.mode == "manual"
+        assert orch.wake_status()["active"] is False
+
+    async def test_switch_refuses_when_audio_listener_is_not_running(
+        self, tmp_path, monkeypatch,
+    ):
+        stack = self.build_mac_stack(tmp_path, monkeypatch)
+        orch = stack.build_orchestrator()
+        orch._has_audio = True
+        result = await orch.set_wake_mode("openwakeword", phrase="hey aura")
+        assert result["ok"] is False
+        assert "listener is not running" in result["message"].lower()
+        assert stack.cfg.wake.mode == "manual"
+
+    async def test_switch_persists_only_after_a_real_detector_is_built(
+        self, tmp_path, monkeypatch,
+    ):
+        stack = self.build_mac_stack(tmp_path, monkeypatch)
+        orch = stack.build_orchestrator()
+        orch._has_audio = True
+        orch._audio_task = asyncio.current_task()
+
+        from aura.wakeword import WakeEngine
+
+        class FakeWake(WakeEngine):
+            pass
+
+        orch._build_wake = lambda: FakeWake()
+        result = await orch.set_wake_mode("openwakeword", phrase="hey aura")
 
         assert result["ok"] is True
         assert result["phrase"] == "hey aura"
-        # openwakeword isn't importable on CI → engine falls back, honestly
-        assert result["engine"] in ("OpenWakeWordEngine", "ManualTrigger")
-
-        # the choice survives a restart
+        assert result["wake_active"] is True
         from aura.config import load_config
         cfg = load_config()
         assert cfg.wake.mode == "openwakeword"
         assert cfg.wake.phrase == "hey aura"
+
+    async def test_wake_engine_frame_activates_capture(self, stack: DemoStack):
+        from aura.audio import AudioFrame
+        from aura.wakeword import WakeEngine
+
+        class OneShotWake(WakeEngine):
+            def feed(self, _frame):
+                return True
+
+        orch = stack.build_orchestrator()
+        orch.cfg.wake.mode = "openwakeword"
+        orch._wake = OneShotWake()
+        orch._has_audio = True
+        listener = asyncio.create_task(orch._audio_loop())
+        orch._audio_task = listener
+        try:
+            await orch._queue.put(AudioFrame(pcm=b"\0" * 640, ts=time.time()))
+            for _ in range(100):
+                if orch.state == "capturing":
+                    break
+                await asyncio.sleep(0.001)
+            assert orch.state == "capturing"
+            assert orch.wake_status()["active"] is True
+        finally:
+            listener.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await listener
+
+    async def test_detector_runtime_failure_degrades_without_killing_listener(
+        self, stack: DemoStack,
+    ):
+        from aura.audio import AudioFrame
+        from aura.wakeword import ManualTrigger, WakeEngine
+
+        class BrokenWake(WakeEngine):
+            def feed(self, _frame):
+                raise RuntimeError("inference crashed")
+
+        orch = stack.build_orchestrator()
+        orch.cfg.wake.mode = "openwakeword"
+        orch._wake = BrokenWake()
+        orch._has_audio = True
+        listener = asyncio.create_task(orch._audio_loop())
+        orch._audio_task = listener
+        try:
+            await orch._queue.put(AudioFrame(pcm=b"\0" * 640, ts=time.time()))
+            for _ in range(100):
+                if isinstance(orch._wake, ManualTrigger):
+                    break
+                await asyncio.sleep(0.001)
+            assert isinstance(orch._wake, ManualTrigger)
+            assert listener.done() is False
+            assert orch.wake_status()["active"] is False
+            assert "inference crashed" in orch.wake_status()["detail"]
+        finally:
+            listener.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await listener
 
     async def test_unknown_mode_refused(self, tmp_path, monkeypatch):
         stack = self.build_mac_stack(tmp_path, monkeypatch)

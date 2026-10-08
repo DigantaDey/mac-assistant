@@ -78,6 +78,10 @@ struct SettingsView: View {
             if let requested = Section.from(value) { section = requested }
             model.requestedSection = nil
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            guard section == .permissions else { return }
+            Task { await model.refreshPermissions() }
+        }
         .overlay(alignment: .bottom) {
             if let toast = model.toast {
                 ToastView(toast: toast)
@@ -455,9 +459,9 @@ private struct PermissionsSection: View {
             SectionTitle(text: "The honest state", subtitle: "Read straight off your Mac, not guessed.")
             InfoRow(label: "Profile", value: model.permissions?.resolvedProfile ?? model.config?.resolvedProfile ?? "—")
             InfoRow(label: "Accessibility",
-                    value: model.permissions?.accessibility.map { $0 ? "Granted" : "Not granted" }
+                    value: model.accessibilityStatus.map { $0 ? "Granted" : "Not granted" }
                         ?? "Checking…",
-                    color: model.permissions?.accessibility.map { $0 ? Theme.ready : Theme.attention }
+                    color: model.accessibilityStatus.map { $0 ? Theme.ready : Theme.attention }
                         ?? Color.secondary)
             InfoRow(label: "Wake models",
                     value: model.permissions?.wakeModels?.ready == true ? "Ready" : "Missing",
@@ -504,7 +508,8 @@ private struct CapabilityRowView: View {
                 }
             }
             .auraButton()
-            .disabled(model.isInstalling
+            .disabled(row.action == .none
+                      || model.isInstalling
                       || (row.action == .testAutomation && model.isTestingAutomation))
         }
         .padding(.vertical, 2)
@@ -542,10 +547,45 @@ private struct WakeSection: View {
             .labelsHidden()
             .pickerStyle(.segmented)
             .onChange(of: mode) { value in model.setWakeMode(value) }
-            Text(mode == "manual"
-                 ? "Aura listens right after you tap the menu-bar icon or press the shortcut."
-                 : "Aura waits quietly for your phrase, on-device, in a few percent of one core.")
-                .font(.system(size: 11)).foregroundStyle(.secondary)
+            .disabled(model.isChangingWakeMode)
+
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: mode == "manual"
+                      ? "hand.tap.fill"
+                      : (model.state?.wakeActive == true ? "mic.fill" : "mic.slash.fill"))
+                    .font(.system(size: 12))
+                    .foregroundStyle(mode == "manual" ? Theme.busy
+                                     : (model.state?.wakeActive == true ? Theme.ready : Theme.attention))
+                    .padding(.top, 1)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(mode == "manual" ? "Tap to activate" :
+                         (model.state?.wakeActive == true ? "Always listening is active" :
+                          "Always listening is not active"))
+                        .font(.system(size: 12, weight: .semibold))
+                    Text(mode == "manual"
+                         ? "Aura starts listening when you tap the orb or press the shortcut."
+                         : (model.state?.wakeDetail ?? "Checking the microphone and wake model…"))
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if mode == "openwakeword" && model.state?.wakeActive != true {
+                HStack(spacing: 8) {
+                    if model.state?.micReady != true {
+                        Button("Allow microphone") { model.requestPermission("microphone") }
+                            .auraButton(prominent: true)
+                    }
+                    if model.permissions?.wakeModels?.ready != true {
+                        Button("Download wake models") { model.runSetupStep("wake") }
+                            .auraButton()
+                    }
+                    if model.state?.micReady == true && model.permissions?.wakeModels?.ready == true {
+                        Button("Try again") { model.setWakeMode("openwakeword") }
+                            .auraButton()
+                    }
+                }
+            }
         }
 
         Card {
@@ -617,7 +657,9 @@ private struct WakeSection: View {
                 }
             }
 
-            Text("A second check: while always-listening, commands must begin with this phrase.")
+            Text(model.state?.wakePhrase?.isEmpty == false
+                 ? "A second check: after the trained wake sound is detected, the transcript must begin with this phrase."
+                 : "Without a trained custom phrase, Aura listens for the phrase supported by the installed wake model shown above.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }

@@ -42,8 +42,11 @@ struct OnboardingView: View {
             refresh()
             Task { await model.refreshPermissions() }
         }
-        .onChange(of: model.permissions?.accessibility) { value in
+        .onChange(of: model.nativeAccessibilityGranted) { value in
             if let value { accessibilityGranted = value }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await model.refreshPermissions(); refresh() }
         }
         .overlay(alignment: .bottom) {
             if let toast = model.toast {
@@ -266,7 +269,7 @@ struct OnboardingView: View {
 
     private func refresh() {
         microphoneGranted = Permissions.microphoneStatus == .authorized
-        accessibilityGranted = model.permissions?.accessibility
+        accessibilityGranted = model.accessibilityStatus
             ?? Permissions.accessibilityGranted
     }
 }

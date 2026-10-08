@@ -56,7 +56,10 @@ public final class EngineClient: @unchecked Sendable {
         self.endpoint = endpoint
         let configuration = sessionConfiguration ?? URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = timeout
-        configuration.timeoutIntervalForResource = 60
+        // The event stream is intentionally long-lived. A 60-second resource
+        // cap silently reconnects it even though its request asks to live for
+        // an hour, replaying stale UI state on every reconnect.
+        configuration.timeoutIntervalForResource = 86_400
         configuration.httpMaximumConnectionsPerHost = 4
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         self.session = URLSession(configuration: configuration)
@@ -184,18 +187,29 @@ public final class EngineClient: @unchecked Sendable {
         AsyncStream { continuation in
             let task = Task { [weak self] in
                 var backoffSeconds: UInt64 = 1
+                var lastEventID = 0
+                var eventEpoch: String?
                 while !Task.isCancelled {
                     guard let self else { break }
                     do {
                         var request = URLRequest(url: self.endpoint.baseURL.appendingPathComponent("api/events"))
                         request.timeoutInterval = 3600
                         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                        if lastEventID > 0 || eventEpoch != nil {
+                            request.setValue(String(lastEventID), forHTTPHeaderField: "Last-Event-ID")
+                        }
+                        if let eventEpoch {
+                            request.setValue(eventEpoch, forHTTPHeaderField: "X-Aura-Event-Epoch")
+                        }
                         self.authorize(&request)
 
                         let (bytes, response) = try await self.session.bytes(for: request)
                         guard let http = response as? HTTPURLResponse else {
                             throw EngineError.malformed("no HTTP response on the event stream")
                         }
+                        let newEpoch = http.value(forHTTPHeaderField: "X-Aura-Event-Epoch") ?? ""
+                        if let eventEpoch, eventEpoch != newEpoch { lastEventID = 0 }
+                        eventEpoch = newEpoch
                         guard http.statusCode == 200 else {
                             throw http.statusCode == 401 ? EngineError.unauthorized
                                 : EngineError.http(http.statusCode, "event stream")
@@ -204,7 +218,13 @@ public final class EngineClient: @unchecked Sendable {
                         var parser = SSEParser()
                         for try await line in bytes.lines {
                             guard let message = parser.feed(line: line) else { continue }
-                            if let event = message.decode() { continuation.yield(event) }
+                            if let event = message.decode() {
+                                // Replay only after this cursor and discard any
+                                // duplicate that straddled a stream reconnect.
+                                guard event.seq > lastEventID else { continue }
+                                lastEventID = event.seq
+                                continuation.yield(event)
+                            }
                         }
                     } catch {
                         if Task.isCancelled { break }

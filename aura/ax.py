@@ -1,10 +1,10 @@
 """Accessibility (AX) — how Aura sees and acts inside *any* app, by label.
 
 macOS exposes a structured tree of every UI element: buttons, links, text
-fields, menus — each with a role, a label, a value, a position. Reading it is
-~50 ms (100× faster than screenshots) and it is *ground truth*: a label comes
-from the app itself, never from a model's imagination. This is the substrate
-that lets Aura click "Sign In" without a vision model guessing at pixels.
+fields, menus — each with a role, a label, and a value. When an app responds,
+this is *ground truth*: a label comes from the app itself, never from a model's
+imagination. This is the substrate that lets Aura click "Sign In" without a
+vision model guessing at pixels.
 
 Three implementations behind one interface:
 
@@ -19,7 +19,9 @@ aura/picker.py — coarse-to-fine, Laya-scored.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -31,6 +33,7 @@ class AXNode:
     size: tuple[int, int] | None = None
     actions: tuple[str, ...] = ()      # e.g. ("AXPress",)
     children: list[AXNode] = field(default_factory=list)
+    native_ref: Any = field(default=None, repr=False, compare=False)
 
     def flat(self) -> list[AXNode]:
         out: list[AXNode] = []
@@ -67,6 +70,8 @@ class MacAXTree:
 
     MAX_DEPTH = 12
     MAX_NODES = 400
+    TREE_BUDGET_SECONDS = 2.0
+    MESSAGING_TIMEOUT_SECONDS = 0.5
 
     def __init__(self, pid: int | None = None) -> None:
         try:
@@ -75,6 +80,7 @@ class MacAXTree:
         except Exception as exc:  # pragma: no cover - Mac only
             raise AXUnavailable(f"pyobjc unavailable: {exc}") from exc
         self._AS = AS
+        self._tree_deadline: float | None = None
         if pid is None:
             app = NSWorkspace.sharedWorkspace().frontmostApplication()
             if app is None:
@@ -82,10 +88,21 @@ class MacAXTree:
             self.app_name = app.localizedName()
             pid = app.processIdentifier()
         self._ref = AS.AXUIElementCreateApplication(pid)
+        # A busy or non-responsive app must not make "read my screen" wait on
+        # every AX attribute's multi-second default timeout.
+        set_timeout = getattr(AS, "AXUIElementSetMessagingTimeout", None)
+        if callable(set_timeout):
+            try:
+                set_timeout(self._ref, self.MESSAGING_TIMEOUT_SECONDS)
+            except Exception:
+                pass
 
     # -- attribute helpers ------------------------------------------------ #
 
     def _attr(self, ref, name: str):
+        if (self._tree_deadline is not None
+                and time.monotonic() >= self._tree_deadline):
+            return None
         AS = self._AS
         try:
             result = AS.AXUIElementCopyAttributeValue(ref, name, None)
@@ -110,10 +127,12 @@ class MacAXTree:
 
     def root(self) -> AXNode:
         count = 0
+        self._tree_deadline = time.monotonic() + self.TREE_BUDGET_SECONDS
 
         def convert(ref, depth: int) -> AXNode | None:
             nonlocal count
-            if depth > self.MAX_DEPTH or count >= self.MAX_NODES:
+            if (depth > self.MAX_DEPTH or count >= self.MAX_NODES
+                    or time.monotonic() >= self._tree_deadline):
                 return None
             count += 1
             role = str(self._attr(ref, "AXRole") or "unknown").removeprefix("AX").lower()
@@ -124,19 +143,11 @@ class MacAXTree:
             value_str = str(value).strip() if isinstance(value, str) else ""
             if not label and value_str and role in ("textfield", "searchfield", "textarea"):
                 label = value_str
-            position = size = None
-            try:
-                pos = self._attr(ref, "AXPosition")
-                siz = self._attr(ref, "AXSize")
-                if pos and siz:
-                    position = (tuple(pos) if not hasattr(pos, "x")
-                                else (int(pos.x), int(pos.y)))
-                    size = (tuple(siz) if not hasattr(siz, "x")
-                            else (int(siz.width), int(siz.height)))
-            except Exception:
-                pass
+            # Actions and geometry are fetched only if this specific node is
+            # activated. Avoiding four remote AX calls per node materially
+            # reduces screen-read latency on large or slow app trees.
             node = AXNode(role=role, label=label[:120], value=value_str[:200],
-                          position=position, size=size, actions=self._actions(ref))
+                          native_ref=ref)
             children = self._attr(ref, "AXChildren")
             if children:
                 for child in children:
@@ -145,7 +156,10 @@ class MacAXTree:
                         node.children.append(sub)
             return node
 
-        return convert(self._ref, 0) or AXNode(role="unknown")
+        try:
+            return convert(self._ref, 0) or AXNode(role="unknown")
+        finally:
+            self._tree_deadline = None
 
     def front_app_name(self) -> str:
         return getattr(self, "app_name", "Unknown")
@@ -156,8 +170,8 @@ class MacAXTree:
         """Press a button-like element: AXPress when available, else a synthetic
         click at its center (CGEvent). Returns success."""
         AS = self._AS
-        # The clean path is AXPress on the live element ref; we resolve the ref
-        # again by walking to the same path in the real tree.
+        # Nodes retain their live AXUIElement, so activation doesn't rebuild
+        # and rescan the entire frontmost-app tree.
         ref = self._find_ref(node)
         if ref is not None and "AXPress" in self._actions(ref):
             try:
@@ -165,13 +179,16 @@ class MacAXTree:
                 return err == 0 or err is None
             except Exception:
                 pass
-        center = node.center()
+        center = node.center() or (self._element_center(ref) if ref is not None else None)
         if center is None:
             return False
         return self._click_at(center)
 
     def _find_ref(self, node: AXNode):
-        """Re-locate a node's live ref by role+label path (position-stable)."""
+        """Return the live element retained while the tree was read."""
+        if node.native_ref is not None:
+            return node.native_ref
+        # Compatibility for nodes constructed by older integrations.
         target_path = _path_of(self.root(), node)
         if not target_path:
             return None
@@ -183,6 +200,21 @@ class MacAXTree:
             except Exception:
                 return None
         return ref
+
+    def _element_center(self, ref) -> tuple[int, int] | None:
+        try:
+            pos = self._attr(ref, "AXPosition")
+            size = self._attr(ref, "AXSize")
+            if not pos or not size:
+                return None
+            position = ((int(pos.x), int(pos.y)) if hasattr(pos, "x")
+                        else tuple(int(value) for value in pos))
+            dimensions = ((int(size.width), int(size.height)) if hasattr(size, "width")
+                          else tuple(int(value) for value in size))
+            return (position[0] + dimensions[0] // 2,
+                    position[1] + dimensions[1] // 2)
+        except Exception:
+            return None
 
     def _click_at(self, point: tuple[int, int]) -> bool:
         try:
