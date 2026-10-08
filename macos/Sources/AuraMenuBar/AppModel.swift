@@ -178,7 +178,7 @@ final class AppModel: ObservableObject {
         accessibilityWatchTask?.cancel()
         accessibilityWatchTask = nil
         if let accessibilityObserver {
-            NSDistributedNotificationCenter.default().removeObserver(accessibilityObserver)
+            DistributedNotificationCenter.default().removeObserver(accessibilityObserver)
         }
         accessibilityObserver = nil
         supervisor.stop()
@@ -198,25 +198,29 @@ final class AppModel: ObservableObject {
     private func watchAccessibility() {
         accessibilityWatchTask?.cancel()
         if accessibilityObserver == nil {
-            accessibilityObserver = NSDistributedNotificationCenter.default()
-                .addObserver(forName: NSNotification.Name("com.apple.accessibility.api"),
-                               object: nil, queue: .main) { [weak self] _ in
+            accessibilityObserver = DistributedNotificationCenter.default()
+                .addObserver(forName: Notification.Name("com.apple.accessibility.api"),
+                             object: nil, queue: .main) { [weak self] _ in
+                    // Bind to a constant first: a weak `self` is a captured
+                    // *var*, which concurrently-executing code may not touch.
+                    guard let model = self else { return }
                     Task { @MainActor in
                         // Give tccd a moment to commit before reading.
                         try? await Task.sleep(nanoseconds: 400_000_000)
-                        await self?.recheckAccessibility()
+                        await model.recheckAccessibility()
                     }
                 }
         }
         accessibilityWatchTask = Task { [weak self] in
+            guard let self else { return }
             // This Task inherits the main actor from watchAccessibility(), so
             // the published state below is read where it is written.
             while !Task.isCancelled {
-                let granted = self?.nativeAccessibilityGranted ?? false
+                let granted = self.nativeAccessibilityGranted ?? false
                 let nap: UInt64 = granted ? 5_000_000_000 : 1_000_000_000
                 do { try await Task.sleep(nanoseconds: nap) } catch { return }
                 guard !Task.isCancelled else { return }
-                await self?.recheckAccessibility()
+                await self.recheckAccessibility()
             }
         }
     }
