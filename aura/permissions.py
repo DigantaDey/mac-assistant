@@ -3,7 +3,8 @@
 Philosophy: macOS already has the perfect consent system (TCC). Aura doesn't
 work around it; it *guides the user through it*. Every check here is honest:
 
-  accessibility  AXIsProcessTrusted() — the real API, no guessing
+  accessibility  AXIsProcessTrusted() — the real API, read from a short-lived
+                 child so a grant made while Aura runs is seen immediately
   microphone     whether Aura's own audio bridge opened the mic
   automation     a harmless AppleEvent actually sent; result observed
   whisper/laya   local readiness checks (binaries + checkpoint load)
@@ -15,7 +16,9 @@ wizard can show itself anywhere without lying about anything.
 from __future__ import annotations
 
 import ctypes
+import os
 import platform
+import re
 import subprocess
 import sys
 from typing import Any
@@ -34,8 +37,6 @@ def is_mac() -> bool:
 
 
 def _load_application_services() -> Any:
-    import ctypes
-
     return ctypes.cdll.LoadLibrary(
         "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
     )
@@ -79,25 +80,126 @@ def _fresh_accessibility_check(timeout: float = 2.0) -> bool | None:
     return None
 
 
-def check_accessibility() -> bool | None:
-    """True when Aura's responsible process may use Accessibility.
-
-    AXIsProcessTrusted can keep a denied answer cached after the user enables
-    Aura in System Settings. Check in a short-lived child first so the visible
-    state refreshes without restarting Aura; fall back to this process only if
-    launching that probe is unavailable.
-    """
-    if not is_mac():
-        return None
+def _read_accessibility() -> bool | None:
+    """Ask macOS, without trusting a cached answer from this process."""
     fresh = _fresh_accessibility_check()
     if fresh is not None:
         return fresh
+    # Last resort. This does poison this process's own HIServices cache, which
+    # is why it is a fallback rather than the first move: a short-lived child
+    # has nothing cached and can therefore see a grant made mid-session.
     try:
         lib = _load_application_services()
         lib.AXIsProcessTrusted.restype = ctypes.c_bool
         return bool(lib.AXIsProcessTrusted())
     except Exception:
         return None
+
+
+def check_accessibility() -> bool | None:
+    """True when the process that drives your apps may use Accessibility.
+
+    `AXIsProcessTrusted` is answered from a per-process cache that a
+    long-lived engine fills once and keeps, so a grant made in System Settings
+    while Aura runs stays invisible to it. Reading from a short-lived child
+    gets the live answer, which is what lets the Setup panel acknowledge a
+    grant the moment the user makes it — no restart, no "check again".
+
+    Deliberately not memoised: a permission panel showing a state the user has
+    already changed is worse than one extra process spawn.
+    """
+    if not is_mac():
+        return None
+    return _read_accessibility()
+
+
+# --------------------------------------------------------------------------- #
+# Which app actually holds the grant — and the words to say about it          #
+# --------------------------------------------------------------------------- #
+
+
+def _process_path(pid: int) -> str:
+    try:
+        proc = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _parent_pid(pid: int) -> int:
+    try:
+        proc = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    try:
+        return int((proc.stdout or "").strip() or 0)
+    except ValueError:
+        return 0
+
+
+_identity_cache: str | None = None
+_identity_resolved = False
+
+
+def accessibility_identity() -> str | None:
+    """The app macOS lists beside the Accessibility switch for this engine.
+
+    TCC attributes Accessibility to the app that owns the process, so an
+    engine started from a terminal is granted as *that terminal*, not as Aura.
+    Naming it is the difference between "not granted" and an instruction the
+    user can actually follow.
+
+    Memoised because walking the parent chain costs a `ps` per hop and the
+    answer cannot change: a process's ancestry is fixed for its lifetime.
+    """
+    global _identity_cache, _identity_resolved
+    if _identity_resolved:
+        return _identity_cache
+    _identity_cache = _resolve_identity()
+    _identity_resolved = True
+    return _identity_cache
+
+
+def _resolve_identity() -> str | None:
+    if not is_mac():
+        return None
+    pid = os.getpid()
+    seen: set[int] = set()
+    for _ in range(8):
+        pid = _parent_pid(pid)
+        if pid <= 1 or pid in seen:
+            return None
+        seen.add(pid)
+        match = re.search(r"/([^/]+)\.app/", _process_path(pid))
+        if match:
+            return match.group(1)
+    return None
+
+
+def accessibility_detail(granted: bool | None = None) -> str:
+    """One honest sentence about the Accessibility state, for the UI and log.
+
+    `granted` lets a caller that has already read the state describe it without
+    paying for a second probe.
+    """
+    if granted is None:
+        granted = check_accessibility()
+    if granted is None:
+        return "Accessibility can't be checked on this platform."
+    identity = accessibility_identity()
+    who = identity or "the app running Aura's engine"
+    if granted:
+        return f"Granted to {who} — Aura can act inside your apps."
+    detail = f"macOS hasn't granted Accessibility to {who} yet."
+    if identity and identity != "Aura":
+        detail += (f" The engine was started from {identity}, so macOS files the "
+                   f"grant under {identity} — launch Aura.app instead, or enable "
+                   f"{identity} in the Accessibility list.")
+    else:
+        detail += " Switch Aura on under System Settings › Privacy & Security › Accessibility."
+    return detail
 
 
 def request_accessibility() -> tuple[str, str]:
@@ -111,11 +213,8 @@ def request_accessibility() -> tuple[str, str]:
     """
     if not is_mac():
         return "unavailable", "Accessibility exists only on macOS"
-    if check_accessibility():
-        return "ok", "Accessibility is granted — Aura can act inside your apps."
-    return "asked", (
-        "Allow Aura in System Settings › Privacy & Security › Accessibility, "
-        "then return to Aura and choose Check again.")
+    granted = check_accessibility()
+    return ("ok" if granted else "asked"), accessibility_detail(granted)
 
 
 def check_microphone(orch: Any) -> bool | None:

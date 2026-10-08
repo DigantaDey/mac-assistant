@@ -81,6 +81,10 @@ public struct PermissionsSnapshot: Decodable, Sendable {
     public let bridge: String?
     public let microphone: Bool?
     public let accessibility: Bool?
+    /// The engine's own words about the Accessibility state — including which
+    /// app macOS actually filed the grant under.
+    public let accessibilityDetail: String?
+    public let accessibilityIdentity: String?
     public let whisperCpp: Bool?
     public let plannerServer: Bool?
     public let plannerEngine: String?
@@ -95,6 +99,8 @@ public struct PermissionsSnapshot: Decodable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case platform, profile, bridge, microphone, accessibility, model
         case resolvedProfile = "resolved_profile"
+        case accessibilityDetail = "accessibility_detail"
+        case accessibilityIdentity = "accessibility_identity"
         case whisperCpp = "whisper_cpp"
         case plannerServer = "planner_server"
         case plannerEngine = "planner_engine"

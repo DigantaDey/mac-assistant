@@ -112,6 +112,11 @@ final class AppModel: ObservableObject {
     /// Read in Aura.app itself: a child Python probe can disagree with the
     /// TCC identity that owns the native Accessibility grant.
     @Published private(set) var nativeAccessibilityGranted: Bool?
+    /// The engine's own live reading. The engine is the process that actually
+    /// drives your apps, so when it can answer, it is the authority on whether
+    /// Aura can act — and it names the app macOS filed the grant under.
+    @Published private(set) var engineAccessibilityGranted: Bool?
+    @Published private(set) var engineAccessibilityDetail: String?
     @Published private(set) var automationTestMessage: String?
     @Published private(set) var automationTestSucceeded: Bool?
     @Published private(set) var config: EngineConfig?
@@ -143,6 +148,8 @@ final class AppModel: ObservableObject {
     private var activePlanReply: String?
     private var automationProbeID: UUID?
     private var automationTimeoutTask: Task<Void, Never>?
+    private var accessibilityWatchTask: Task<Void, Never>?
+    private var accessibilityObserver: NSObjectProtocol?
 
     init(token: String) {
         let endpoint = EngineEndpoint(host: "127.0.0.1", port: Prefs.port, token: token)
@@ -161,13 +168,73 @@ final class AppModel: ObservableObject {
         log.write("Aura.app: starting (v\(AuraVersion.semantic), port \(Prefs.port))")
         nativeAccessibilityGranted = Permissions.accessibilityGranted
         subscribeToEvents()
+        watchAccessibility()
         supervisor.start()
         Task { await refreshAll() }
     }
 
     func shutdown() {
         eventTask?.cancel()
+        accessibilityWatchTask?.cancel()
+        accessibilityWatchTask = nil
+        if let accessibilityObserver {
+            NSDistributedNotificationCenter.default().removeObserver(accessibilityObserver)
+        }
+        accessibilityObserver = nil
         supervisor.stop()
+    }
+
+    // MARK: - noticing an Accessibility grant on its own
+
+    /// Keep watching until the user's switch is reflected here — no "Check
+    /// again" button, no restart, no stale "not granted" beside a grant the
+    /// user can see in System Settings.
+    ///
+    /// Two triggers, because neither alone is reliable: macOS posts
+    /// `com.apple.accessibility.api` when the setting changes (but can post it
+    /// before tccd commits), and a slow poll catches the commit itself. The
+    /// poll backs off once Aura is trusted — there is nothing left to wait for,
+    /// but a revocation should still be noticed.
+    private func watchAccessibility() {
+        accessibilityWatchTask?.cancel()
+        if accessibilityObserver == nil {
+            accessibilityObserver = NSDistributedNotificationCenter.default()
+                .addObserver(forName: NSNotification.Name("com.apple.accessibility.api"),
+                               object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor in
+                        // Give tccd a moment to commit before reading.
+                        try? await Task.sleep(nanoseconds: 400_000_000)
+                        await self?.recheckAccessibility()
+                    }
+                }
+        }
+        accessibilityWatchTask = Task { [weak self] in
+            // This Task inherits the main actor from watchAccessibility(), so
+            // the published state below is read where it is written.
+            while !Task.isCancelled {
+                let granted = self?.nativeAccessibilityGranted ?? false
+                let nap: UInt64 = granted ? 5_000_000_000 : 1_000_000_000
+                do { try await Task.sleep(nanoseconds: nap) } catch { return }
+                guard !Task.isCancelled else { return }
+                await self?.recheckAccessibility()
+            }
+        }
+    }
+
+    /// Re-read the native grant and, when it changed, say so and re-sync.
+    private func recheckAccessibility() async {
+        let live = Permissions.accessibilityGranted
+        guard live != nativeAccessibilityGranted else { return }
+        let wasGranted = nativeAccessibilityGranted
+        nativeAccessibilityGranted = live
+        log.write("Aura.app: accessibility \(live ? "granted" : "no longer granted")")
+        if live {
+            toast("Accessibility granted — Aura can act inside your apps.", kind: .success)
+            appendSystem("Accessibility granted.")
+        } else if wasGranted == true {
+            toast("macOS no longer reports Accessibility for Aura.", kind: .warning)
+        }
+        await refreshPermissions()
     }
 
     private func engineStatusChanged(_ status: EngineSupervisor.Status) {
@@ -403,6 +470,25 @@ final class AppModel: ObservableObject {
                 let snapshot = try? await client.state()
                 if let snapshot { state = snapshot }
             }
+
+        case "accessibility":
+            // The engine polls its own live grant and speaks up when it
+            // changes. This is the answer that matters for whether Aura can
+            // actually act, and it arrives without the user asking.
+            let granted = event.data["granted"]?.boolValue
+            engineAccessibilityDetail = event.data["detail"]?.stringValue
+            let alreadyKnown = engineAccessibilityGranted == granted
+            engineAccessibilityGranted = granted
+            guard !alreadyKnown else { return }
+            if let detail = event.data["detail"]?.stringValue, !detail.isEmpty {
+                appendSystem(detail)
+            }
+            if granted == true, nativeAccessibilityGranted != true {
+                // The engine is trusted and Aura.app is not — worth knowing,
+                // because it means the grant belongs to another copy.
+                nativeAccessibilityGranted = Permissions.accessibilityGranted
+            }
+            Task { await refreshPermissions() }
 
         default:
             break
@@ -665,12 +751,15 @@ final class AppModel: ObservableObject {
     }
 
     func refreshPermissions() async {
-        // Read Aura.app's TCC state before waiting for the engine. The engine
-        // process is useful for diagnostics, but is not the authority for the
-        // native app's own Accessibility grant.
+        // Read Aura.app's TCC state before waiting for the engine, then again
+        // after: the round trip takes long enough for a grant to land, and a
+        // panel that shows a state the user has already changed is worse than
+        // one extra read.
         nativeAccessibilityGranted = Permissions.accessibilityGranted
         permissions = try? await client.permissions()
         nativeAccessibilityGranted = Permissions.accessibilityGranted
+        engineAccessibilityGranted = permissions?.accessibility
+        engineAccessibilityDetail = permissions?.accessibilityDetail
         let snapshot = try? await client.state()
         if let snapshot { state = snapshot }
     }
@@ -776,15 +865,19 @@ final class AppModel: ObservableObject {
                 // the real stream; no engine restart is required.
                 let answer = try await client.requestPermission(target)
                 if target == "accessibility" {
-                    // Aura.app is the TCC identity the user enabled. The
-                    // engine-side subprocess probe can lag or report a
-                    // different responsible-process result; the native check
-                    // is authoritative for this screen.
-                    if Permissions.accessibilityGranted {
-                        toast("Accessibility is granted to Aura.", kind: .success)
+                    // The engine is the process that drives your apps, and it
+                    // re-reads the grant from a fresh process — so its answer
+                    // is the one to believe, and it names the app macOS filed
+                    // the grant under. That is what turns "still not granted"
+                    // into something the user can act on.
+                    await refreshPermissions()
+                    let granted = accessibilityStatus == true
+                    let detail = accessibilityDetail ?? answer.message
+                    if granted {
+                        toast(detail ?? "Accessibility is granted to Aura.", kind: .success)
                     } else {
                         Permissions.openAccessibilitySettings()
-                        toast("Switch Aura on in the Accessibility list — the System Settings pane is open.",
+                        toast(detail ?? "Switch Aura on in the Accessibility list — the System Settings pane is open.",
                               kind: .warning)
                     }
                 } else {
@@ -792,7 +885,7 @@ final class AppModel: ObservableObject {
                 }
             } catch {
                 if target == "accessibility" {
-                    if Permissions.accessibilityGranted {
+                    if accessibilityStatus == true {
                         toast("Accessibility is granted to Aura.", kind: .success)
                     } else {
                         Permissions.openAccessibilitySettings()
@@ -1159,8 +1252,20 @@ final class AppModel: ObservableObject {
         return value
     }
 
+    /// The Accessibility answer to show.
+    ///
+    /// The engine is the process that actually drives your apps, so its live
+    /// reading wins when it has one — an engine started from a terminal is
+    /// granted as that terminal, and only the engine can see that. Aura.app's
+    /// own reading is the fallback for when the engine isn't answering yet.
     var accessibilityStatus: Bool? {
-        nativeAccessibilityGranted ?? permissions?.accessibility
+        engineAccessibilityGranted ?? nativeAccessibilityGranted
+    }
+
+    /// The engine's own sentence about the state, when it has one.
+    var accessibilityDetail: String? {
+        guard let detail = engineAccessibilityDetail, !detail.isEmpty else { return nil }
+        return detail
     }
 
     var capabilities: [CapabilityRow] {
@@ -1191,8 +1296,9 @@ final class AppModel: ObservableObject {
             CapabilityRow(
                 id: "accessibility", title: "Accessibility",
                 detail: accessibility == true
-                    ? "Aura can read and click inside your apps, as you ask."
-                    : "Lets Aura see and click inside other apps. macOS asks you; Aura never guesses.",
+                    ? (accessibilityDetail ?? "Aura can read and click inside your apps, as you ask.")
+                    : (accessibilityDetail
+                       ?? "Lets Aura see and click inside other apps. macOS asks you; Aura never guesses."),
                 state: accessibility,
                 action: accessibility == true ? .openAccessibility : .requestAccessibility,
                 actionTitle: accessibility == true ? "Open System Settings" : "Grant access"),

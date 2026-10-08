@@ -42,6 +42,83 @@ class TestWriteOverrides:
         assert raw["wake"]["threshold"] == 0.7
 
 
+class TestListRoundTrip:
+    """A list must survive the write → read cycle as a list.
+
+    The regression: `_toml_value` stringified every non-number, so training a
+    wake phrase wrote `models = "['…/hey-aura.npz']"`. The loader rejected that
+    as "expected a list" and fell back to the default model — so the user's own
+    phrase stopped working on every launch after the one that trained it.
+    """
+
+    MODEL = "/Users/someone/Library/Application Support/Aura/wakewords/hey-aura.npz"
+
+    def test_list_is_written_as_a_toml_array(self, tmp_path):
+        import tomllib
+
+        write_overrides(tmp_path, {"wake": {"models": [self.MODEL]}})
+        raw = tomllib.loads(runtime_overrides_path(tmp_path).read_text())
+        assert raw["wake"]["models"] == [self.MODEL]
+
+    def test_list_survives_a_reload(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AURA_DATA_DIR", str(tmp_path))
+        write_overrides(tmp_path, {"wake": {"models": [self.MODEL],
+                                            "mode": "openwakeword",
+                                            "phrase": "hey aura"}})
+        cfg = load_config()
+        assert cfg.wake.models == [self.MODEL]
+        assert cfg.wake.mode == "openwakeword"
+
+    def test_multiple_entries_and_spaces_survive(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AURA_DATA_DIR", str(tmp_path))
+        models = ["/tmp/a b/one.npz", "/tmp/two.onnx", "hey_jarvis"]
+        write_overrides(tmp_path, {"wake": {"models": models}})
+        assert load_config().wake.models == models
+
+    def test_stringified_list_from_an_older_build_is_repaired(self, tmp_path, monkeypatch):
+        """The file a real user already has on disk heals itself on read."""
+        monkeypatch.setenv("AURA_DATA_DIR", str(tmp_path))
+        runtime_overrides_path(tmp_path).write_text(
+            "[wake]\n"
+            f'models = "[\'{self.MODEL}\']"\n'
+            'mode = "openwakeword"\n'
+            'phrase = "hey aura"\n')
+        cfg = load_config()
+        assert cfg.wake.models == [self.MODEL]
+
+    def test_repair_is_written_back_as_an_array(self, tmp_path, monkeypatch):
+        import tomllib
+
+        monkeypatch.setenv("AURA_DATA_DIR", str(tmp_path))
+        runtime_overrides_path(tmp_path).write_text(
+            f'[wake]\nmodels = "[\'{self.MODEL}\']"\n')
+        write_overrides(tmp_path, {"wake": {"mode": "openwakeword"}})
+        raw = tomllib.loads(runtime_overrides_path(tmp_path).read_text())
+        assert raw["wake"]["models"] == [self.MODEL]
+
+    def test_json_spelling_is_also_readable(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AURA_DATA_DIR", str(tmp_path))
+        runtime_overrides_path(tmp_path).write_text(
+            f'[wake]\nmodels = \'["{self.MODEL}"]\'\n')
+        assert load_config().wake.models == [self.MODEL]
+
+    def test_a_plain_string_where_a_list_belongs_is_still_rejected(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """A typo must not be silently turned into a one-element list."""
+        monkeypatch.setenv("AURA_DATA_DIR", str(tmp_path))
+        runtime_overrides_path(tmp_path).write_text('[wake]\nmodels = "hey_aura"\n')
+        cfg = load_config()
+        assert cfg.wake.models == ["hey_jarvis"]      # untouched default
+        assert "expected a list" in capsys.readouterr().err
+
+    def test_strings_are_escaped_not_broken(self, tmp_path):
+        write_overrides(tmp_path, {"wake": {"phrase": 'say "hey aura"\nthen wait'}})
+        import tomllib
+        raw = tomllib.loads(runtime_overrides_path(tmp_path).read_text())
+        assert raw["wake"]["phrase"] == 'say "hey aura"\nthen wait'
+
+
 class TestLiveApply:
     def build(self, tmp_path, monkeypatch):
         monkeypatch.setenv("AURA_DATA_DIR", str(tmp_path))

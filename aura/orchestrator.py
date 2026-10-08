@@ -25,11 +25,13 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from . import config as config_mod
 from . import log as log_mod
+from . import vad as vad_mod
 from .audio import AudioFrame, MicStream, SilentMic
 from .events import EventBus
 from .laya import ExampleBuffer, HeuristicBackend, LayaBackend
@@ -55,6 +57,23 @@ State = Literal["armed", "capturing", "transcribing", "planning",
 # cap is that Aura ALWAYS answers or fails clearly, never hangs.
 MAX_ACTIVE_REQUEST_SECONDS = 20.0
 TRAIN_CAPTURE_TIMEOUT_SECONDS = 5.0
+
+#: How much audio Aura keeps behind the wake detector, and how long it waits
+#: for the command after a wake phrase that came on its own.
+#:
+#: A wake detector can only fire once the phrase is in the past, and the
+#: detector's own window is a full second long — so at the moment of the fire
+#: the phrase finished up to ~1 s ago. Keeping two seconds behind it means the
+#: phrase is still in hand when recording starts, which is what lets the
+#: always-on phrase gate verify the wake instead of rejecting every session.
+WAKE_PREROLL_SECONDS = 2.0
+WAKE_COMMAND_GRACE_SECONDS = 2.2
+
+#: Cadence of the maintenance loop. Config polling and idle unloading keep
+#: their ~10 s rhythm; the Accessibility watch needs to notice a grant within
+#: a couple of seconds of the user flipping the switch.
+MAINTENANCE_TICK_SECONDS = 2.0
+MAINTENANCE_SLOW_TICKS = 5
 
 
 @dataclass
@@ -129,6 +148,13 @@ class Orchestrator:
         self._train_vad = EnergyVAD(end_silence_seconds=0.6, max_seconds=4.0)
         self._setup_running = False
         self._laya_idle_unloaded = False
+        # Audio kept behind the wake detector so the phrase itself survives
+        # into the recording (see WAKE_PREROLL_SECONDS).
+        self._preroll: deque[AudioFrame] = deque(
+            maxlen=max(1, round(WAKE_PREROLL_SECONDS / vad_mod.FRAME_SECONDS)))
+        # Last published Accessibility answer — the watcher only speaks up when
+        # it actually changes, so a steady state costs nothing.
+        self._accessibility: bool | None = None
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop:
@@ -162,6 +188,9 @@ class Orchestrator:
                                                      name="aura-maintenance")
         self._remember_mtimes()
         await self._probe_planner()
+        # Say the Accessibility truth once at startup, so the log and the Setup
+        # panel start from the real state instead of an unknown one.
+        await self._watch_accessibility()
         # Warm the decision model in the background: a cold checkpoint load
         # takes seconds, and paying that on the user's *first* command is
         # exactly what "still thinking" feels like. Best-effort — never fatal.
@@ -262,13 +291,55 @@ class Orchestrator:
                 continue
 
     async def _maintenance_loop(self) -> None:
-        """Every 10 s: apply live config changes, unload idle models, probe
-        the planner so the UI can tell the user when the brain is offline."""
+        """The engine's own heartbeat.
+
+        Every ~10 s: apply live config changes, unload idle models, probe the
+        planner so the UI can tell the user when the brain is offline. Every
+        ~2 s: notice an Accessibility grant the moment macOS records it, so the
+        Setup panel acknowledges it without the user hunting for a refresh.
+        """
+        tick = 0
         while True:
-            await asyncio.sleep(10.0)
+            await asyncio.sleep(MAINTENANCE_TICK_SECONDS)
+            tick += 1
+            await self._watch_accessibility()
+            if tick % MAINTENANCE_SLOW_TICKS:
+                continue
             self._poll_config_changes()
             self._unload_if_idle()
             await self._probe_planner()
+
+    async def _watch_accessibility(self) -> None:
+        """Report an Accessibility change as soon as it happens.
+
+        `AXIsProcessTrusted` is answered from a per-process cache that a
+        long-lived engine fills once and keeps, so a grant made in System
+        Settings while Aura runs stays invisible to it. Reading from a
+        short-lived child (see permissions.check_accessibility) gets the live
+        answer. That probe costs a process spawn, so it runs only while the
+        answer is still "no" — the one state worth paying for — and stops for
+        good the moment Aura is trusted.
+        """
+        from . import permissions as perms
+
+        if not perms.is_mac() or self._accessibility is True:
+            return
+        try:
+            granted = await asyncio.to_thread(perms.check_accessibility)
+        except Exception as exc:
+            log_exception("accessibility watch failed", exc, logger=log)
+            return
+        if granted is None or granted == self._accessibility:
+            return
+        self._accessibility = granted
+        detail = perms.accessibility_detail(granted)
+        if granted:
+            log.info("accessibility: granted — %s", detail)
+        else:
+            log.info("accessibility: not granted yet — %s", detail)
+        self.bus.publish("log", line=f"Accessibility: {detail}")
+        self.bus.publish("accessibility", granted=granted, detail=detail,
+                         identity=perms.accessibility_identity() or "")
 
     async def _probe_planner(self) -> None:
         probe = getattr(self.planner, "probe", None)
@@ -492,6 +563,10 @@ class Orchestrator:
                     self._train_capture_armed = False
                     self._handle_train_sample(frames)
             elif self.state == "armed" and self._wake:
+                if self._phrase_gated:
+                    # Keep the phrase itself in hand: the detector can only
+                    # fire once the phrase is already behind it.
+                    self._preroll.append(frame)
                 try:
                     detected = self._wake.feed(frame)
                 except Exception as exc:
@@ -507,7 +582,7 @@ class Orchestrator:
                     self.bus.publish("wake_fallback", reason=reason)
                     detected = False
                 if detected:
-                    await self.begin_capture()
+                    await self.begin_capture(preroll=self._take_preroll())
             elif self.state == "capturing":
                 verdict = self._vad.feed(frame)
                 if verdict in ("end", "timeout"):
@@ -517,6 +592,18 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
     # Session entry points                                                #
     # ------------------------------------------------------------------ #
+
+    @property
+    def _phrase_gated(self) -> bool:
+        """Always-listening with a phrase the transcript must begin with."""
+        return bool(self.cfg.wake.mode == "openwakeword"
+                    and self.cfg.wake.phrase.strip())
+
+    def _take_preroll(self) -> list[AudioFrame]:
+        """Hand over (and clear) the audio kept behind the wake detector."""
+        frames = list(self._preroll)
+        self._preroll.clear()
+        return frames
 
     async def trigger_manual(self) -> None:
         """Wake from UI/hotkey: start listening for an utterance."""
@@ -531,11 +618,22 @@ class Orchestrator:
         # would sit armed and fire a *second*, unwanted capture as soon as the
         # first session ended (Aura re-listening on its own, then "I didn't
         # catch anything" 12 s later).
+        self._preroll.clear()
         await self.begin_capture()
 
-    async def begin_capture(self) -> None:
+    async def begin_capture(self, preroll: list[AudioFrame] | None = None) -> None:
+        """Start recording.
+
+        `preroll` is the audio from just before the wake detector fired. Seeding
+        the VAD with it is what lets the transcript begin with the wake phrase,
+        so the always-on phrase gate has something to verify instead of
+        rejecting a perfectly good command.
+        """
         self.state = "capturing"
-        self._vad.reset()
+        if preroll:
+            self._vad.prime(preroll, grace_silence=WAKE_COMMAND_GRACE_SECONDS)
+        else:
+            self._vad.reset()
         self.bus.publish("state", state=self.state)
         self.bus.publish("hint", text="Listening…")
 
@@ -581,13 +679,28 @@ class Orchestrator:
             return
 
         # Phrase gate: in always-on mode the utterance must start with the
-        # user's wake phrase — the second factor against false wakes.
-        if (self.cfg.wake.mode == "openwakeword" and self.cfg.wake.phrase
-                and not phrase_gate(text, self.cfg.wake.phrase)):
-            self.bus.publish("log", line=f"phrase gate rejected: {text[:60]!r}")
-            await self._end_session()
-            return
-        text = strip_phrase(text, self.cfg.wake.phrase) if self.cfg.wake.mode == "openwakeword" else text
+        # user's wake phrase — the second factor against false wakes. This only
+        # works because the recording is seeded with the audio from just before
+        # the detector fired (see begin_capture's preroll): by the time a wake
+        # detector can fire, the phrase itself is already in the past.
+        if self._phrase_gated:
+            phrase = self.cfg.wake.phrase
+            if not phrase_gate(text, phrase):
+                self.bus.publish(
+                    "log",
+                    line=f"phrase gate rejected {text[:60]!r} — expected it to begin "
+                         f"with “{phrase}”")
+                await self._end_session()
+                return
+            text = strip_phrase(text, phrase)
+            if not text:
+                # The phrase on its own. Aura really did hear it, so say so
+                # rather than pretending a command arrived — and go straight
+                # back to listening.
+                self.bus.publish("hint", text="Yes? Say what you need.")
+                self.bus.publish("log", line=f"wake phrase “{phrase}” heard, no request yet")
+                await self._end_session()
+                return
         if not text:
             await self._end_session("Listening.")
             return
@@ -1228,17 +1341,29 @@ class Orchestrator:
             self.bus.publish("log", line=f"could not persist wake model: {exc}")
         self._remember_mtimes()
         self._wake = self._build_wake()
+        status = self.wake_status()
         self._cancel_training_capture_timeout()
         self._trainer = None
         self._train_capture_armed = False
         self.bus.publish("train_update", phase="done", phrase=phrase,
                          threshold=round(trained.threshold, 3),
                          margin=round(trained.margin, 3))
-        self.bus.publish("log", line=f"Wake phrase “{phrase}” trained and active.")
+        # Report what is actually listening. A trained template that failed to
+        # load falls back to manual wake, and calling that "active" is exactly
+        # the kind of quiet lie that makes a user say the phrase at a Mac that
+        # isn't listening.
+        active = bool(status["active"])
+        self.bus.publish(
+            "log",
+            line=(f"Wake phrase “{phrase}” trained and active — say it and keep "
+                  f"talking." if active else
+                  f"Wake phrase “{phrase}” trained, but {status['detail']}"))
         return {"ok": True, "phrase": phrase, "path": str(path),
                 "threshold": round(trained.threshold, 3),
                 "margin": round(trained.margin, 3),
-                "engine": type(self._wake).__name__}
+                "engine": type(self._wake).__name__,
+                "wake_active": active,
+                "wake_detail": status["detail"]}
 
     # ------------------------------------------------------------------ #
     # In-app component install (Setup panel — nothing typed, ever)         #

@@ -463,6 +463,16 @@ private struct PermissionsSection: View {
                         ?? "Checking…",
                     color: model.accessibilityStatus.map { $0 ? Theme.ready : Theme.attention }
                         ?? Color.secondary)
+            // The engine's own words — including which app macOS filed the
+            // grant under, which is the part that turns "not granted" into
+            // something the user can act on. Aura re-reads this by itself, so
+            // it is never a stale answer waiting for a button press.
+            if let detail = model.accessibilityDetail {
+                Text(detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             InfoRow(label: "Wake models",
                     value: model.permissions?.wakeModels?.ready == true ? "Ready" : "Missing",
                     color: model.permissions?.wakeModels?.ready == true ? Theme.ready : Theme.attention)

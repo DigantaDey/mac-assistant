@@ -111,7 +111,8 @@ class TemplateWakeEngine(WakeEngine):
 
     SCORE_EVERY = 8          # frames (~0.26 s) between scoring passes
 
-    def __init__(self, model_path: str, threshold_margin: float = 0.0) -> None:
+    def __init__(self, model_path: str, threshold_margin: float = 0.0,
+                 refractory_seconds: float = 2.5) -> None:
         try:
             import numpy as np_
         except Exception as exc:  # pragma: no cover
@@ -128,6 +129,7 @@ class TemplateWakeEngine(WakeEngine):
         self.template = data["template"]
         self.threshold = float(data["threshold"]) + threshold_margin
         self.phrase = str(data.get("phrase", ""))
+        self.refractory = max(0.0, float(refractory_seconds))
         self._buf = bytearray()
         self._since_score = 0
         self._last_fire = 0.0
@@ -152,7 +154,7 @@ class TemplateWakeEngine(WakeEngine):
         if score < self.threshold:
             return False
         now = time.monotonic()
-        if now - self._last_fire < 2.5:
+        if now - self._last_fire < self.refractory:
             return False
         self._last_fire = now
         self._buf.clear()
@@ -174,13 +176,18 @@ def load_template_meta(model_path: str) -> dict:
         return {}
 
 
-def wake_models_ready(cfg) -> tuple[bool, str]:
+def wake_models_ready(cfg, models: list[str] | None = None) -> tuple[bool, str]:
     """Cheap, honest check: do the configured wake model files exist on disk?
 
     Used by the Setup panel so "always listening" can offer a one-tap
-    download instead of silently falling back to manual wake.
+    download instead of silently falling back to manual wake. `models`
+    overrides the configured list — the factory passes just the pretrained
+    names it is about to hand to openWakeWord.
     """
-    models = list(getattr(cfg.wake, "models", None) or [])
+    if models is None:
+        models = list(getattr(cfg.wake, "models", None) or [])
+    else:
+        models = list(models)
     if not models:
         return True, "No wake model needed — manual wake is active."
     for m in models:
@@ -209,31 +216,36 @@ def build_wake_engine(cfg, on_fallback=None) -> WakeEngine:
     log and the Setup panel instead of a crash.
     """
     mode = getattr(cfg.wake, "mode", "manual")
-    if mode == "openwakeword":
-        # A trained template (.npz from the Wake Phrase panel) always wins —
-        # it is the user's own voice, calibrated on this machine.
-        for m in cfg.wake.models or []:
-            if str(m).endswith(".npz"):
-                try:
-                    return TemplateWakeEngine(str(m))
-                except Exception as exc:
-                    if on_fallback:
-                        on_fallback(f"trained phrase model unreadable: {exc}")
-                    break
+    if mode != "openwakeword":
+        return ManualTrigger()
+
+    models = [str(m) for m in (cfg.wake.models or [])]
+    templates = [m for m in models if m.endswith(".npz")]
+    # A trained template (.npz from the Wake Phrase panel) always wins — it is
+    # the user's own voice, calibrated on this machine. openWakeWord cannot
+    # read one, so it never sees the list while a template is configured.
+    for template in templates:
         try:
-            ready, detail = wake_models_ready(cfg)
-            if not ready:
-                raise RuntimeError(detail)
-            return OpenWakeWordEngine(
-                models=cfg.wake.models,
-                threshold=cfg.wake.threshold,
-                refractory_seconds=cfg.wake.refractory_seconds,
-            )
+            return TemplateWakeEngine(
+                template,
+                refractory_seconds=getattr(cfg.wake, "refractory_seconds", 2.5))
         except Exception as exc:
             if on_fallback:
-                on_fallback(f"always-listening unavailable, using manual wake: {exc}")
-            return ManualTrigger()
-    return ManualTrigger()
+                on_fallback(f"trained phrase model unreadable: {exc}")
+    pretrained = [m for m in models if not m.endswith(".npz")]
+    try:
+        ready, detail = wake_models_ready(cfg, pretrained)
+        if not ready:
+            raise RuntimeError(detail)
+        return OpenWakeWordEngine(
+            models=pretrained,
+            threshold=cfg.wake.threshold,
+            refractory_seconds=cfg.wake.refractory_seconds,
+        )
+    except Exception as exc:
+        if on_fallback:
+            on_fallback(f"always-listening unavailable, using manual wake: {exc}")
+        return ManualTrigger()
 
 
 # --------------------------------------------------------------------------- #

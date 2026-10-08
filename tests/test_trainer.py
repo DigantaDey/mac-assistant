@@ -17,6 +17,7 @@ np = pytest.importorskip("numpy")
 
 
 from aura.audio import AudioFrame
+from aura.config import load_config
 from aura.wakeword import (
     ManualTrigger,
     TemplateWakeEngine,
@@ -253,8 +254,16 @@ class TestTrainingFlow:
         assert res["ok"]
         for _ in range(4):
             orch._handle_train_sample(self._good())
+
         import asyncio
-        done = asyncio.run(orch.training_finish())
+
+        async def finish():
+            # A live listener is part of "always listening is active": without
+            # one, wake_status() correctly refuses to claim it.
+            orch._audio_task = asyncio.current_task()
+            return await orch.training_finish()
+
+        done = asyncio.run(finish())
         assert done["ok"], done
         assert done["engine"] == "TemplateWakeEngine"
         assert done["margin"] > 0
@@ -269,10 +278,26 @@ class TestTrainingFlow:
         assert isinstance(orch._wake, TemplateWakeEngine)
         assert stack.cfg.wake.mode == "openwakeword"
         assert stack.cfg.wake.phrase == "hey aura"
-        # persisted for the next launch
-        overrides = Path(stack.cfg.data_dir) / "runtime.toml"
-        assert overrides.exists() and "hey aura" in overrides.read_text()
+        assert done["wake_active"] is True
         assert orch.training_status()["active"] is False
+
+        # Persisted so the *next* launch listens for the same phrase. Reading
+        # the text is not enough: a stringified list satisfies that check and
+        # is still thrown away by the loader, which is exactly how a trained
+        # phrase used to stop working after one restart.
+        overrides = Path(stack.cfg.data_dir) / "runtime.toml"
+        assert overrides.exists()
+        import tomllib
+        on_disk = tomllib.loads(overrides.read_text())
+        assert on_disk["wake"]["models"] == [done["path"]], (
+            "wake.models must be written as a TOML array — a stringified list "
+            "is what made a trained phrase stop working after one restart")
+        reloaded = load_config(data_dir=stack.cfg.data_dir)
+        assert reloaded.wake.models == [done["path"]]
+        assert reloaded.wake.mode == "openwakeword"
+        assert reloaded.wake.phrase == "hey aura"
+        # …and the engine the next launch builds is the trained template
+        assert isinstance(build_wake_engine(reloaded), TemplateWakeEngine)
 
     def test_cancel_resets(self, stack):
         orch = FakeMicOrchestrator.build(stack)

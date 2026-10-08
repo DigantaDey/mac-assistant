@@ -251,8 +251,10 @@ have open. So the engine behaves like a serious local service:
 
 Permissions are still macOS's: Aura asks through TCC (Microphone,
 Accessibility, per-app Automation) and reports the *real* answer, never a
-guess. Revoke anything in System Settings and Aura's Setup screen will say so
-on the next refresh.
+guess. Grant or revoke anything in System Settings and Aura notices on its own
+— macOS caches the Accessibility answer per process, so Aura re-reads it from a
+fresh one and watches for the change instead of waiting for you to hit a
+refresh button.
 
 ---
 

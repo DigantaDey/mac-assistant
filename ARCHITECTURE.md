@@ -40,6 +40,12 @@ paranoid gate, and dumb-but-perfect executors.
   in-app training (the Wake Phrase panel). A configurable **spoken phrase
   gate** adds a second factor: in always-on mode the transcript must begin
   with the user's phrase, killing false accepts.
+- The gate only works because of the **pre-roll**: a detector can only fire
+  once the phrase is behind it, so the orchestrator keeps ~2 s of audio behind
+  the wake engine and seeds the VAD with it (`EnergyVAD.prime`). The phrase
+  survives into the recording, the transcript really does begin with it, and a
+  pause between phrase and command is bridged by a longer grace rather than
+  ending the turn.
 - STT is a one-method interface with three backends; whisper.cpp is preferred
   on Apple Silicon (CoreML/ANE encoder). TTS defaults to `say` (zero extra RAM,
   offline, instant); Piper/Kokoro are drop-in upgrades.
@@ -173,12 +179,28 @@ in the planner catalog, the UI, and the safety manifest.
 
 ### 7. Permissions (`permissions.py`, Setup wizard)
 Aura treats TCC as *the* consent system, not an obstacle. Every check is
-honest and live: Accessibility via `AXIsProcessTrusted()`, microphone via
-whether Aura's own audio bridge opened, automation via a harmless AppleEvent
-actually sent (the consent dialog is the feature), whisper/Laya readiness via
-real binary probes and a live checkpoint load. The Setup wizard renders these as cards with
-deep links (`x-apple.systempreferences:…`) into the exact Privacy panes,
-a progress bar, and a Check-again loop. Nothing is faked, anywhere.
+honest and live: Accessibility, microphone via whether Aura's own audio bridge
+opened, automation via a harmless AppleEvent actually sent (the consent dialog
+is the feature), whisper/Laya readiness via real binary probes and a live
+checkpoint load. The Setup wizard renders these as cards with deep links
+(`x-apple.systempreferences:…`) into the exact Privacy panes, a progress bar,
+and a Check-again loop. Nothing is faked, anywhere.
+
+Accessibility is the one macOS makes hard to read. `AXIsProcessTrusted()` is
+answered from a **per-process cache** that a long-lived process fills once and
+keeps, so a grant made while Aura runs is invisible to it. Two answers
+therefore, both live:
+
+- The **engine** reads from a short-lived child process (a fresh cache) and
+  polls every ~2 s while ungranted, publishing an `accessibility` event the
+  moment the answer changes — so the panel acknowledges a grant by itself.
+- The **app** probes with a listen-only `CGEvent` tap, which cannot be answered
+  from that cache, and falls back to `AXIsProcessTrusted()`. It also observes
+  `com.apple.accessibility.api` and polls.
+
+Because TCC files the grant under the app that *owns* the process, an engine
+started from a terminal is granted as that terminal. Aura names that identity
+in the message instead of only saying "not granted".
 
 ### 8. The app (`macos/` — AuraCore + AuraMenuBar)
 Two Swift targets in one package (`swift build`, no Xcode project):

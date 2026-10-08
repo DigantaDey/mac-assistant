@@ -112,6 +112,67 @@ class TestEnergyVAD:
         assert vad.pcm_frames()   # and the leading silence proves pre-roll survived
 
 
+class TestPrime:
+    """Seeding an utterance with audio from *before* the trigger fired.
+
+    A wake detector can only fire once the phrase is already in the past, so
+    without this the recording starts after the phrase — the transcript never
+    begins with the wake phrase, and the always-on phrase gate rejects every
+    single session.
+    """
+
+    def test_primed_frames_are_in_the_utterance(self):
+        vad = EnergyVAD(end_silence_seconds=0.5, max_seconds=4.0)
+        preroll = frames(speech(0.8))
+        vad.prime(preroll)
+        verdict, collected = feed_until(vad, frames(speech(0.6)) + frames(silence(1.0)))
+        assert verdict == "end"
+        assert len(collected) > len(preroll)
+        # the primed audio is at the front, in order
+        assert collected[:len(preroll)] == preroll
+
+    def test_leading_room_tone_is_dropped(self):
+        vad = EnergyVAD(end_silence_seconds=0.5, max_seconds=4.0)
+        quiet = frames(silence(1.0))
+        loud = frames(speech(0.6))
+        vad.prime(quiet + loud)
+        # ~1 s of silence must not be handed to the transcriber
+        kept = vad.pcm_frames()
+        assert 0 < len(kept) <= len(loud) + vad.PRIME_BACKOFF_FRAMES
+
+    def test_all_quiet_preroll_starts_fresh_instead(self):
+        vad = EnergyVAD(end_silence_seconds=0.5, max_seconds=4.0)
+        vad.prime(frames(silence(1.0)))
+        assert vad.pcm_frames() == []
+        # …and a real utterance is still captured normally afterwards
+        verdict, collected = feed_until(vad, frames(speech(0.8)) + frames(silence(1.0)))
+        assert verdict == "end" and collected
+
+    def test_grace_gives_longer_to_start_than_to_finish(self):
+        """After a wake, a pause before the command must not end the turn."""
+        vad = EnergyVAD(end_silence_seconds=0.5, max_seconds=8.0)
+        vad.prime(frames(speech(0.7)), grace_silence=2.0)
+        # 1.2 s of quiet — longer than end_silence, shorter than the grace
+        verdict, _ = feed_until(vad, frames(silence(1.2)))
+        assert verdict == ""
+        # …and the command that follows is still part of the same utterance
+        verdict, collected = feed_until(vad, frames(speech(0.8)) + frames(silence(1.0)))
+        assert verdict == "end"
+        assert len(collected) > len(frames(speech(0.8)))
+
+    def test_without_grace_the_pause_ends_the_turn(self):
+        vad = EnergyVAD(end_silence_seconds=0.5, max_seconds=8.0)
+        vad.prime(frames(speech(0.7)))
+        verdict, _ = feed_until(vad, frames(silence(1.2)))
+        assert verdict == "end"
+
+    def test_reset_clears_the_grace(self):
+        vad = EnergyVAD(end_silence_seconds=0.5, max_seconds=8.0)
+        vad.prime(frames(speech(0.7)), grace_silence=3.0)
+        vad.reset()
+        assert vad._end_silence() == 0.5
+
+
 class TestUtterancesAdapter:
     @pytest.mark.asyncio
     async def test_yields_non_empty_utterances(self):
