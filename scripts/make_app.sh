@@ -65,8 +65,21 @@ cat > "$DEST/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-say "Ad-hoc code signing"
-codesign --force --sign - "$DEST" 2>/dev/null || true
+IDENTITY="${AURA_SIGNING_IDENTITY:--}"
+if [ "$IDENTITY" = "-" ]; then
+  say "Ad-hoc code signing"
+  codesign --force --sign - "$DEST" 2>/dev/null || true
+else
+  # A real identity is the difference between a permission you grant once and
+  # one you re-grant after every rebuild, so a typo'd identity must fail loudly
+  # rather than quietly fall back to ad-hoc.
+  say "Signing as: $IDENTITY"
+  if ! codesign --force --sign "$IDENTITY" "$DEST"; then
+    echo "codesign could not sign with '$IDENTITY'." >&2
+    echo "Available identities:  security find-identity -v -p codesigning" >&2
+    exit 1
+  fi
+fi
 
 if $INSTALL; then
   say "Installing to /Applications"
@@ -86,6 +99,15 @@ cat <<'EOF'
     · ⌥Space anywhere wakes Aura; right-click the ◉ for the menu
     · Settings live in the panel's gear icon; Activity keeps every session
 
-  Note: the ad-hoc signature runs fine locally. For "Start at Login" macOS
-  may ask you to approve Aura under System Settings › General › Login Items.
+  Note: by default Aura is ad-hoc signed, which runs fine locally — but macOS
+  pins the Accessibility grant to that exact build, so rebuilding Aura.app
+  orphans it and the switch in System Settings reads "on" while matching
+  nothing. Sign with one stable identity instead and the grant survives every
+  rebuild:
+
+      security find-identity -v -p codesigning        # list identities
+      AURA_SIGNING_IDENTITY="Aura Dev" ./scripts/make_app.sh --install
+
+  A self-signed certificate is enough. For "Start at Login" macOS may also ask
+  you to approve Aura under System Settings › General › Login Items.
 EOF

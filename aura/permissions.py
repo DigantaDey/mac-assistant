@@ -162,7 +162,8 @@ def accessibility_identity() -> str | None:
     return _identity_cache
 
 
-def _resolve_identity() -> str | None:
+def _app_bundle_path() -> str | None:
+    """Full path of the .app bundle that owns this engine's process chain."""
     if not is_mac():
         return None
     pid = os.getpid()
@@ -172,10 +173,62 @@ def _resolve_identity() -> str | None:
         if pid <= 1 or pid in seen:
             return None
         seen.add(pid)
-        match = re.search(r"/([^/]+)\.app/", _process_path(pid))
+        match = re.search(r"^(.*?/[^/]+\.app)(?:/|$)", _process_path(pid))
         if match:
             return match.group(1)
     return None
+
+
+def _resolve_identity() -> str | None:
+    bundle = _app_bundle_path()
+    if not bundle:
+        return None
+    name = bundle.rsplit("/", 1)[-1]
+    return name[: -len(".app")] if name.endswith(".app") else None
+
+
+def _signature_is_adhoc(bundle: str) -> bool | None:
+    """True when a bundle's designated requirement is its own code hash.
+
+    `codesign --sign -` (what scripts/make_app.sh does) produces an *ad-hoc*
+    signature: no certificate, no team, so the only thing macOS can bind a
+    permission to is that build's cdhash. TCC records the grant against it,
+    and the next rebuild has a different hash — so the grant silently stops
+    matching while System Settings still shows the switch switched on. That
+    reads to the user as "I granted it and Aura still says no", and no amount
+    of re-checking fixes it. `None` means we could not tell.
+
+    `codesign -d` writes its report to stderr, so both streams are read.
+    """
+    try:
+        proc = subprocess.run(["codesign", "-dv", "--verbose=2", bundle],
+                              capture_output=True, text=True, timeout=4, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    report = f"{proc.stdout}\n{proc.stderr}"
+    if "Signature=adhoc" in report or "(adhoc" in report:
+        return True
+    return False if "Identifier=" in report else None
+
+
+_adhoc_cache: bool | None = None
+_adhoc_resolved = False
+
+
+def _app_is_adhoc_signed() -> bool | None:
+    """Memoised `_signature_is_adhoc` for the bundle owning this engine.
+
+    A running bundle's signature cannot change underneath it, so one probe per
+    engine lifetime is enough — and the permissions panel reads this on every
+    snapshot.
+    """
+    global _adhoc_cache, _adhoc_resolved
+    if _adhoc_resolved:
+        return _adhoc_cache
+    bundle = _app_bundle_path()
+    _adhoc_cache = _signature_is_adhoc(bundle) if bundle else None
+    _adhoc_resolved = True
+    return _adhoc_cache
 
 
 def accessibility_detail(granted: bool | None = None) -> str:
@@ -197,8 +250,16 @@ def accessibility_detail(granted: bool | None = None) -> str:
         detail += (f" The engine was started from {identity}, so macOS files the "
                    f"grant under {identity} — launch Aura.app instead, or enable "
                    f"{identity} in the Accessibility list.")
-    else:
-        detail += " Switch Aura on under System Settings › Privacy & Security › Accessibility."
+        return detail
+    detail += " Switch Aura on under System Settings › Privacy & Security › Accessibility."
+    if _app_is_adhoc_signed():
+        # An ad-hoc signature binds the grant to that build's code hash, so a
+        # rebuild leaves a switch that reads "on" while matching nothing. Re-
+        # checking can never clear this; only replacing the row can.
+        detail += (" If Aura already appears switched on there, that row belongs "
+                   "to an earlier build — this Aura is signed ad-hoc, so macOS "
+                   "pinned the grant to the old binary. Remove the Aura row with "
+                   "the − button and switch it on again.")
     return detail
 
 
