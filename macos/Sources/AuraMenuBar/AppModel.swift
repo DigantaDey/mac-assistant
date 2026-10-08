@@ -109,6 +109,11 @@ final class AppModel: ObservableObject {
     @Published private(set) var health: EngineHealth?
     @Published private(set) var state: EngineState?
     @Published private(set) var permissions: PermissionsSnapshot?
+    /// Read in Aura.app itself: a child Python probe can disagree with the
+    /// TCC identity that owns the native Accessibility grant.
+    @Published private(set) var nativeAccessibilityGranted: Bool?
+    @Published private(set) var automationTestMessage: String?
+    @Published private(set) var automationTestSucceeded: Bool?
     @Published private(set) var config: EngineConfig?
     @Published private(set) var skills: [SkillSpec] = []
     @Published private(set) var activity: [HistoryEntry] = []
@@ -117,6 +122,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var isStartingTraining = false
     @Published private(set) var isFinishingTraining = false
     @Published private(set) var isTestingAutomation = false
+    @Published private(set) var isChangingWakeMode = false
     @Published private(set) var feedbackByEntryID: [Int: ActivityFeedbackState] = [:]
     @Published private(set) var setupProgress: [String: String] = [:]
     @Published private(set) var messages: [PanelMessage] = []
@@ -136,6 +142,7 @@ final class AppModel: ObservableObject {
     private var activeSessionID: String?
     private var activePlanReply: String?
     private var automationProbeID: UUID?
+    private var automationTimeoutTask: Task<Void, Never>?
 
     init(token: String) {
         let endpoint = EngineEndpoint(host: "127.0.0.1", port: Prefs.port, token: token)
@@ -152,6 +159,7 @@ final class AppModel: ObservableObject {
 
     func start() {
         log.write("Aura.app: starting (v\(AuraVersion.semantic), port \(Prefs.port))")
+        nativeAccessibilityGranted = Permissions.accessibilityGranted
         subscribeToEvents()
         supervisor.start()
         Task { await refreshAll() }
@@ -311,10 +319,13 @@ final class AppModel: ObservableObject {
             }
 
         case "reply":
-            if let replySession = event.session {
-                if let activeSessionID, replySession != activeSessionID { return }
-                if activeSessionID == nil && thinkingMessageID == nil { return }
-            }
+            if let replySession = event.session, activeSessionID != replySession { return }
+            if activeSessionID == nil && thinkingMessageID == nil { return }
+            // A reply is terminal user-facing state. The engine publishes its
+            // armed transition immediately after this event; treating the
+            // result as complete here also prevents a missed state frame from
+            // leaving the composer permanently busy.
+            phase = "armed"
             let text = event.text ?? ""
             if !text.isEmpty {
                 let failed = (event.data["outcome"]?.stringValue ?? "ok") == "failed"
@@ -334,6 +345,9 @@ final class AppModel: ObservableObject {
                 logLines.append(line)
                 if logLines.count > 400 { logLines.removeFirst(logLines.count - 400) }
             }
+
+        case "history_updated":
+            Task { _ = await refreshActivity() }
 
         case "train_update":
             let trainingPhase = event.data["phase"]?.stringValue ?? "idle"
@@ -385,6 +399,10 @@ final class AppModel: ObservableObject {
 
         case "wake_fallback":
             if let reason = event.reason { toast(reason, kind: .warning) }
+            Task {
+                let snapshot = try? await client.state()
+                if let snapshot { state = snapshot }
+            }
 
         default:
             break
@@ -499,6 +517,9 @@ final class AppModel: ObservableObject {
             return
         }
 
+        activeSessionID = nil
+        activePlanReply = nil
+        liveActions.removeAll()
         appendUser(trimmed)
         phase = "planning"
         watchForStall()
@@ -606,6 +627,7 @@ final class AppModel: ObservableObject {
         }
 
         permissions = try? await permissionsTask
+        nativeAccessibilityGranted = Permissions.accessibilityGranted
         config = try? await configTask
 
         let skillList = try? await skillsTask
@@ -623,8 +645,6 @@ final class AppModel: ObservableObject {
     private func refreshAfterSession() async {
         let snapshot = try? await client.state()
         if let snapshot { state = snapshot; phase = snapshot.state }
-        let list = try? await client.history()
-        if let list { activity = list }
     }
 
     func refreshConfig() async {
@@ -645,7 +665,12 @@ final class AppModel: ObservableObject {
     }
 
     func refreshPermissions() async {
+        // Read Aura.app's TCC state before waiting for the engine. The engine
+        // process is useful for diagnostics, but is not the authority for the
+        // native app's own Accessibility grant.
+        nativeAccessibilityGranted = Permissions.accessibilityGranted
         permissions = try? await client.permissions()
+        nativeAccessibilityGranted = Permissions.accessibilityGranted
         let snapshot = try? await client.state()
         if let snapshot { state = snapshot }
     }
@@ -666,10 +691,22 @@ final class AppModel: ObservableObject {
     }
 
     func setWakeMode(_ mode: String) {
+        guard !isChangingWakeMode else { return }
+        isChangingWakeMode = true
         Task {
-            let wakeResult = try? await client.setWakeMode(mode)
-            if let reply = wakeResult, reply.ok == false {
-                toast(reply.message ?? "That didn't take.", kind: .warning)
+            defer { isChangingWakeMode = false }
+            do {
+                let reply = try await client.setWakeMode(mode)
+                if reply.ok {
+                    if mode == "openwakeword" {
+                        toast("Always listening is active.", kind: .success)
+                    }
+                } else {
+                    toast(reply.message ?? "Aura couldn't start that listening mode.",
+                          kind: .warning)
+                }
+            } catch {
+                toast(error.localizedDescription, kind: .warning)
             }
             await refreshConfig()
             await refreshPermissions()
@@ -738,20 +775,30 @@ final class AppModel: ObservableObject {
                 // TCC answer. This call both verifies the device and hot-attaches
                 // the real stream; no engine restart is required.
                 let answer = try await client.requestPermission(target)
-                if target == "accessibility" && answer.status != "ok" {
-                    // Not granted yet: open the exact pane and say what to do.
-                    // A tap on this button must always end somewhere visible.
-                    Permissions.openAccessibilitySettings()
-                    toast("Switch Aura on in the Accessibility list — the System Settings pane is open.",
-                          kind: .warning)
+                if target == "accessibility" {
+                    // Aura.app is the TCC identity the user enabled. The
+                    // engine-side subprocess probe can lag or report a
+                    // different responsible-process result; the native check
+                    // is authoritative for this screen.
+                    if Permissions.accessibilityGranted {
+                        toast("Accessibility is granted to Aura.", kind: .success)
+                    } else {
+                        Permissions.openAccessibilitySettings()
+                        toast("Switch Aura on in the Accessibility list — the System Settings pane is open.",
+                              kind: .warning)
+                    }
                 } else {
                     toast(answer.message ?? "Checked.", kind: answer.ok ? .success : .warning)
                 }
             } catch {
                 if target == "accessibility" {
-                    Permissions.openAccessibilitySettings()
-                    toast("Couldn't reach the engine — enable Aura in the Accessibility pane that just opened.",
-                          kind: .warning)
+                    if Permissions.accessibilityGranted {
+                        toast("Accessibility is granted to Aura.", kind: .success)
+                    } else {
+                        Permissions.openAccessibilitySettings()
+                        toast("Couldn't reach the engine — enable Aura in the Accessibility pane that just opened.",
+                              kind: .warning)
+                    }
                 } else {
                     toast(error.localizedDescription, kind: .failure)
                 }
@@ -774,6 +821,8 @@ final class AppModel: ObservableObject {
         let probeID = UUID()
         automationProbeID = probeID
         isTestingAutomation = true
+        automationTestMessage = "Testing a harmless AppleEvent to System Events…"
+        automationTestSucceeded = nil
         toast("Checking Automation access…", kind: .info)
 
         Task { [weak self] in
@@ -781,8 +830,12 @@ final class AppModel: ObservableObject {
                 Permissions.testAutomation()
             }.value
             guard let self, self.automationProbeID == probeID else { return }
+            self.automationTimeoutTask?.cancel()
+            self.automationTimeoutTask = nil
             self.automationProbeID = nil
             self.isTestingAutomation = false
+            self.automationTestMessage = result.message
+            self.automationTestSucceeded = result.ok
             if result.permissionRequired {
                 Permissions.openAutomationSettings()
             }
@@ -791,15 +844,20 @@ final class AppModel: ObservableObject {
         }
 
         // NSAppleScript can wait on a macOS consent sheet. Keep the UI honest
-        // even if that sheet was hidden behind another window.
-        Task { [weak self] in
+        // even if that sheet is behind another window; the row itself holds the
+        // result, so the user does not have to catch a transient toast.
+        automationTimeoutTask?.cancel()
+        automationTimeoutTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 12_000_000_000)
             guard let self, self.automationProbeID == probeID else { return }
             self.automationProbeID = nil
+            self.automationTimeoutTask = nil
             self.isTestingAutomation = false
+            let message = "The test hasn't returned yet — check the macOS permission prompt or Privacy & Security › Automation."
+            self.automationTestMessage = message
+            self.automationTestSucceeded = false
             Permissions.openAutomationSettings()
-            self.toast("Automation is taking too long — check the macOS permission prompt or Privacy & Security › Automation.",
-                       kind: .warning)
+            self.toast(message, kind: .warning)
         }
     }
 
@@ -1081,16 +1139,42 @@ final class AppModel: ObservableObject {
         (permissions?.resolvedProfile ?? config?.resolvedProfile ?? state?.profile) == "demo"
     }
 
+    var isAlwaysListeningActive: Bool { state?.wakeActive == true }
+
+    var wakeActivationPhrase: String? {
+        guard isAlwaysListeningActive else { return nil }
+        if let phrase = state?.wakePhrase?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !phrase.isEmpty { return phrase }
+        guard let configured = config?.wakeModels?.first else { return nil }
+        let name = URL(fileURLWithPath: configured).deletingPathExtension().lastPathComponent
+        let known: [String: String] = [
+            "hey_jarvis": "Hey Jarvis", "hey_mycroft": "Hey Mycroft",
+            "hey_rhasspy": "Hey Rhasspy", "alexa": "Alexa", "okay_nabu": "Okay Nabu",
+        ]
+        return known[name] ?? name.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
     var confidenceThreshold: Double {
         guard let value = config?.liveValue("laya", "confidence_threshold")?.doubleValue else { return 0.62 }
         return value
     }
 
+    var accessibilityStatus: Bool? {
+        nativeAccessibilityGranted ?? permissions?.accessibility
+    }
+
     var capabilities: [CapabilityRow] {
         let microphone = permissions?.microphone ?? state?.micReady
-        let accessibility = permissions?.accessibility
+        let accessibility = accessibilityStatus
         let wakeReady = permissions?.wakeModels?.ready ?? false
-        let wakeDetail = permissions?.wakeModels?.detail ?? "Wake words come from the pretrained model set."
+        let alwaysOn = state?.wakeMode == "openwakeword"
+        // Model files being present is not proof that the listener opened its
+        // microphone or detector. For an enabled mode, only the engine's live
+        // status can say whether Aura is actually listening.
+        let wakeState = alwaysOn ? state?.wakeActive : wakeReady
+        let wakeDetail = alwaysOn
+            ? (state?.wakeDetail ?? state?.wakeError ?? "Checking the live wake listener…")
+            : (permissions?.wakeModels?.detail ?? "Wake words come from the pretrained model set.")
         let whisper = permissions?.whisperCpp
         let planner = permissions?.plannerServer
         let isMac = permissions?.isMac ?? false
@@ -1114,12 +1198,12 @@ final class AppModel: ObservableObject {
                 actionTitle: accessibility == true ? "Open System Settings" : "Grant access"),
             CapabilityRow(
                 id: "automation", title: "Automation",
-                detail: isMac
-                    ? "macOS asks per app the first time Aura drives it. This checks the dialogs work."
-                    : "AppleScript automation is a macOS feature.",
-                state: nil,
+                detail: automationTestMessage ?? (isMac
+                    ? "macOS asks per app the first time Aura drives it. This sends a harmless test to System Events."
+                    : "AppleScript automation is a macOS feature."),
+                state: automationTestSucceeded,
                 action: .testAutomation,
-                actionTitle: "Run a test"),
+                actionTitle: automationTestSucceeded == true ? "Run again" : "Run a test"),
             CapabilityRow(
                 id: "whisper", title: "Speech-to-text",
                 detail: whisper == true
@@ -1139,9 +1223,11 @@ final class AppModel: ObservableObject {
             CapabilityRow(
                 id: "wake", title: "Wake words",
                 detail: wakeDetail,
-                state: wakeReady,
-                action: .installWakeModels,
-                actionTitle: wakeReady ? "Installed" : "Download models"),
+                state: wakeState,
+                action: wakeReady ? .none : .installWakeModels,
+                actionTitle: !wakeReady ? "Download models" :
+                    (alwaysOn && wakeState == true ? "Listening" :
+                     (alwaysOn ? "Check setup" : "Installed"))),
         ]
     }
 }

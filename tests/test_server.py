@@ -3,11 +3,38 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import urllib.error
 
 import pytest
-from conftest import get, post
+from conftest import auth_headers, get, post
+
+
+def _open_event_stream(port: int, extra_headers: dict[str, str] | None = None):
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    connection.request("GET", "/api/events", headers=auth_headers(extra_headers))
+    response = connection.getresponse()
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "text/event-stream; charset=utf-8"
+    assert response.fp.readline() == b"retry: 2000\n"
+    assert response.fp.readline() == b"\n"
+    return connection, response
+
+
+def _read_sse_event(response) -> dict:
+    event_id = None
+    payload = None
+    while True:
+        line = response.fp.readline()
+        if not line:
+            raise AssertionError("event stream closed before the expected event")
+        if line.startswith(b"id: "):
+            event_id = int(line[4:].strip())
+        elif line.startswith(b"data: "):
+            payload = json.loads(line[6:])
+        elif line == b"\n" and event_id is not None and payload is not None:
+            return {"id": event_id, **payload}
 
 
 class TestServer:
@@ -25,8 +52,56 @@ class TestServer:
         _, state = get(f"{base}/api/state")
         st = json.loads(state)
         assert st["state"] == "armed"
+        assert st["wake_mode"] == "manual"
+        assert st["wake_active"] is False
+        assert st["wake_engine"] == "ManualTrigger"
         status, skills = get(f"{base}/api/skills")
         assert status == 200 and json.loads(skills)["skills"]
+
+    def test_event_stream_resumes_and_resets_cursor_on_engine_restart(self, server):
+        orch, _, cfg = server
+        port = cfg.server.port
+        first_connection, first_response = _open_event_stream(port)
+        try:
+            epoch = first_response.getheader("X-Aura-Event-Epoch")
+            assert epoch == orch.bus.epoch
+            live = orch.bus.publish("state", state="planning")
+            first = _read_sse_event(first_response)
+            assert first["id"] == live.seq
+            assert first["type"] == "state"
+        finally:
+            first_response.close()
+            first_connection.close()
+
+        missed = orch.bus.publish("reply", text="replayed after reconnect")
+        resumed_connection, resumed_response = _open_event_stream(
+            port, {"Last-Event-ID": str(live.seq), "X-Aura-Event-Epoch": epoch})
+        try:
+            replay = _read_sse_event(resumed_response)
+            assert replay["id"] == missed.seq
+            assert replay["data"]["text"] == "replayed after reconnect"
+        finally:
+            resumed_response.close()
+            resumed_connection.close()
+
+        # The last cursor may be larger than the sequence counter after the
+        # engine process restarts. A changed epoch replays this process's
+        # bounded history instead of waiting for the old cursor to be reached.
+        after_restart = orch.bus.publish("reply", text="new engine history")
+        restarted_connection, restarted_response = _open_event_stream(
+            port, {"Last-Event-ID": "999999", "X-Aura-Event-Epoch": "old-engine"})
+        try:
+            assert restarted_response.getheader("X-Aura-Event-Epoch") == epoch
+            replayed = []
+            while not any(event["id"] == after_restart.seq for event in replayed):
+                replayed.append(_read_sse_event(restarted_response))
+            assert replayed[-1]["data"]["text"] == "new engine history"
+        finally:
+            restarted_response.close()
+            restarted_connection.close()
+            # Wake the handler out of its blocking queue wait so it notices
+            # the closed socket and unsubscribes immediately.
+            orch.bus.publish("log", line="SSE test disconnect")
 
     def test_path_traversal_refused(self, server):
         _, srv, cfg = server

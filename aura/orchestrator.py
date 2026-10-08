@@ -106,6 +106,7 @@ class Orchestrator:
         self._confirmations: dict[str, asyncio.Future[str]] = {}
 
         self._wake: WakeEngine | None = None
+        self._wake_error = ""
         self._vad = EnergyVAD(end_silence_seconds=cfg.session.end_of_speech_seconds,
                               max_seconds=cfg.session.max_utterance_seconds)
         self._mic: MicStream | SilentMic | None = None
@@ -369,23 +370,90 @@ class Orchestrator:
     def _build_wake(self) -> WakeEngine:
         from .wakeword import build_wake_engine
 
+        self._wake_error = ""
+
         def on_fallback(reason: str) -> None:
+            self._wake_error = reason
             self.bus.publish("log", line=f"wake: {reason}")
             self.bus.publish("wake_fallback", reason=reason)
 
         return build_wake_engine(self.cfg, on_fallback=on_fallback)
 
+    def wake_status(self) -> dict[str, Any]:
+        """Report the listener that is actually running, not just the saved toggle."""
+        from .wakeword import ManualTrigger
+
+        engine = self._wake
+        engine_name = type(engine).__name__ if engine is not None else "Unavailable"
+        mode = self.cfg.wake.mode
+        active = False
+        if mode == "manual":
+            detail = "Tap the Aura orb or press the shortcut to start listening."
+        elif not self._has_audio:
+            detail = ("Always listening is selected, but Aura has no live microphone. "
+                      "Allow microphone access, then try again.")
+        elif self._audio_task is None or self._audio_task.done():
+            detail = "Always listening is selected, but Aura's audio listener is not running. Restart the engine."
+        elif engine is None:
+            detail = self._wake_error or "Always listening is selected, but no wake detector is available."
+        elif isinstance(engine, ManualTrigger):
+            detail = self._wake_error or (
+                "Always listening is selected, but no wake detector is active. "
+                "Install a wake model or train your phrase.")
+        else:
+            active = engine is not None
+            phrase = (self.cfg.wake.phrase.strip()
+                      or str(getattr(engine, "phrase", "")).strip())
+            if not phrase:
+                for model in self.cfg.wake.models or []:
+                    path = str(model)
+                    if path.endswith(".npz"):
+                        continue  # TemplateWakeEngine exposes its phrase directly.
+                    if path.rsplit("/", 1)[-1] in {
+                        "hey_jarvis", "hey_mycroft", "hey_rhasspy", "alexa", "okay_nabu",
+                    }:
+                        phrase = path.rsplit("/", 1)[-1].replace("_", " ").title()
+                    if phrase:
+                        break
+            detail = (f"Always listening is active — say “{phrase}”." if phrase
+                      else "Always listening is active with the installed wake model.")
+        return {"mode": mode, "engine": engine_name, "active": active,
+                "error": self._wake_error, "detail": detail}
+
     async def set_wake_mode(self, mode: str, phrase: str | None = None) -> dict:
-        """Switch manual ↔ always-listening at runtime; persist the choice."""
+        """Switch manual ↔ always-listening at runtime; persist only a live mode."""
         if mode not in ("manual", "openwakeword"):
             return {"ok": False, "message": f"unknown wake mode {mode!r}"}
         if config_mod.resolved_profile(self.cfg) == "demo":
             return {"ok": False,
                     "message": "Demo profile pins manual wake — set profile = \"mac\" "
                                "in config.toml to enable always-listening."}
+
+        old_mode, old_phrase = self.cfg.wake.mode, self.cfg.wake.phrase
+        old_wake, old_error = self._wake, self._wake_error
+        if mode == "openwakeword" and not self._has_audio:
+            return {"ok": False,
+                    "mode": old_mode,
+                    "message": "Always listening needs a live microphone. Allow Microphone access in Setup, then try again."}
+        if mode == "openwakeword" and (
+                self._audio_task is None or self._audio_task.done()):
+            return {"ok": False, "mode": old_mode,
+                    "message": "Aura's audio listener is not running. Restart the engine, then try again."}
+
         self.cfg.wake.mode = mode
         if phrase is not None:
             self.cfg.wake.phrase = phrase.strip()[:60]
+        candidate = self._build_wake()
+        from .wakeword import ManualTrigger
+
+        if mode == "openwakeword" and isinstance(candidate, ManualTrigger):
+            reason = self._wake_error or "The wake detector could not be started."
+            self.cfg.wake.mode, self.cfg.wake.phrase = old_mode, old_phrase
+            self._wake, self._wake_error = old_wake, old_error
+            return {"ok": False, "mode": old_mode, "engine": type(old_wake).__name__,
+                    "message": f"Always listening couldn't start: {reason}"}
+
+        self._wake = candidate
         try:
             config_mod.write_overrides(
                 self.cfg.data_dir,
@@ -393,15 +461,16 @@ class Orchestrator:
             )
         except OSError as exc:
             self.bus.publish("log", line=f"could not persist wake mode: {exc}")
-        self._wake = self._build_wake()
         self._remember_mtimes()
         self.bus.publish("config", changed=["wake.mode"], wake_mode=mode,
                          phrase=self.cfg.wake.phrase)
         note = (f"Wake mode: {mode}" +
                 (f" (phrase gate: “{self.cfg.wake.phrase}”)" if self.cfg.wake.phrase else ""))
         self.bus.publish("log", line=note)
+        status = self.wake_status()
         return {"ok": True, "mode": mode, "phrase": self.cfg.wake.phrase,
-                "engine": type(self._wake).__name__}
+                "engine": type(self._wake).__name__, "wake_active": status["active"],
+                "wake_detail": status["detail"]}
 
     # ------------------------------------------------------------------ #
     # Audio path (real mic only)                                          #
@@ -423,7 +492,21 @@ class Orchestrator:
                     self._train_capture_armed = False
                     self._handle_train_sample(frames)
             elif self.state == "armed" and self._wake:
-                if self._wake.feed(frame):
+                try:
+                    detected = self._wake.feed(frame)
+                except Exception as exc:
+                    # A detector's first inference can fail after successful
+                    # model construction. Keep the audio loop alive, degrade
+                    # explicitly to manual wake, and expose the real status.
+                    from .wakeword import ManualTrigger
+
+                    reason = f"wake detector failed during audio processing: {exc}"
+                    self._wake_error = reason
+                    self._wake = ManualTrigger()
+                    self.bus.publish("log", line=reason)
+                    self.bus.publish("wake_fallback", reason=reason)
+                    detected = False
+                if detected:
                     await self.begin_capture()
             elif self.state == "capturing":
                 verdict = self._vad.feed(frame)
@@ -544,29 +627,27 @@ class Orchestrator:
                        "seconds), so I stopped it. Please try again."
                        if deadline else "I stopped that one — ask me again?")
             session = self.session
-            if session is not None:
-                self.memory.record_event(
-                    session.transcript,
-                    (session.plan.as_dict() if session.plan else {}),
-                    message, "failed", _ms(session.started),
-                )
+            plan = session.plan.as_dict() if session and session.plan else {}
             await self._end_session(message, outcome="failed")
+            if session is not None:
+                await self._record_session_event(
+                    session.id, session.transcript, plan, message, "failed",
+                    _ms(session.started))
         except BaseException as exc:  # the orb must never freeze
             detail = log_exception(f"session failed while handling {transcript[:60]!r}",
                                    exc, logger=log)
             self.bus.publish("log", line=f"session error: {detail}")
             session = self.session
-            if session is not None:
-                self.memory.record_event(
-                    session.transcript,
-                    (session.plan.as_dict() if session.plan else {}),
-                    f"failed: {detail}", "failed", _ms(session.started))
+            plan = session.plan.as_dict() if session and session.plan else {}
+            message = self._failure_message("Something went wrong while thinking.", detail)
             # The user gets the *detail*, not just an apology: "something went
             # wrong" is unfixable, "LayaError: laya predict: …" is a bug report.
             try:
-                await self._end_session(
-                    self._failure_message("Something went wrong while thinking.", detail),
-                    outcome="failed", diagnostic=detail)
+                await self._end_session(message, outcome="failed", diagnostic=detail)
+                if session is not None:
+                    await self._record_session_event(
+                        session.id, session.transcript, plan, message, "failed",
+                        _ms(session.started))
             except BaseException:  # even the apology must not hang the state
                 session_id = self.session.id if self.session is not None else None
                 self._disarm_watchdog()
@@ -713,11 +794,12 @@ class Orchestrator:
                     self._record_example(transcript, p["action"],
                                          "cancelled" if answer in ("cancel", "timeout") else "corrected",
                                          p.get("decision"))
-                self.memory.record_event(
-                    transcript, plan.as_dict(), plan.reply,
-                    outcome="cancelled", total_ms=_ms(t0))
-                await self._end_session("No problem — cancelled." if answer == "cancel"
-                                        else "I didn't hear a yes, so I cancelled it.")
+                message = ("No problem — cancelled." if answer == "cancel"
+                           else "I didn't hear a yes, so I cancelled it.")
+                await self._end_session(message)
+                await self._record_session_event(
+                    session.id, transcript, plan.as_dict(), plan.reply,
+                    "cancelled", _ms(t0))
                 return
             # Confirmed: record positive supervision, then give execution its
             # own active-work window under the watchdog.
@@ -797,25 +879,44 @@ class Orchestrator:
                 self._record_example(transcript, p["action"], "auto", p.get("decision"))
         await self._respond(session, reply, outcome=outcome, total_ms=_ms(t0))
 
+    async def _record_session_event(self, session_id: str, transcript: str, plan: dict,
+                                    reply: str, outcome: str, total_ms: int) -> None:
+        """Persist history off-loop, after the user-facing session is ready.
+
+        SQLite is local, but a busy database or a slow disk must not keep the
+        orb in Responding after the action and reply are already complete.
+        """
+        try:
+            await asyncio.to_thread(self.memory.record_event, transcript, plan,
+                                    reply, outcome, total_ms)
+        except Exception as exc:
+            detail = log_exception("history: couldn't save the completed session", exc,
+                                   logger=log)
+            self.bus.publish("log", line=f"activity history save failed: {detail}")
+        else:
+            self.bus.publish("history_updated", session=session_id)
+
     async def _respond(self, session: Session, reply: str, outcome: str, total_ms: int,
                        diagnostic: str = "") -> None:
         self.state = "responding"
         self.bus.publish("state", state=self.state, session=session.id)
         plan = session.plan
+        plan_data = plan.as_dict() if plan else {}
         log.info("reply (%s, %dms, %s): %s", outcome, total_ms,
                  getattr(plan, "routed_by", "?") or "?", reply[:200])
         self.bus.publish("reply", text=reply, session=session.id,
                          total_ms=total_ms, outcome=outcome,
                          diagnostic=diagnostic or getattr(plan, "diagnostic", ""),
                          degraded=bool(getattr(plan, "degraded", False)))
-        self.memory.record_event(session.transcript,
-                                 (session.plan.as_dict() if session.plan else {}),
-                                 reply, outcome, total_ms)
         # Fire TTS in the background — the user can issue their next command
         # immediately instead of waiting for speech to finish.
         self._speak_async(reply)
         self._last_activity = time.monotonic()
+        # Finish the visible state before touching disk. The history write runs
+        # in a worker and announces completion separately for Activity.
         await self._end_session()
+        await self._record_session_event(session.id, session.transcript, plan_data,
+                                         reply, outcome, total_ms)
 
     def _speak_async(self, text: str) -> None:
         """Speak on a worker without blocking the session or leaking failures."""
@@ -1363,11 +1464,15 @@ class Orchestrator:
         # ru_maxrss: bytes on macOS, KB on Linux → normalize to MB.
         rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         rss_mb = rss_mb / (1024 * 1024) if _sys.platform == "darwin" else rss_mb / 1024
+        wake = self.wake_status()
         return {
             "rss_mb": round(rss_mb, 1),
             "state": self.state,
             "wake_mode": self.cfg.wake.mode,
-            "wake_engine": type(self._wake).__name__ if self._wake else None,
+            "wake_engine": wake["engine"],
+            "wake_active": wake["active"],
+            "wake_error": wake["error"],
+            "wake_detail": wake["detail"],
             "stt_engine": type(self.stt).__name__,
             "examples": self.examples.stats(),
         }

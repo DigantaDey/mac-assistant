@@ -278,17 +278,35 @@ class AuraServer:
                     self._json({"ok": False, "error": "not found"}, 404)
 
             def _sse(self) -> None:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Connection", "close")
-                self.send_header("X-Accel-Buffering", "no")
-                self.close_connection = True
-                self.end_headers()
-                sid, q = orch.bus.subscribe_queue()
+                raw_cursor = self.headers.get("Last-Event-ID", "").strip()
+                request_epoch = self.headers.get("X-Aura-Event-Epoch", "").strip()
                 try:
+                    cursor = max(0, int(raw_cursor)) if raw_cursor else None
+                except ValueError:
+                    cursor = None
+                # Sequence numbers restart with a new engine process. If the
+                # client resumes across that boundary, replay this process's
+                # bounded history instead of waiting for the old number again.
+                if request_epoch and request_epoch != orch.bus.epoch:
+                    cursor = 0
+
+                if cursor is None:
+                    sid, q = orch.bus.subscribe_queue()
+                    backlog = []
+                else:
+                    sid, q, backlog = orch.bus.subscribe_queue_after(cursor)
+
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Connection", "close")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.send_header("X-Aura-Event-Epoch", orch.bus.epoch)
+                    self.close_connection = True
+                    self.end_headers()
                     self.wfile.write(b"retry: 2000\n\n")
-                    for ev in orch.bus.recent(20):
+                    for ev in backlog:
                         self._write_sse(ev.seq, ev.type, ev.as_dict()["data"], ev.ts)
                     self.wfile.flush()
                     while True:
@@ -626,6 +644,7 @@ def _state_snapshot(orch, cfg, auth: bool = True) -> dict:
     session = orch.session
     planner_status = dict(getattr(orch, "planner_status", {}) or {})
     planner_name = type(getattr(orch, "planner", None)).__name__
+    wake_status = orch.wake_status()
     return {
         "state": orch.state,
         "version": _version(),
@@ -633,6 +652,10 @@ def _state_snapshot(orch, cfg, auth: bool = True) -> dict:
         "bridge": orch.bridge.platform,
         "wake_mode": cfg.wake.mode,
         "wake_phrase": cfg.wake.phrase,
+        "wake_engine": wake_status["engine"],
+        "wake_active": wake_status["active"],
+        "wake_error": wake_status["error"],
+        "wake_detail": wake_status["detail"],
         "tts_enabled": cfg.tts.enabled,
         "ask_before_run": cfg.safety.show_plan_before_run,
         "data_dir": cfg.data_dir,

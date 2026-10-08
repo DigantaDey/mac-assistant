@@ -205,7 +205,11 @@ struct PanelView: View {
                 .disabled(model.isBusy)
 
             VStack(spacing: 3) {
-                Text(model.phase == "armed" ? "Say your wake phrase" : model.phaseLabel)
+                Text(model.phase == "armed"
+                     ? (model.isAlwaysListeningActive
+                        ? "Say “\(model.wakeActivationPhrase ?? "your wake phrase")”"
+                        : "Tap the orb to speak")
+                     : model.phaseLabel)
                     .font(.system(size: 13, weight: .semibold))
                 Text(model.isListening ? "…and just talk" : "or type a command below")
                     .font(.system(size: 11))

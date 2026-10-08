@@ -73,7 +73,10 @@ enum Permissions {
     /// on macOS, the consent prompt can be attributed to osascript/python and
     /// never appear beside Aura in Privacy & Security.
     static func testAutomation() -> AutomationTestResult {
-        let source = #"tell application "System Events" to get name of first application process"#
+        // Reading System Events' version is a read-only AppleEvent. Avoid
+        // enumerating application processes here: that also exercises AX and
+        // can make an Automation test look like an Accessibility failure.
+        let source = #"tell application id "com.apple.systemevents" to get version"#
         guard let script = NSAppleScript(source: source) else {
             return AutomationTestResult(ok: false,
                                         message: "Couldn't prepare the Automation test.",
@@ -92,20 +95,20 @@ enum Permissions {
             return AutomationTestResult(
                 ok: false,
                 message: needsPermission
-                    ? "macOS needs permission to let Aura control System Events. Turn Aura on in Privacy & Security › Automation."
+                    ? "macOS needs permission to let Aura send Apple events to System Events. Turn Aura on in Privacy & Security › Automation."
                     : "The Automation test failed: \(detail)",
                 permissionRequired: needsPermission)
         }
 
-        if let reached = result.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !reached.isEmpty {
+        let version = result.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let version, !version.isEmpty {
             return AutomationTestResult(
                 ok: true,
-                message: "Automation works — Aura reached System Events (\(reached)).",
+                message: "Automation works — Aura reached System Events (version \(version)).",
                 permissionRequired: false)
         }
-        return AutomationTestResult(ok: true,
-                                    message: "Automation works — Aura reached System Events.",
+        return AutomationTestResult(ok: false,
+                                    message: "System Events didn't return a version, so Aura couldn't verify Automation access.",
                                     permissionRequired: false)
     }
 

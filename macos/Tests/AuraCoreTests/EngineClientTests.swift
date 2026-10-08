@@ -109,7 +109,7 @@ final class EngineClientTests: XCTestCase {
     }
 
     func testStateAndConfigDecode() async throws {
-        let state = #"{"state":"proposing","version":"0.6.0","wake_mode":"openwakeword","mic_ready":true,"planner_online":false,"planner":{"engine":"openai_compat","model":"qwen3:4b","base_url":"http://127.0.0.1:11434/v1","last_error":"connection refused"},"session":{"id":"abc","transcript":"empty the trash","token":"deadbeef"}}"#
+        let state = #"{"state":"proposing","version":"0.6.0","wake_mode":"openwakeword","wake_phrase":"hey aura","wake_engine":"TemplateWakeEngine","wake_active":true,"wake_detail":"Always listening is active — say hey aura.","mic_ready":true,"planner_online":false,"planner":{"engine":"openai_compat","model":"qwen3:4b","base_url":"http://127.0.0.1:11434/v1","last_error":"connection refused"},"session":{"id":"abc","transcript":"empty the trash","token":"deadbeef"}}"#
         let config = #"{"version":"0.6.0","resolved_profile":"mac","data_dir":"/tmp","port":7331,"live":{"tts":{"enabled":true,"rate":178},"safety":{"show_plan_before_run":false}},"planner":{"model":"qwen3:4b"},"files":{"user_config":"/tmp/config.toml","runtime":"/tmp/runtime.toml"}}"#
 
         StubURLProtocol.respond = { request in
@@ -121,11 +121,26 @@ final class EngineClientTests: XCTestCase {
         XCTAssertEqual(snapshot.session?.token, "deadbeef")
         XCTAssertEqual(snapshot.planner?.lastError, "connection refused")
         XCTAssertEqual(snapshot.micReady, true)
+        XCTAssertEqual(snapshot.wakePhrase, "hey aura")
+        XCTAssertEqual(snapshot.wakeEngine, "TemplateWakeEngine")
+        XCTAssertEqual(snapshot.wakeActive, true)
+        XCTAssertEqual(snapshot.wakeDetail, "Always listening is active — say hey aura.")
 
         let settings = try await client.config()
         XCTAssertEqual(settings.resolvedProfile, "mac")
         XCTAssertEqual(settings.liveValue("tts", "rate")?.intValue, 178)
         XCTAssertEqual(settings.liveValue("safety", "show_plan_before_run")?.boolValue, false)
+    }
+
+    func testMetricsDecodeActualWakeListenerStatus() async throws {
+        let payload = #"{"rss_mb":120.5,"state":"armed","wake_mode":"openwakeword","wake_engine":"OpenWakeWordEngine","wake_active":true,"wake_detail":"Always listening is active — say Hey Jarvis.","wake_error":""}"#
+        StubURLProtocol.respond = { _ in (200, Data(payload.utf8)) }
+
+        let metrics = try await makeClient().metrics()
+        XCTAssertEqual(metrics.wakeEngine, "OpenWakeWordEngine")
+        XCTAssertEqual(metrics.wakeActive, true)
+        XCTAssertEqual(metrics.wakeDetail, "Always listening is active — say Hey Jarvis.")
+        XCTAssertEqual(metrics.wakeError, "")
     }
 
     func testWritesArePostsWithJSONBodies() async throws {
