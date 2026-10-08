@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import AVFoundation
 import AuraCore
+import CoreGraphics
 
 /// The app owns the consent conversation.
 ///
@@ -45,8 +46,42 @@ enum Permissions {
 
     // MARK: accessibility
 
+    /// Whether macOS currently trusts Aura for Accessibility — read live.
+    ///
+    /// `AXIsProcessTrusted()` alone is not enough for a menu-bar app that runs
+    /// for days. HIServices answers it from a per-process cache that is only
+    /// refreshed by the `com.apple.accessibility.api` distributed notification,
+    /// and that notification can arrive *before* tccd has committed the grant —
+    /// so the cache refills with the old "denied" and never corrects itself.
+    /// The result is the exact complaint this app must never produce: the user
+    /// has switched Aura on, System Settings agrees, and Aura still says no.
+    ///
+    /// An event tap cannot be created without the trust and cannot be answered
+    /// from that cache, so it is the live probe. `AXIsProcessTrusted()` remains
+    /// the fallback — if the probe is unavailable for any reason, this degrades
+    /// to exactly the behaviour it replaces, never to a wrong "no".
     static var accessibilityGranted: Bool {
-        AXIsProcessTrusted()
+        if eventTapProbeSucceeds() { return true }
+        return AXIsProcessTrusted()
+    }
+
+    /// A listen-only tap on the session's event stream: permitted only with the
+    /// Accessibility grant. Created and torn down immediately — nothing is
+    /// observed, and no prompt is raised when it is refused.
+    private static func eventTapProbeSucceeds() -> Bool {
+        let mask = CGEventMask(1 << CGEventType.mouseMoved.rawValue)
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: mask,
+            // The tap is never enabled, so this is never called; passing the
+            // event back unretained keeps it correct even if that changes.
+            callback: { _, _, event, _ in Unmanaged.passUnretained(event) },
+            userInfo: nil
+        ) else { return false }
+        CFMachPortInvalidate(tap)
+        return true
     }
 
     /// Shows the system dialog once; afterwards the user flips the switch in

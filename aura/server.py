@@ -601,13 +601,19 @@ def _permissions_snapshot(orch, cfg) -> dict:
     from . import permissions as perms
 
     wake_ready, wake_detail = perms.check_wake_models(cfg)
+    # A permission panel is read after the user has been to System Settings, so
+    # it must never answer from a cache: this is the one place a stale "not
+    # granted" is indistinguishable from a bug.
+    accessibility = perms.check_accessibility()
     return {
         "platform": "mac" if perms.is_mac() else "other",
         "profile": cfg.profile,
         "resolved_profile": config_mod.resolved_profile(cfg),
         "bridge": orch.bridge.platform,
         "microphone": perms.check_microphone(orch),
-        "accessibility": perms.check_accessibility(),
+        "accessibility": accessibility,
+        "accessibility_detail": perms.accessibility_detail(accessibility),
+        "accessibility_identity": perms.accessibility_identity() or "",
         "whisper_cpp": perms.check_whisper_cpp(cfg),
         "planner_server": perms.check_planner_server(cfg),
         "planner_engine": cfg.planner.engine,

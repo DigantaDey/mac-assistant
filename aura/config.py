@@ -15,6 +15,8 @@ persists UI changes atomically.
 
 from __future__ import annotations
 
+import ast
+import json
 import os
 import sys
 import tempfile
@@ -252,12 +254,64 @@ def _warn_bad_value(section: str, key: str, want: str, value: Any) -> None:
           file=sys.stderr)
 
 
+def _parse_list_literal(text: str) -> Any:
+    """Parse a stringified list with JSON first, then Python literal syntax.
+
+    Aura's own overrides used `str(list)` (single quotes — not JSON), while a
+    hand-edited file is more likely to hold JSON. Either spelling is readable.
+    """
+    for parse in (json.loads, ast.literal_eval):
+        try:
+            parsed = parse(text)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list):
+            return parsed
+    return None
+
+
+def _coerce_list(value: Any) -> list[Any] | None:
+    """Read a list out of a value that arrived as a string.
+
+    Aura writes its own runtime overrides, and an earlier build stringified
+    list values on the way out — so a real install can hold
+
+        models = "['/…/wakewords/hey-aura.npz']"
+
+    instead of a TOML array. Refusing to read that dropped the user's trained
+    wake phrase on every launch, with only a warning on stderr to show for it.
+    Repairing it here means an existing install heals itself on the next read;
+    `_toml_value` writes a real array from now on.
+
+    Returns None when the value is not a list in any readable spelling.
+    """
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text.startswith("[") or not text.endswith("]"):
+        return None
+    parsed = _parse_list_literal(text)
+    return parsed if isinstance(parsed, list) else None
+
+
+def _heal_value(value: Any) -> Any:
+    """`_coerce_list` for rewriting: leave anything else exactly as it was."""
+    if isinstance(value, str):
+        coerced = _coerce_list(value)
+        if coerced is not None:
+            return coerced
+    return value
+
+
 def _apply(dc: Any, raw: dict[str, Any]) -> None:
     """Merge a raw dict into a dataclass instance.
 
     Unknown keys are ignored; a key whose *type* doesn't match is skipped
     with a warning — a typo in the user's file must not corrupt the running
-    config (e.g. `models = "hey_jarvis"` where a list belongs).
+    config (e.g. `models = "hey_jarvis"` where a list belongs). A list that
+    arrived stringified is read rather than dropped (see `_coerce_list`).
     """
     if not isinstance(raw, dict):
         return
@@ -278,8 +332,9 @@ def _apply(dc: Any, raw: dict[str, Any]) -> None:
             else:
                 _warn_bad_value(section, key, "true/false", value)
         elif isinstance(current, list):
-            if isinstance(value, list):
-                setattr(dc, key, value)
+            coerced = _coerce_list(value)
+            if coerced is not None:
+                setattr(dc, key, coerced)
             else:
                 _warn_bad_value(section, key, "a list", value)
         elif isinstance(current, (int, float)):
@@ -380,13 +435,50 @@ def load_config(explicit_path: str | None = None,
 # --------------------------------------------------------------------------- #
 
 
-def _toml_value(value: Any) -> str:
-    if isinstance(value, bool):
+def _toml_escape(text: str) -> str:
+    """Escape one string as a TOML basic string body (quotes excluded)."""
+    out: list[str] = []
+    for ch in text:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\b":
+            out.append("\\b")
+        elif ch == "\f":
+            out.append("\\f")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _toml_value(value: Any) -> str | None:
+    """Render one Python value as TOML. None means "don't write this key".
+
+    A list must round-trip as a TOML *array*. Stringifying it (what an earlier
+    build did) produced `models = "['…hey-aura.npz']"`, which the loader then
+    rejected as "expected a list" — so the user's own trained wake phrase was
+    silently discarded on every launch after the one that trained it.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):          # before int: bool is an int subclass
         return "true" if value else "false"
     if isinstance(value, (int, float)):
-        return str(value)
-    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{text}"'
+        return repr(float(value)) if isinstance(value, float) else str(value)
+    if isinstance(value, (list, tuple)):
+        parts = [rendered for rendered in (_toml_value(item) for item in value)
+                 if rendered is not None]
+        return "[" + ", ".join(parts) + "]"
+    return f'"{_toml_escape(str(value))}"'
 
 
 def write_overrides(data_dir: str | Path, updates: dict[str, dict[str, Any]]) -> Path:
@@ -404,7 +496,9 @@ def write_overrides(data_dir: str | Path, updates: dict[str, dict[str, Any]]) ->
     raw = _load_toml(path) or {}
     for section, values in raw.items():
         if isinstance(values, dict):
-            current[section] = dict(values)
+            # Heal values an earlier build stringified, so the file converges
+            # on the array spelling instead of carrying the broken one forever.
+            current[section] = {key: _heal_value(value) for key, value in values.items()}
 
     for section, values in updates.items():
         allowed = LIVE_FIELDS.get(section, set())
@@ -416,9 +510,15 @@ def write_overrides(data_dir: str | Path, updates: dict[str, dict[str, Any]]) ->
     for section, values in current.items():
         if not values:
             continue
-        lines.append(f"[{section}]")
+        rendered = []
         for key, value in values.items():
-            lines.append(f"{key} = {_toml_value(value)}")
+            text = _toml_value(value)
+            if text is not None:          # None has no TOML spelling — omit it
+                rendered.append(f"{key} = {text}")
+        if not rendered:
+            continue
+        lines.append(f"[{section}]")
+        lines.extend(rendered)
         lines.append("")
 
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")

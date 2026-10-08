@@ -251,8 +251,18 @@ have open. So the engine behaves like a serious local service:
 
 Permissions are still macOS's: Aura asks through TCC (Microphone,
 Accessibility, per-app Automation) and reports the *real* answer, never a
-guess. Revoke anything in System Settings and Aura's Setup screen will say so
-on the next refresh.
+guess. Grant or revoke anything in System Settings and Aura notices on its own
+— macOS caches the Accessibility answer per process, so Aura re-reads it from a
+fresh one and watches for the change instead of waiting for you to hit a
+refresh button.
+
+Two things can make a grant you *did* give look missing, and Aura says which
+one you have instead of just reporting "not granted": TCC files Accessibility
+under the app that owns the engine (so an engine started from a terminal is
+granted as *that terminal*, not as Aura), and an ad-hoc signature binds the
+grant to that build's code hash, so a rebuild orphans it while System Settings
+still shows the switch on. Aura detects both and tells you the fix — the second
+one is why `make_app.sh` can sign with a stable identity.
 
 ---
 

@@ -193,6 +193,146 @@ class TestLiveWakeSwitch:
         assert "demo" in data["message"].lower()
 
 
+class TestWakePreroll:
+    """The wake phrase must survive into the recording.
+
+    A detector can only fire once the phrase is behind it, so the audio that
+    *contains* the phrase is gone by the time recording starts. Every
+    always-listening session was therefore transcribed as the command alone and
+    then rejected by the phrase gate — Aura woke, heard "open YouTube", decided
+    it wasn't addressed to her, and said nothing at all.
+    """
+
+    def _orchestrator(self, stack):
+        orch = stack.build_orchestrator()
+        orch.cfg.wake.mode = "openwakeword"
+        orch.cfg.wake.phrase = "hey aura"
+        orch._has_audio = True
+        return orch
+
+    async def _run(self, orch, stream, wake_after_frames):
+        """Drive the real audio loop; return the frames handed to the VAD."""
+        from aura.audio import AudioFrame
+        from aura.wakeword import WakeEngine
+
+        class FireAt(WakeEngine):
+            def __init__(self):
+                self.n = 0
+
+            def feed(self, _frame):
+                self.n += 1
+                return self.n == wake_after_frames
+
+        orch._wake = FireAt()
+        captured: list = []
+
+        async def grab(frames):
+            captured.extend(frames)
+
+        orch.run_session_frames = grab
+        listener = asyncio.create_task(orch._audio_loop())
+        orch._audio_task = listener
+        try:
+            for pcm in stream:
+                await orch._queue.put(AudioFrame(pcm=pcm, ts=time.time()))
+            for _ in range(600):
+                if captured:
+                    break
+                await asyncio.sleep(0.005)
+        finally:
+            listener.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await listener
+        return captured
+
+    #: Amplitudes are markers: PHRASE_AMP is spoken *before* the detector can
+    #: fire, COMMAND_AMP after. Which of them turns up in the capture is the
+    #: whole question, so the assertion has to look at samples, not durations.
+    PHRASE_AMP = 4000
+    COMMAND_AMP = 1500
+
+    def _tone(self, amp, seconds=0.032):
+        import numpy as np
+
+        return (np.ones(int(seconds * 16000), dtype=np.int16) * amp)
+
+    def _quiet(self, seconds=0.032):
+        import numpy as np
+
+        return np.zeros(int(seconds * 16000), dtype=np.int16)
+
+    async def test_phrase_audio_is_inside_the_capture(self, stack: DemoStack):
+        orch = self._orchestrator(stack)
+        # 20 frames of phrase, the wake fires on the 20th, then the command,
+        # then silence to close the utterance.
+        stream = ([self._tone(self.PHRASE_AMP)] * 20
+                  + [self._tone(self.COMMAND_AMP)] * 20
+                  + [self._quiet()] * 40)
+        captured = await self._run(orch, stream, wake_after_frames=20)
+        assert captured, "nothing was captured after the wake fired"
+
+        import numpy as np
+
+        samples = np.concatenate([np.asarray(f.pcm) for f in captured])
+        assert (samples == self.PHRASE_AMP).any(), (
+            "the audio spoken before the detector fired is missing from the "
+            "recording — the transcript can never begin with the wake phrase")
+        assert (samples == self.COMMAND_AMP).any(), "the command was not captured"
+
+    async def test_manual_wake_keeps_no_preroll(self, stack: DemoStack):
+        """A tap on the orb starts a clean recording — no stale room tone."""
+        orch = self._orchestrator(stack)
+        orch.cfg.wake.mode = "manual"
+        orch._preroll.extend(
+            type("F", (), {"pcm": self._quiet(), "ts": 0.0})() for _ in range(5))
+        await orch.trigger_manual()
+        assert list(orch._preroll) == []
+        assert orch.state == "capturing"
+
+
+class TestPhraseGateEndToEnd:
+    """What the phrase gate does with a real transcript, after the pre-roll."""
+
+    async def _session(self, stack, transcript):
+        orch = stack.build_orchestrator()
+        orch.cfg.wake.mode = "openwakeword"
+        orch.cfg.wake.phrase = "hey aura"
+
+        class FakeSTT:
+            def transcribe(self, _frames):
+                return transcript
+
+        orch.stt = FakeSTT()
+        planned: list[str] = []
+
+        async def fake_session(text, spoken=False):
+            planned.append(text)
+
+        orch._session_text = fake_session
+        import numpy as np
+
+        from aura.audio import AudioFrame
+
+        pcm = (np.ones(16000, dtype=np.int16) * 4000)
+        await orch.run_session_frames([AudioFrame(pcm=pcm, ts=time.time())])
+        return orch, planned
+
+    async def test_command_after_the_phrase_reaches_the_planner(self, stack: DemoStack):
+        _, planned = await self._session(stack, "Hey Aura, open YouTube")
+        assert planned == ["open YouTube"]
+
+    async def test_command_without_the_phrase_is_rejected(self, stack: DemoStack):
+        """The second factor still does its job against a false acoustic wake."""
+        orch, planned = await self._session(stack, "open YouTube")
+        assert planned == []
+        assert orch.state == "armed"
+
+    async def test_the_phrase_on_its_own_is_not_a_command(self, stack: DemoStack):
+        orch, planned = await self._session(stack, "hey aura")
+        assert planned == [], "Aura must not invent a request from a bare wake phrase"
+        assert orch.state == "armed"
+
+
 class TestIdleUnload:
     async def test_unload_called_after_idle(self, stack: DemoStack):
         orch = stack.build_orchestrator()
