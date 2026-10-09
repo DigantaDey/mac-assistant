@@ -63,6 +63,58 @@ final class WakeTrainingModelTests: XCTestCase {
     }
 }
 
+/// The Wake Phrase panel's listening meter and retrain notice ride on the
+/// state snapshot: a miscalibrated template must be *visible*, never silent.
+final class EngineStateWakeTelemetryTests: XCTestCase {
+
+    func testDecodesLiveListeningTelemetry() throws {
+        let json = """
+        {"state":"armed","version":"0.7.2","wake_mode":"openwakeword",
+         "wake_engine":"TemplateWakeEngine","wake_active":true,
+         "wake_detail":"Always listening is active — say “hey aura”.",
+         "wake_notice":"","wake_level":0.9812,"wake_threshold":0.9753,"wake_fires":2}
+        """
+        let state = try JSONDecoder().decode(EngineState.self, from: Data(json.utf8))
+        XCTAssertEqual(state.wakeActive, true)
+        XCTAssertEqual(state.wakeLevel, 0.9812)
+        XCTAssertEqual(state.wakeThreshold, 0.9753)
+        XCTAssertEqual(state.wakeFires, 2)
+        XCTAssertEqual(state.wakeNotice, "")
+    }
+
+    func testNullTelemetryDecodesToNil() throws {
+        // Python None lands as JSON null: nothing scored recently must not
+        // crash the decoder or invent a level.
+        let json = """
+        {"state":"armed","wake_active":true,"wake_notice":"",
+         "wake_level":null,"wake_threshold":0.9753,"wake_fires":null}
+        """
+        let state = try JSONDecoder().decode(EngineState.self, from: Data(json.utf8))
+        XCTAssertNil(state.wakeLevel)
+        XCTAssertEqual(state.wakeThreshold, 0.9753)
+        XCTAssertNil(state.wakeFires)
+    }
+
+    func testOlderEngineWithoutTelemetryStillDecodes() throws {
+        let json = """
+        {"state":"armed","version":"0.7.1","wake_mode":"manual","wake_active":false}
+        """
+        let state = try JSONDecoder().decode(EngineState.self, from: Data(json.utf8))
+        XCTAssertNil(state.wakeLevel)
+        XCTAssertNil(state.wakeThreshold)
+        XCTAssertNil(state.wakeNotice)
+    }
+
+    func testLegacyTemplateNoticeSurvivesDecoding() throws {
+        let json = """
+        {"state":"armed","wake_active":true,
+         "wake_notice":"This phrase was trained by an older Aura build and may be hard to trigger — train it again under Settings ▸ Wake Phrase."}
+        """
+        let state = try JSONDecoder().decode(EngineState.self, from: Data(json.utf8))
+        XCTAssertTrue(state.wakeNotice?.contains("train it again") ?? false)
+    }
+}
+
 final class JSONValueAnyTests: XCTestCase {
 
     func testAnyValueRoundTripsPrimitives() throws {

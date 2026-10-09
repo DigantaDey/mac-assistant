@@ -17,10 +17,23 @@ import tempfile
 import wave
 from pathlib import Path
 
+#: One transcription's deadline. whisper.cpp is a subprocess that loads its
+#: model on every invocation — a cold start with a `small` model can take
+#: several seconds before the first word is decoded, and the old 4-second cap
+#: silently returned "" (heard by the user as "I didn't catch that") on
+#: exactly the first command after a wake. The orchestrator independently
+#: bounds the whole wait by the session budget; this keeps the subprocess
+#: from outliving that promise.
+TRANSCRIBE_TIMEOUT_SECONDS = 15.0
+
 
 class STTEngine:
     def transcribe(self, pcm_frames) -> str:
         raise NotImplementedError
+
+    def warm(self) -> bool:
+        """Optional: pay cold-start costs now, not on the first utterance."""
+        return False
 
 
 def _write_wav(pcm_frames, path: Path, sample_rate: int = 16_000) -> None:
@@ -50,7 +63,8 @@ class WhisperCppSTT(STTEngine):
         if not self.bin:
             raise RuntimeError("whisper.cpp binary not found (looked for whisper-cli, main)")
 
-    def transcribe(self, pcm_frames) -> str:
+    @staticmethod
+    def _wav_bytes(pcm_frames) -> bytes:
         # Build WAV in memory and pipe through stdin — eliminates disk I/O
         # (no temp file create/write/read/unlink per utterance).
         import io
@@ -65,13 +79,16 @@ class WhisperCppSTT(STTEngine):
                 pcm = frame.pcm
                 chunks.append(pcm.tobytes() if hasattr(pcm, "tobytes") else bytes(pcm))
             wf.writeframes(b"".join(chunks))
-        wav_data = buf.getvalue()
+        return buf.getvalue()
 
+    def transcribe(self, pcm_frames) -> str:
+        wav_data = self._wav_bytes(pcm_frames)
         try:
             proc = subprocess.run(
                 [self.bin, "-m", self.model, "-f", "-",
                  "-l", self.language, "-nt", "-np"],
-                input=wav_data, capture_output=True, timeout=4,
+                input=wav_data, capture_output=True,
+                timeout=TRANSCRIBE_TIMEOUT_SECONDS,
             )
             if proc.returncode != 0:
                 raise RuntimeError(proc.stderr.decode(errors="replace")[:200])
@@ -89,13 +106,31 @@ class WhisperCppSTT(STTEngine):
                     proc = subprocess.run(
                         [self.bin, "-m", self.model, "-f", str(wav_path),
                          "-l", self.language, "-nt", "-np"],
-                        capture_output=True, text=True, timeout=4,
+                        capture_output=True, text=True,
+                        timeout=TRANSCRIBE_TIMEOUT_SECONDS,
                     )
                 except subprocess.TimeoutExpired:
                     return ""
                 return " ".join(proc.stdout.split()).strip()
             finally:
                 wav_path.unlink(missing_ok=True)
+
+    def warm(self) -> bool:
+        """One silent pass at startup: loads the binary, the model and the OS
+        page cache so the user's first command decodes at warm speed. A
+        failure here is fine — the first transcribe simply pays instead."""
+        try:
+            self.transcribe([_SilenceFrame(16_000 // 4)])   # 0.25 s of quiet
+            return True
+        except Exception:
+            return False
+
+
+class _SilenceFrame:
+    """A quarter-second of digital silence with the AudioFrame pcm shape."""
+
+    def __init__(self, samples: int) -> None:
+        self.pcm = b"\x00\x00" * samples
 
 
 class FasterWhisperSTT(STTEngine):
@@ -126,6 +161,15 @@ class FasterWhisperSTT(STTEngine):
             self._model = None
             return True
         return False
+
+    def warm(self) -> bool:
+        """Load the model now so the first utterance doesn't pay for it.
+        The orchestrator's idle-unload still reclaims it later, by design."""
+        try:
+            self._ensure_model()
+            return True
+        except Exception:
+            return False
 
     def transcribe(self, pcm_frames) -> str:
         model = self._ensure_model()

@@ -58,6 +58,20 @@ State = Literal["armed", "capturing", "transcribing", "planning",
 MAX_ACTIVE_REQUEST_SECONDS = 20.0
 TRAIN_CAPTURE_TIMEOUT_SECONDS = 5.0
 
+# One skill may not spend the whole session budget: a wedged Accessibility
+# call (an app that stopped answering AX) once held "what's on my screen"
+# until the watchdog killed the entire session with a generic "that took too
+# long". A per-skill deadline turns that into what it actually is — "this app
+# didn't answer" — with budget left for the reply to reach the user.
+SKILL_TIMEOUT_SECONDS = 15.0
+
+# Speech queued longer ago than this (wall clock — monotonic pauses while the
+# Mac sleeps) is stale: the moment it belongs to has passed. Without this a
+# Mac waking from sleep could suddenly announce a cancellation from an hour
+# ago, out of nowhere, and a wedged `say` could occupy the timeout for
+# something nobody is waiting to hear any more.
+MAX_SPEECH_AGE_SECONDS = 20.0
+
 #: How much audio Aura keeps behind the wake detector, and how long it waits
 #: for the command after a wake phrase that came on its own.
 #:
@@ -126,6 +140,7 @@ class Orchestrator:
 
         self._wake: WakeEngine | None = None
         self._wake_error = ""
+        self._wake_notice = ""
         self._vad = EnergyVAD(end_silence_seconds=cfg.session.end_of_speech_seconds,
                               max_seconds=cfg.session.max_utterance_seconds)
         self._mic: MicStream | SilentMic | None = None
@@ -195,6 +210,11 @@ class Orchestrator:
         # takes seconds, and paying that on the user's *first* command is
         # exactly what "still thinking" feels like. Best-effort — never fatal.
         asyncio.create_task(self._warm_planner(), name="aura-warmup")
+        # Same reasoning for the other cold-start cliffs: whisper.cpp loads
+        # its model per invocation, and the first pyobjc import inside a skill
+        # once cost more than the whole session budget (the "what's on my
+        # screen" deadline in the wild). Both pay at startup instead.
+        asyncio.create_task(self._warm_auxiliary(), name="aura-warmup-aux")
         self.state = "armed"
         self.bus.publish("state", state=self.state, mic=mic_kind,
                          wake=getattr(self.cfg.wake, "mode", "manual"))
@@ -227,6 +247,38 @@ class Orchestrator:
             log.info("warm-up: %s", "ready" if ok else "not available (see the log above)")
         except Exception as exc:
             log_exception("warm-up failed", exc, logger=log)
+
+    async def _warm_auxiliary(self) -> None:
+        """Pre-pay the two remaining cold-start cliffs, in the background.
+
+        * STT: whisper.cpp is a subprocess that loads its model on *every*
+          invocation; the first real command must not race that load against
+          the transcription deadline. One silent pass at startup warms the
+          binary, the model file and the OS page cache.
+        * Accessibility: the first `import ApplicationServices` (pyobjc) in
+          the engine process can take longer than an entire session budget on
+          a cold disk — which is how "what's on my screen" once died on the
+          watchdog before reading a single element. Import it here, once,
+          where the wait hurts nobody.
+        """
+        started = time.monotonic()
+        warmed: list[str] = []
+        warm_stt = getattr(self.stt, "warm", None)
+        if callable(warm_stt):
+            try:
+                if await asyncio.to_thread(warm_stt):
+                    warmed.append("speech")
+            except Exception as exc:
+                log.debug("warm-up: speech skipped (%s)", exc)
+        if getattr(self.bridge, "platform", "") == "mac":
+            try:
+                if await asyncio.to_thread(_prewarm_accessibility):
+                    warmed.append("accessibility")
+            except Exception as exc:
+                log.debug("warm-up: accessibility skipped (%s)", exc)
+        if warmed:
+            log.info("warm-up: %s ready in %.1fs", " + ".join(warmed),
+                     time.monotonic() - started)
 
     async def ensure_microphone(self) -> tuple[bool, str]:
         """Attach the live stream after a permission grant without a restart.
@@ -442,13 +494,33 @@ class Orchestrator:
         from .wakeword import build_wake_engine
 
         self._wake_error = ""
+        self._wake_notice = ""
 
         def on_fallback(reason: str) -> None:
             self._wake_error = reason
+            # The file log, not just the bus: "always listening" silently
+            # degrading to manual wake must leave a trace a bug report can
+            # carry — the Activity feed is not where users look first.
+            log.warning("wake: %s", reason)
             self.bus.publish("log", line=f"wake: {reason}")
             self.bus.publish("wake_fallback", reason=reason)
 
-        return build_wake_engine(self.cfg, on_fallback=on_fallback)
+        engine = build_wake_engine(self.cfg, on_fallback=on_fallback)
+        # A template trained by an older Aura was calibrated in a score space
+        # the live detector never produces — its threshold is unreachable and
+        # the phrase simply never fires. It still loads, so say the honest
+        # thing instead of pretending to listen for a phrase that can't wake.
+        calibration = getattr(engine, "calibration", None)
+        if calibration is not None and calibration < 2:
+            self._wake_notice = (
+                "This phrase was trained by an older Aura build and may be hard "
+                "to trigger — train it again under Settings ▸ Wake Phrase.")
+            log.warning("wake: %s", self._wake_notice)
+            self.bus.publish("log", line=f"wake: {self._wake_notice}")
+        log.info("wake: listening via %s%s", type(engine).__name__,
+                 f" — phrase gate “{self.cfg.wake.phrase}”"
+                 if self._phrase_gated else "")
+        return engine
 
     def wake_status(self) -> dict[str, Any]:
         """Report the listener that is actually running, not just the saved toggle."""
@@ -488,8 +560,21 @@ class Orchestrator:
                         break
             detail = (f"Always listening is active — say “{phrase}”." if phrase
                       else "Always listening is active with the installed wake model.")
+        # Live listening telemetry — what the detector is hearing right now.
+        # "I said it and nothing happened" needs an answer the user can see:
+        # a level beside the threshold says whether Aura heard anything at all.
+        stats: dict[str, Any] = {}
+        if engine is not None:
+            try:
+                stats = engine.stats() or {}
+            except Exception:      # telemetry must never break the status read
+                stats = {}
         return {"mode": mode, "engine": engine_name, "active": active,
-                "error": self._wake_error, "detail": detail}
+                "error": self._wake_error, "detail": detail,
+                "notice": self._wake_notice,
+                "level": stats.get("level"),
+                "threshold": stats.get("threshold"),
+                "fires": stats.get("fires")}
 
     async def set_wake_mode(self, mode: str, phrase: str | None = None) -> dict:
         """Switch manual ↔ always-listening at runtime; persist only a live mode."""
@@ -631,8 +716,12 @@ class Orchestrator:
         """
         self.state = "capturing"
         if preroll:
+            log.info("wake: %s fired — capturing the command (%.1fs of pre-roll)",
+                     type(self._wake).__name__,
+                     len(preroll) * vad_mod.FRAME_SECONDS)
             self._vad.prime(preroll, grace_silence=WAKE_COMMAND_GRACE_SECONDS)
         else:
+            log.info("listening: manual wake — capturing")
             self._vad.reset()
         self.bus.publish("state", state=self.state)
         self.bus.publish("hint", text="Listening…")
@@ -686,6 +775,8 @@ class Orchestrator:
         if self._phrase_gated:
             phrase = self.cfg.wake.phrase
             if not phrase_gate(text, phrase):
+                log.info("phrase gate rejected %r — expected it to begin with %r",
+                         text[:60], phrase)
                 self.bus.publish(
                     "log",
                     line=f"phrase gate rejected {text[:60]!r} — expected it to begin "
@@ -697,6 +788,7 @@ class Orchestrator:
                 # The phrase on its own. Aura really did hear it, so say so
                 # rather than pretending a command arrived — and go straight
                 # back to listening.
+                log.info("wake phrase %r heard, no request followed it", phrase)
                 self.bus.publish("hint", text="Yes? Say what you need.")
                 self.bus.publish("log", line=f"wake phrase “{phrase}” heard, no request yet")
                 await self._end_session()
@@ -955,8 +1047,25 @@ class Orchestrator:
                 # command — for as long as macOS took to answer. A worker
                 # thread keeps Aura responsive (and the orb breathing) while
                 # the skill works.
-                result = await asyncio.to_thread(
-                    _execute_skill, skill, action.args, _SkillCtx(self))
+                #
+                # The wait is bounded below the session budget: a single AX
+                # call to an app that stopped answering can outlive every
+                # inner timeout, and the session must still report *which*
+                # app didn't answer instead of dying on the watchdog's
+                # generic "that took too long". The orphaned thread's late
+                # result is discarded — nothing reads it any more.
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _execute_skill, skill, action.args, _SkillCtx(self)),
+                    timeout=SKILL_TIMEOUT_SECONDS)
+            except TimeoutError:
+                log.warning("result: %s timed out after %gs — reporting failure "
+                            "while the worker thread unwinds on its own",
+                            action.skill, SKILL_TIMEOUT_SECONDS)
+                result = _skill_result(
+                    False,
+                    f"{action.skill} didn't finish within {SKILL_TIMEOUT_SECONDS:g} "
+                    "seconds — the app it reached for may not be responding.")
             except Exception as exc:  # a crashing skill must never kill the session
                 result = _skill_result(False, f"{action.skill} failed: {exc}")
             pending["result"] = _SkillOutcome(result.ok, result.message, result.data)
@@ -1032,10 +1141,26 @@ class Orchestrator:
                                          reply, outcome, total_ms)
 
     def _speak_async(self, text: str) -> None:
-        """Speak on a worker without blocking the session or leaking failures."""
+        """Speak on a worker without blocking the session or leaking failures.
+
+        Queued speech carries its birth time: a Mac that sleeps mid-session
+        resumes with executor work that is an hour old, and a `say` process
+        announcing a long-gone "I didn't hear a yes" into a quiet room is not
+        a delight. Wall clock on purpose — monotonic pauses while asleep.
+        """
         if self._loop is None:
             return
-        future = self._loop.run_in_executor(None, self.tts.speak, text)
+        queued_at = time.time()
+
+        def speak_if_fresh() -> float:
+            age = time.time() - queued_at
+            if age > MAX_SPEECH_AGE_SECONDS:
+                log.info("skipping stale speech queued %.0fs ago: %r",
+                         age, text[:60])
+                return 0.0
+            return self.tts.speak(text)
+
+        future = self._loop.run_in_executor(None, speak_if_fresh)
 
         def report_failure(done) -> None:
             try:
@@ -1655,6 +1780,24 @@ def _execute_skill(skill, args: dict, ctx: _SkillCtx):
     the next command while a skill waits on the system.
     """
     return asyncio.run(skill.execute(args, ctx))
+
+
+def _prewarm_accessibility() -> bool:
+    """Import the pyobjc frameworks the AX skills need — nothing else.
+
+    The first import of ApplicationServices/AppKit/Quartz in a process is
+    disk- and binding-heavy (seconds on a cold start); doing it at startup
+    keeps it off the first "what's on my screen". Returns False off-Mac or
+    when pyobjc isn't installed — the skills report that honestly themselves.
+    """
+    import sys as _sys
+
+    if _sys.platform != "darwin":
+        return False
+    import AppKit  # noqa: F401
+    import ApplicationServices  # noqa: F401
+    import Quartz  # noqa: F401
+    return True
 
 
 class _SkillCtx:

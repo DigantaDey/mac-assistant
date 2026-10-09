@@ -30,6 +30,15 @@ public struct EngineState: Decodable, Sendable {
     public let wakeActive: Bool?
     public let wakeError: String?
     public let wakeDetail: String?
+    /// A template trained by an older build, calibrated in a score space the
+    /// live detector never reaches — Aura keeps listening but recommends
+    /// retraining, and the panel must say so instead of silently never waking.
+    public let wakeNotice: String?
+    /// Live listening telemetry: the detector's best score over the last
+    /// couple of seconds, beside the threshold it must clear.
+    public let wakeLevel: Double?
+    public let wakeThreshold: Double?
+    public let wakeFires: Int?
     public let ttsEnabled: Bool?
     public let askBeforeRun: Bool?
     public let dataDir: String?
@@ -66,6 +75,10 @@ public struct EngineState: Decodable, Sendable {
         case wakeActive = "wake_active"
         case wakeError = "wake_error"
         case wakeDetail = "wake_detail"
+        case wakeNotice = "wake_notice"
+        case wakeLevel = "wake_level"
+        case wakeThreshold = "wake_threshold"
+        case wakeFires = "wake_fires"
         case ttsEnabled = "tts_enabled"
         case askBeforeRun = "ask_before_run"
         case dataDir = "data_dir"

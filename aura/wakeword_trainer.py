@@ -55,6 +55,20 @@ EMBED_DIM = BANDS * 2  # mean ∥ max pooling
 WINDOW_S = 1.0         # the one window size used at training AND detection —
 # samples are normalized to it so "same phrase, different moment" scores the same
 
+#: Detection geometry — shared by TemplateWakeEngine and the calibration below.
+#: The live detector scores a trailing WINDOW_S window every DETECT_STEP_S,
+#: plus a second window DETECT_OFFSET_S behind it (so a phrase longer than the
+#: window still gets a well-aligned look). The offset is an exact multiple of
+#: the step, so "every window on the DETECT_STEP_S grid" is the union of both.
+DETECT_STEP_S = 0.128
+DETECT_OFFSET_S = 0.384
+
+#: Bump when the score space a saved threshold lives in changes. Templates
+#: written by older Aura builds (no key ⇒ version 1) were calibrated on raw
+#: capture embeddings the live detector never produces; they load and run, but
+#: the app recommends retraining them.
+TEMPLATE_CALIBRATION = 2
+
 
 def _require_numpy() -> None:
     if not HAS_NUMPY:
@@ -126,6 +140,30 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:  # type: ignore[name-defined]
     if denom == 0.0:
         return 0.0
     return float(np.dot(a, b) / denom)
+
+
+def detector_windows(x: np.ndarray, sr: int = SR) -> list[np.ndarray]:  # type: ignore[name-defined]
+    """Every WINDOW_S slice of `x` the live detector would actually score.
+
+    TemplateWakeEngine scores on a DETECT_STEP_S cadence, so this is the clip's
+    windows on that same grid (the offset window is a whole number of steps
+    back, hence already part of it). Calibrating the threshold on *these*
+    slices is what makes the stored number live in the score space detection
+    produces — the earlier build embedded whole captures instead (preroll +
+    phrase + trailing silence ≈ 2 s), whose mean-pooled spectrum is diluted by
+    silence the 1 s live window never contains. The result was a threshold no
+    real utterance could reach: the trained phrase simply never fired.
+
+    Clips shorter than one window are centered/padded exactly like
+    `normalize_length` — the single view the detector would get of them.
+    """
+    _require_numpy()
+    win = int(WINDOW_S * sr)
+    step = max(1, round(DETECT_STEP_S * sr))
+    x = np.asarray(x)
+    if len(x) <= win:
+        return [normalize_length(x, sr)]
+    return [x[start:start + win] for start in range(0, len(x) - win + 1, step)]
 
 
 # --------------------------------------------------------------------------- #
@@ -251,22 +289,54 @@ class TrainedWake:
     negatives: int
 
 
+def _window_scores(clips: list, template: np.ndarray) -> np.ndarray:  # type: ignore[name-defined]
+    """Best detector-visible score per clip: max over `detector_windows`.
+
+    The live engine fires when ANY scored window clears the threshold, so the
+    per-clip maximum is the honest "what the detector would see" statistic —
+    for positives (the phrase must fire) and negatives (noise must not) alike.
+    """
+    scores = []
+    for clip in clips:
+        windows = detector_windows(clip)
+        embeddings = np.stack([spectral_embedding(w) for w in windows])
+        embeddings = embeddings / np.maximum(
+            np.linalg.norm(embeddings, axis=1, keepdims=True), 1e-9)
+        scores.append(float(np.max(embeddings @ template)))
+    return np.asarray(scores, dtype=np.float64)
+
+
+#: Where the threshold sits between the strongest negative and the weakest
+#: positive, 0 = at the negative, 1 = at the positive. Below the midpoint on
+#: purpose: in always-on mode a spoken-phrase gate (whisper transcript must
+#: begin with the phrase) rejects acoustic false accepts, so the expensive
+#: failure is a phrase that doesn't fire — the product reading as dead — not
+#: one extra rejected transcription.
+THRESHOLD_POSITION = 0.40
+
+
 def train_wake(positives: list, negatives: list | None = None) -> TrainedWake:
     """Calibrate a template detector on the user's own voice.
 
-    Positives: samples of the phrase. Negatives: synthesized backgrounds
-    (always) plus locally spoken distractors via `say` (on a Mac). The score
-    at detection time is cosine(template, window) — so the threshold is
-    calibrated in exactly that space: the midpoint between the weakest
-    positive we accepted and the strongest negative we could synthesize.
-    Closed form, deterministic, instant, and the reported margin is
-    measured, not assumed.
+    Positives: samples of the phrase, exactly as the Wake Phrase Studio
+    captured them (VAD clip: preroll + phrase + trailing silence). Negatives:
+    synthesized backgrounds (always) plus any user-supplied clips.
+
+    Two spaces, kept apart on purpose:
+
+    * The **template** is the mean of each sample's centered one-second
+      window — the canonical view of the phrase, position-independent.
+    * The **threshold** is calibrated on the scores the *live detector* would
+      produce: every window on its scoring grid, best per clip (see
+      `detector_windows`). A threshold calibrated anywhere else is a number
+      the microphone stream can never reach — which is exactly how the
+      previous build shipped trained phrases that never fired.
     """
     _require_numpy()
     if len(positives) < 3:
         raise TrainingUnavailable("Need at least three good samples of your phrase.")
 
-    pos = np.stack([spectral_embedding(p) for p in positives])   # (P, D)
+    pos = np.stack([spectral_embedding(normalize_length(p)) for p in positives])
     pos = pos / np.maximum(np.linalg.norm(pos, axis=1, keepdims=True), 1e-9)
     template = pos.mean(axis=0)
     tnorm = float(np.linalg.norm(template))
@@ -282,18 +352,17 @@ def train_wake(positives: list, negatives: list | None = None) -> TrainedWake:
     # wave reader rejects anyway). User-supplied negatives remain supported,
     # while deterministic spectral negatives keep this interactive fit
     # snappy enough to feel instant behind the "Train phrase" button.
-    neg = np.stack([spectral_embedding(normalize_length(n)) for n in negs])
-    neg = neg / np.maximum(np.linalg.norm(neg, axis=1, keepdims=True), 1e-9)
 
-    pos_scores = pos @ template
-    neg_scores = neg @ template
-    threshold = float((pos_scores.min() + neg_scores.max()) / 2.0)
+    pos_scores = _window_scores(list(positives), template)
+    neg_scores = _window_scores(negs, template)
+    threshold = float(neg_scores.max()
+                      + THRESHOLD_POSITION * (pos_scores.min() - neg_scores.max()))
     threshold = min(threshold, float(pos_scores.min()) - 1e-3)  # never reject a provided sample
     margin = float(pos_scores.mean() - neg_scores.mean())
 
     return TrainedWake(template=template.astype(np.float32),
                        threshold=threshold, margin=margin,
-                       positives=len(positives), negatives=len(neg))
+                       positives=len(positives), negatives=len(negs))
 
 
 def save_template(trained: TrainedWake, phrase: str, path: Path) -> Path:
@@ -306,6 +375,7 @@ def save_template(trained: TrainedWake, phrase: str, path: Path) -> Path:
         threshold=np.float64(trained.threshold),
         phrase=phrase,
         created=np.float64(time.time()),
+        calibration=np.int64(TEMPLATE_CALIBRATION),
     )
     return path
 

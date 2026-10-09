@@ -27,8 +27,31 @@ class TestPhraseGate:
     def test_phrase_must_lead(self):
         assert phrase_gate("open spotify hey aura", "hey aura") is False
 
-    def test_similar_but_wrong_rejected(self):
-        assert phrase_gate("hey auraa open spotify", "hey aura") is False
+    def test_transcription_slips_are_the_phrase(self):
+        """The gate runs *after* the acoustic detector fired on the user's
+        own voice. Whisper rendering "hey aura" as "hey auraa" / "hey aur" /
+        "hey aure" used to be a silent rejection of a real wake — the exact
+        "I said it and nothing happened" failure, one layer deeper. One edit
+        per word is the phrase; a different word is not."""
+        for heard in ("hey auraa open spotify", "hey aur set volume",
+                      "hey aure turn on the lights", "Hey Aura! open spotify"):
+            assert phrase_gate(heard, "hey aura") is True, heard
+
+    def test_genuinely_different_speech_stays_rejected(self):
+        for heard in ("hey euro open spotify",          # two edits away
+                      "high tower open spotify",        # different words
+                      "hey aria sing something",        # different name
+                      "okay aura open spotify",         # not the phrase
+                      "a um hey aura open spotify"):    # filler forgives one token, not two
+            assert phrase_gate(heard, "hey aura") is False, heard
+
+    def test_single_leading_filler_is_forgiven(self):
+        """The recording starts at a detector fire, not a sentence boundary —
+        "um hey aura …" is still the user waking Aura."""
+        assert phrase_gate("um hey aura open spotify", "hey aura") is True
+
+    def test_short_words_must_match_exactly(self):
+        assert phrase_gate("no aura open spotify", "hey aura") is False
 
 
 class TestStripPhrase:
@@ -45,6 +68,14 @@ class TestStripPhrase:
 
     def test_phrase_only(self):
         assert strip_phrase("hey aura", "hey aura") == ""
+
+    def test_strips_what_the_gate_accepted(self):
+        """Gate and stripper share one matcher: a near-miss or filler word
+        the gate lets through must not be handed to the planner as part of
+        the command."""
+        assert strip_phrase("Hey Auraa open spotify", "hey aura") == "open spotify"
+        assert strip_phrase("um hey aura set volume to 30", "hey aura") == "set volume to 30"
+        assert strip_phrase("hey auraa", "hey aura") == ""
 
 
 class TestLiveWakeSwitch:

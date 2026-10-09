@@ -24,6 +24,23 @@ enum Notify {
     /// visible there, so the notification is only needed when it isn't.
     @MainActor static var panelIsVisible: () -> Bool = { true }
 
+    /// macOS's live answer to "will Aura's notifications show?".
+    ///
+    /// The proposal alert is the safety net under the whole confirmation
+    /// flow, so its permission is not a fire-and-forget detail: it is read
+    /// at launch, re-read whenever it matters (a proposal with the panel
+    /// closed, the Setup panel opening), and *surfaced* — an ad-hoc signed
+    /// rebuild can orphan the grant exactly like it does for Accessibility,
+    /// and a silently denied notification is indistinguishable from a bug.
+    @MainActor static private(set) var authorization: UNAuthorizationStatus = .notDetermined
+
+    @MainActor static var canNotify: Bool {
+        switch authorization {
+        case .authorized, .provisional, .ephemeral: return true
+        default: return false
+        }
+    }
+
     // MARK: - setup
 
     static func bootstrap() {
@@ -42,9 +59,48 @@ enum Notify {
                                               options: [])
         center.setNotificationCategories([category])
 
-        // Best effort: an LSUIElement app asks once; if the user said no,
-        // Aura simply doesn't notify (the panel card still works).
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        // Ask once (an LSUIElement app gets one prompt), but *record* the
+        // answer — and any answer macOS already had — so the proposal path
+        // knows whether a notification will actually show, and Setup can
+        // show the user how to fix a "no".
+        Task { @MainActor in
+            await refreshAuthorization()
+            if authorization == .notDetermined {
+                await ensureAuthorization()
+            }
+        }
+    }
+
+    /// Read the live status from the notification center.
+    @MainActor @discardableResult
+    static func refreshAuthorization() async -> Bool {
+        let settings: UNNotificationSettings = await withCheckedContinuation { continuation in
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                continuation.resume(returning: settings)
+            }
+        }
+        authorization = settings.authorizationStatus
+        return canNotify
+    }
+
+    /// Ask if macOS hasn't been asked yet; never re-prompts a "no" (the API
+    /// can't). Returns whether notifications will show.
+    @MainActor @discardableResult
+    static func ensureAuthorization() async -> Bool {
+        if authorization == .notDetermined {
+            let granted: Bool = await withCheckedContinuation { continuation in
+                UNUserNotificationCenter.current()
+                    .requestAuthorization(options: [.alert, .sound]) { granted, _ in
+                        continuation.resume(returning: granted)
+                    }
+            }
+            if granted {
+                await refreshAuthorization()
+            } else {
+                authorization = .denied
+            }
+        }
+        return canNotify
     }
 
     // MARK: - proposals

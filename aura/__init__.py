@@ -19,4 +19,4 @@ Layers (see ARCHITECTURE.md):
 """
 
 __app_name__ = "Aura"
-__version__ = "0.7.1"
+__version__ = "0.7.2"

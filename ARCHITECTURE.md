@@ -39,7 +39,23 @@ paranoid gate, and dumb-but-perfect executors.
 - Wake supports pretrained openWakeWord models and user-trained custom-phrase
   in-app training (the Wake Phrase panel). A configurable **spoken phrase
   gate** adds a second factor: in always-on mode the transcript must begin
-  with the user's phrase, killing false accepts.
+  with the user's phrase, killing false accepts — which is why the template
+  threshold sits deliberately below the midpoint between the weakest positive
+  and the strongest negative: a false accept costs one rejected
+  transcription, a false reject makes the product read as dead.
+- **Training and detection share one score space.** The trainer calibrates
+  the threshold by sliding the *detector's own* windows (a trailing 1 s span
+  every ~128 ms, plus one offset 384 ms behind it) across every training
+  take, so the stored number is reachable by what the microphone stream
+  actually produces. An earlier build embedded whole ~2 s VAD captures
+  instead; their silence-diluted mean-pooled spectra scored ~0.999 against
+  their own template while live windows measured ~0.985 — trained phrases
+  never fired and nothing was logged. Templates carry a `calibration`
+  version: v1 files still load, but the engine flags them and the panel
+  recommends retraining. Detectors also publish a rolling **listening level**
+  (`wake_level` beside `wake_threshold` in `/api/state`), which the Wake
+  Phrase panel renders as a live meter — "did Aura hear me?" is answerable
+  without a log dive.
 - The gate only works because of the **pre-roll**: a detector can only fire
   once the phrase is behind it, so the orchestrator keeps ~2 s of audio behind
   the wake engine and seeds the VAD with it (`EnergyVAD.prime`). The phrase
@@ -222,9 +238,18 @@ and has no UI dependencies:
 icon, one instance):
 - `NSStatusItem` whose icon mirrors the engine state (ready / working /
   needs-your-OK / attention), an `NSPopover` hosting the SwiftUI panel (orb,
-  transcript, reply, **native confirmation card** with ⌘↩ / Esc, composer,
-  suggestions, Activity, My data), and a right-click menu wired to the
-  delegate;
+  transcript, reply, **native confirmation card** with ⌘↩ / Esc and a live
+  countdown of the engine's 45 s answer window, composer, suggestions,
+  Activity, My data), and a right-click menu wired to the delegate;
+- **a pending question always reaches the user**: the card when the panel is
+  open, a system notification with Run / Cancel when it isn't — and because a
+  transient popover closes on any click elsewhere, the close itself
+  re-delivers a still-pending proposal as a notification (once per token).
+  When macOS won't show notifications (denied — an ad-hoc rebuild orphans the
+  grant exactly like Accessibility), Aura presents its own panel instead and
+  Setup shows the permission as a capability row with a deep link into
+  System Settings › Notifications. Authorization is read live
+  (`getNotificationSettings`), never assumed;
 - a Settings window with eight sections driven by the engine's own state
   (General, Voice, Understanding, Safety, Permissions, Wake Phrase, Activity,
   About) and a first-run onboarding window that explains what stays local
@@ -270,17 +295,20 @@ at runtime (`POST /api/config` validates type + membership, persists to
 refused with a friendly message.
 
 ## Testing
-**Engine (Linux CI, `pytest`):** 280+ tests cover the JSON parser, the rule
+**Engine (Linux CI, `pytest`):** 490+ tests cover the JSON parser, the rule
 layer, the **Laya adapter against the published API** (a fake `laya` module
 implements `Router.predict`/`predict_batch`, so the real code path runs
 off-Mac), routing/degradation, the **planner's fallbacks** (dead endpoint ⇒
 degraded plan that still acts), the **session guard** (planner crash ⇒ session
-still answers, with the error named), logging (file/bus/tail/`/api/log`), wake
-fallback honesty, safety verdicts, the Laya heuristic + example buffer,
-memory/FTS/preferences, **access control** (token required,
-browser `Origin` and foreign `Host` refused, no HTML surface), live config
-round-trips and refusals, and **full orchestration over real HTTP** (typed
-session, confirmation flow, cancel flow, busy-state hints, feedback
+still answers, with the error named), the **per-skill deadline** (a wedged
+Accessibility call fails as itself instead of eating the session), logging
+(file/bus/tail/`/api/log`), wake fallback honesty, the **train → detect
+round-trip** (studio-shaped captures must wake the running detector — the
+regression behind "my phrase never fires"), safety verdicts, the Laya
+heuristic + example buffer, memory/FTS/preferences, **access control** (token
+required, browser `Origin` and foreign `Host` refused, no HTML surface), live
+config round-trips and refusals, and **full orchestration over real HTTP**
+(typed session, confirmation flow, cancel flow, busy-state hints, feedback
 recording). The dry-run bridge makes the whole product testable on Linux —
 the same code path a Mac runs.
 
